@@ -1,0 +1,10 @@
+{
+  "video_path": "raw_videos/pokemon_emerald/Pok\u00e9mon Emerald - Super Walkthrough.rkZMopvNV48.mp4",
+  "crop_region": {
+    "x": 0,
+    "y": 0,
+    "width": 640,
+    "height": 360,
+    "confidence": 0.0
+  }
+}

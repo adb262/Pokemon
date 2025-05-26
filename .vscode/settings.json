@@ -1,0 +1,29 @@
+{
+    "editor.codeActionsOnSave": {},
+    "python.languageServer": "Pylance",
+    "files.watcherExclude": {
+      "**/.git/**": true,
+      "**/.DS_Store/**": true,
+      "**/node_modules/**": true,
+      "**/__pycache__": true,
+      "**/venv/lib/python3.11/site-packages/prisma/**": true,
+      "**/prisma/client/**": true
+    },
+    "python.analysis.ignore": [
+      "**/venv/lib/python3.11/site-packages/prisma",
+      "/var/tmp/node_modules",
+      "**/prisma/client",
+      "**/lib/db/client"
+    ],
+    "python.analysis.exclude": [
+      "**/venv/lib/python3.11/site-packages/prisma",
+      "/var/tmp/node_modules",
+      "**/prisma/client",
+      "**/lib/db/client"
+    ],
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.indexing": false,
+    "python.analysis.diagnosticMode": "openFilesOnly"
+  }
+  

@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+*.log
+cleaned_videos/
+raw_videos/
+pokemon_frames/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.png
+*.jpg
