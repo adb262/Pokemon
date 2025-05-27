@@ -19,3 +19,4 @@ runs/
 *.pth
 *.png
 *.jpg
+wandb/

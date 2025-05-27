@@ -8,7 +8,7 @@ from codebook import NaiveCodebook
 from lapa.positional_bias import Transformer
 
 
-class VQVAE(nn.Module):
+class MultiFrameVQVAE(nn.Module):
     def __init__(
         self,
         channels: int,
@@ -22,13 +22,15 @@ class VQVAE(nn.Module):
         num_heads: int,
         num_transformer_layers: int
     ):
-        super(VQVAE, self).__init__()
+        super(MultiFrameVQVAE, self).__init__()
         self.image_height, self.image_width = image_size
         self.patch_height, self.patch_width = patch_size
         patch_dim = channels * self.patch_height * self.patch_width
+        self._rearrange_single_frame = Rearrange(
+            'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',  p1=self.patch_height, p2=self.patch_width)
+        self._rearrange_multi_frame = Rearrange(
+            'b n c (h p1) (w p2) -> b n (h w) (p1 p2 c)',  p1=self.patch_height, p2=self.patch_width)
         self._embed_image_patches = nn.Sequential(
-            Rearrange(
-                'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',  p1=self.patch_height, p2=self.patch_width),
             nn.LayerNorm(patch_dim),
             nn.Linear(patch_dim, patch_embed_dim),
             nn.LayerNorm(patch_embed_dim),)
@@ -119,28 +121,28 @@ class VQVAE(nn.Module):
             ff_mult=2,
         )
 
-    def encode(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Images are of shape (batch_size, channels, height, width)
-        # We want to embed the images into a sequence of patches
-        assert image_1_batch.shape == image_2_batch.shape and len(image_1_batch.shape) == 4
+    def encode(self, context_images: torch.Tensor, prediction_image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Context images are of shape (batch_size, num_context_images, channels, height, width)
+        # Prediction image is of shape (batch_size, channels, height, width)
+        assert context_images.shape[1:] == prediction_image.shape and len(context_images.shape) == 5
 
         # Embed the images into a sequence of patches
-        image_1_patches: torch.Tensor = self._embed_image_patches(image_1_batch)
-        image_2_patches: torch.Tensor = self._embed_image_patches(image_2_batch)
+        rearranged_context_images = self._rearrange_multi_frame(context_images)
+        rearranged_target_image = self._rearrange_single_frame(prediction_image)
+        context_patches: torch.Tensor = self._embed_image_patches(rearranged_context_images)
+        prediction_patches: torch.Tensor = self._embed_image_patches(rearranged_target_image)
 
-        # Encode the patches into a sequence of latent vectors (batch_size, num_patches, patch_embed_dim)
+        # Encode the patches into a sequence of latent vectors (batch_size, n, num_patches, patch_embed_dim)
         # Could concat and split up on batch but simpler this way
-        encoded_first = self.spatial_transformer(image_1_patches)
-        encoded_last = self.spatial_transformer(image_2_patches)
+        encoded_context = self.spatial_transformer(context_patches)
+        encoded_prediction = self.spatial_transformer(prediction_patches)
 
-        # Concatenate the two sequences of latent vectors (batch_size, num_patches * 2, patch_embed_dim)
-        encoded = torch.cat([encoded_first, encoded_last], dim=1)
+        # Concatenate the two sequences of latent vectors (batch_size, num_context_images + 1, num_patches, patch_embed_dim)
+        encoded = torch.cat([encoded_context, encoded_prediction], dim=1)
 
-        # Pass through the temporal transformer (batch_size, num_patches * 2, patch_embed_dim)
+        # Pass through the temporal transformer (batch_size, num_context_images + 1, num_patches, patch_embed_dim)
         encoded: torch.Tensor = self.temporal_transformer(encoded)
-
-        encoded_first, encoded_last = encoded.split(encoded.shape[1] // 2, dim=1)
-        return encoded_first, encoded_last
+        return encoded[:, :-1, :, :], encoded[:, -1, :, :]
 
     def quantize(self, encoded_first: torch.Tensor, encoded_last: torch.Tensor,
                  mode: Literal["train", "inference"] = "train") -> torch.Tensor:
@@ -152,6 +154,7 @@ class VQVAE(nn.Module):
             return self.codebook.inference(encoded_first, encoded_last)
 
     def decode(self, encoded_first: torch.Tensor, quantized: torch.Tensor) -> torch.Tensor:
+        # encoded_first is of shape (batch_size, num_patches, patch_embed_dim)
         out = self.decoder(encoded_first, context=quantized)
         out = self.project_to_pixels(out)
         return self.reshape_patches_to_images(out)

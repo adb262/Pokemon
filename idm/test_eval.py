@@ -6,7 +6,7 @@ Tests the evaluation functionality with a trained or randomly initialized model.
 
 from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from train import TrainingConfig
-from idm.vqvae import VQVAE
+from vqvae import VQVAE
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -96,7 +96,9 @@ def tensor_to_image(tensor):
     return Image.fromarray(image_array)
 
 
-def test_visualization(model, dataloader, device, num_samples=2, save_dir="test_eval_results"):
+def test_visualization(
+        model: VQVAE, dataloader: PokemonFrameLoader, device: torch.device, num_samples: int = 2,
+        save_dir: str = "test_eval_results"):
     """Test visualization with model"""
     model.eval()
     os.makedirs(save_dir, exist_ok=True)
@@ -111,7 +113,8 @@ def test_visualization(model, dataloader, device, num_samples=2, save_dir="test_
 
         # Forward pass
         try:
-            reconstructed = model(image1_batch, image2_batch)
+            residual = model.inference_step(image1_batch, image2_batch)
+            reconstructed = image2_batch + residual
             logger.info(f"Reconstruction shape: {reconstructed.shape}")
 
             # Create visualization
@@ -187,7 +190,8 @@ def main():
         shuffle=True,
         num_workers=2,
         min_frame_gap=1,
-        max_frame_gap=3
+        max_frame_gap=3,
+        stage="test"
     )
 
     # Print dataset info

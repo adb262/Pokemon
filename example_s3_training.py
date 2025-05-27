@@ -19,7 +19,7 @@ Environment Variables Required:
 - AWS_REGION: AWS region (optional, defaults to us-east-1)
 """
 
-from idm.train import main, CONFIG
+from train import main, CONFIG
 import os
 import sys
 from pathlib import Path

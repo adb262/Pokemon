@@ -6,7 +6,6 @@ Ensures only clean Pokemon gameplay footage is retained.
 Supports both local storage and S3.
 """
 
-from idm.s3_utils import S3Manager, get_s3_manager_from_env
 import cv2
 import numpy as np
 import logging
@@ -17,6 +16,7 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass
+from s3_utils import default_s3_manager
 
 # Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))
@@ -38,8 +38,7 @@ class CropRegion:
 class PokemonVideoCleaner:
     """Cleans Pokemon videos by detecting and removing commentary/UI overlays with S3 support"""
 
-    def __init__(self, min_gameplay_ratio: float = 0.6, use_s3: bool = False,
-                 s3_manager: Optional[S3Manager] = None, s3_prefix: str = "raw_videos",
+    def __init__(self, min_gameplay_ratio: float = 0.6, use_s3: bool = False, s3_prefix: str = "raw_videos",
                  clean_s3_prefix: str = "clean_videos"):
         """
         Initialize the Pokemon video cleaner
@@ -57,25 +56,9 @@ class PokemonVideoCleaner:
         self.clean_s3_prefix = clean_s3_prefix
         self.pokemon_colors = self._get_pokemon_game_colors()
 
-        # Initialize S3 manager if needed
-        if use_s3:
-            if s3_manager is None:
-                try:
-                    self.s3_manager = get_s3_manager_from_env()
-                    logger.info(f"S3 manager initialized for bucket: {self.s3_manager.bucket_name}")
-                except Exception as e:
-                    logger.error(f"Failed to initialize S3 manager: {e}")
-                    logger.error("Falling back to local storage only")
-                    self.use_s3 = False
-                    self.s3_manager = None
-            else:
-                self.s3_manager = s3_manager
-        else:
-            self.s3_manager = None
-
     def _download_video_from_s3(self, s3_key: str) -> Optional[str]:
         """Download video from S3 to temporary file"""
-        if not self.use_s3 or not self.s3_manager:
+        if not self.use_s3:
             return None
 
         try:
@@ -85,7 +68,7 @@ class PokemonVideoCleaner:
             temp_file.close()
 
             # Download from S3
-            success = self.s3_manager.download_file(s3_key, temp_path)
+            success = default_s3_manager.download_file(s3_key, temp_path)
             if success:
                 logger.debug(f"Downloaded video from S3 to temp file: {temp_path}")
                 return temp_path
@@ -110,7 +93,7 @@ class PokemonVideoCleaner:
 
     def _upload_crop_info_to_s3(self, crop_region: CropRegion, video_path: str, game_name: str) -> bool:
         """Upload crop information to S3"""
-        if not self.use_s3 or not self.s3_manager:
+        if not self.use_s3:
             return False
 
         try:
@@ -136,7 +119,7 @@ class PokemonVideoCleaner:
             s3_key = f"{self.clean_s3_prefix}/{game_dir}/{video_name}_crop_info.json"
 
             # Upload to S3
-            success = self.s3_manager.upload_json(crop_info, s3_key)
+            success = default_s3_manager.upload_json(crop_info, s3_key)
             if success:
                 logger.info(f"Uploaded crop info to S3: {s3_key}")
                 return True
@@ -543,7 +526,7 @@ class PokemonVideoCleaner:
         """Get information about storage configuration"""
         return {
             'use_s3': self.use_s3,
-            's3_bucket': self.s3_manager.bucket_name if self.s3_manager else None,
+            's3_bucket': default_s3_manager.bucket_name,
             's3_prefix': self.s3_prefix,
             'clean_s3_prefix': self.clean_s3_prefix,
             'min_gameplay_ratio': self.min_gameplay_ratio

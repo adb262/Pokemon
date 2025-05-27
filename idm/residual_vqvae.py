@@ -4,8 +4,8 @@ import torch.nn as nn
 
 from einops.layers.torch import Rearrange
 
-from codebook import NaiveCodebook
 from lapa.positional_bias import Transformer
+from vector_quantize_pytorch import ResidualLFQ
 
 
 class VQVAE(nn.Module):
@@ -82,25 +82,34 @@ class VQVAE(nn.Module):
             ff_mult=2,
         )
 
-        # VQ-VAE codebook
-        # self.codebook = NSVQ(
-        #     dim=latent_dim,
-        #     num_embeddings=num_embeddings,
-        #     embedding_dim=embedding_dim,
-        #     device=device,
-        #     discarding_threshold=0.1,
-        #     initialization='normal',
-        #     code_seq_len=1,
-        #     patch_size=self.patch_height * self.patch_width,
-        #     image_size=360,
-        # )
-        self.codebook = NaiveCodebook(
-            num_embeddings,
-            patch_embed_dim * num_patches,
-            latent_dim
+        # ResidualLFQ configuration - each LFQ layer needs dim = log2(codebook_size)
+
+        self.residual_lfq = ResidualLFQ(
+            dim=latent_dim,  # Input dimension (will be projected to codebook_dim internally)
+            codebook_size=patch_embed_dim,  # 256 codes per quantizer
+            num_quantizers=num_embeddings,  # Number of residual quantizers
+            quantize_dropout=True,  # Enable dropout for better generalization
+            quantize_dropout_cutoff_index=1,  # Keep at least 1 quantizer
+            experimental_softplus_entropy_loss=True,
+            entropy_loss_weight=0.1,
+            commitment_loss_weight=0.25,
         )
 
-        # Create a sparse projection from patch_embed_dim * num_patches to num_embeddings
+        # Project difference to action space
+        self.to_action = nn.Sequential(
+            nn.LayerNorm(patch_embed_dim),
+            nn.Linear(patch_embed_dim, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+
+        # Project action back to patch space for decoding
+        self.from_action = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, patch_embed_dim),
+            nn.LayerNorm(patch_embed_dim),
+        )
 
         # Decoder to cast from image_0 + action latent space to image_1
         # self.decoder = nn.Transformer(
@@ -143,32 +152,53 @@ class VQVAE(nn.Module):
         return encoded_first, encoded_last
 
     def quantize(self, encoded_first: torch.Tensor, encoded_last: torch.Tensor,
-                 mode: Literal["train", "inference"] = "train") -> torch.Tensor:
-        encoded_first = encoded_first.reshape(encoded_first.shape[0], -1)
-        encoded_last = encoded_last.reshape(encoded_last.shape[0], -1)
-        if mode == "train":
-            return self.codebook(encoded_first, encoded_last)
-        else:
-            return self.codebook.inference(encoded_first, encoded_last)
+                 mode: Literal["train", "inference"] = "train") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Compute the difference (action) between frames
+        # Shape: (batch_size, num_patches, patch_embed_dim)
+        frame_diff = encoded_last - encoded_first
+
+        # Pool across patches to get a global action representation
+        # You could also use attention pooling here
+        global_action = frame_diff.mean(dim=1)  # (batch_size, patch_embed_dim)
+
+        # Project to action space
+        action_features = self.to_action(global_action)  # (batch_size, action_dim)
+
+        # ResidualLFQ expects 3D input: (batch, sequence, dim)
+        # We treat each action as a single "token" in the sequence
+        action_features = action_features.unsqueeze(1)  # (batch_size, 1, action_dim)
+
+        # Quantize the action
+        quantized_action, indices, aux_loss = self.residual_lfq(action_features)
+
+        # Remove sequence dimension
+        quantized_action = quantized_action.squeeze(1)  # (batch_size, action_dim)
+
+        # Project back to patch space and broadcast to all patches
+        decoded_action = self.from_action(quantized_action)  # (batch_size, patch_embed_dim)
+        # (batch_size, num_patches, patch_embed_dim)
+        decoded_action = decoded_action.unsqueeze(1).expand(-1, frame_diff.size(1), -1)
+
+        return decoded_action, indices, aux_loss
 
     def decode(self, encoded_first: torch.Tensor, quantized: torch.Tensor) -> torch.Tensor:
         out = self.decoder(encoded_first, context=quantized)
         out = self.project_to_pixels(out)
         return self.reshape_patches_to_images(out)
 
-    def forward(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> torch.Tensor:
+    def forward(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         encoded_first, encoded_last = self.encode(image_1_batch, image_2_batch)
 
         # Quantize the latent vectors (batch_size, num_patches, latent_dim)
-        quantized = self.quantize(encoded_first, encoded_last)
+        quantized, indices, commit_loss = self.quantize(encoded_first, encoded_last)
 
         # Decode the quantized latent vectors into a sequence of patches (batch_size, num_patches, patch_dim)
-        return self.decode(encoded_first.detach(), quantized)
+        return self.decode(encoded_first.detach(), quantized), commit_loss
 
     @torch.inference_mode()
     def inference_step(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> torch.Tensor:
         encoded_first, encoded_last = self.encode(image_1_batch, image_2_batch)
-        quantized = self.quantize(encoded_first, encoded_last, mode="inference")
+        quantized, indices, commit_loss = self.quantize(encoded_first, encoded_last, mode="inference")
         return self.decode(encoded_first.detach(), quantized)
 
     def reshape_patches_to_images(self, patches: torch.Tensor) -> torch.Tensor:

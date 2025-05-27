@@ -6,7 +6,7 @@ Focuses on classic games: Emerald, Fire Red, Ruby, Sapphire, Heart Gold, Soul Si
 Supports both local storage and S3 upload.
 """
 
-from idm.s3_utils import S3Manager, get_s3_manager_from_env
+from s3_utils import S3Manager, get_s3_manager_from_env
 import logging
 import yt_dlp
 from pathlib import Path

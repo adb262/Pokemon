@@ -5,7 +5,8 @@ Loads a trained model and visualizes reconstruction results.
 """
 
 from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from idm.vqvae import VQVAE
+from s3_utils import get_s3_manager_from_env, parse_s3_path
+from vqvae import VQVAE
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -16,6 +17,9 @@ import os
 from pathlib import Path
 import argparse
 from PIL import Image
+from train import TrainingConfig
+
+TrainingConfig = TrainingConfig()
 
 # Add the parent directory to the path so we can import from data_collection
 sys.path.append(str(Path(__file__).parent.parent))
@@ -46,50 +50,56 @@ def create_model(config):
     return model
 
 
-def load_checkpoint(model, checkpoint_path, device):
+def load_checkpoint(checkpoint_path, device, s3_manager):
     """Load model checkpoint with support for new comprehensive format"""
+    tmp_path = Path(f"{checkpoint_path.split('/')[-1]}")
+    if checkpoint_path.startswith('s3://'):
+        if not os.path.exists(tmp_path):
+            bucket, key = parse_s3_path(checkpoint_path)
+            s3_manager.download_file(key, tmp_path)
+
+        checkpoint_path = tmp_path
+
     if not os.path.exists(checkpoint_path):
         logger.error(f"Checkpoint not found: {checkpoint_path}")
         return None
 
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
 
-        # Load model state
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            logger.error("No model_state_dict found in checkpoint")
-            return None
+    config = checkpoint['config']
+    model = create_model(config)
+    model.to(device)
 
-        # Extract metadata with fallbacks for older checkpoint formats
-        epoch = checkpoint.get('epoch', 0)
-        batch_idx = checkpoint.get('batch_idx', 0)
-        loss = checkpoint.get('loss', 0.0)
-        config = checkpoint.get('config', {})
-        timestamp = checkpoint.get('timestamp', 'unknown')
-
-        logger.info(f"Checkpoint loaded successfully:")
-        logger.info(f"  Path: {checkpoint_path}")
-        logger.info(f"  Epoch: {epoch}")
-        logger.info(f"  Batch: {batch_idx}")
-        logger.info(f"  Loss: {loss:.6f}")
-        logger.info(f"  Timestamp: {timestamp}")
-
-        if config:
-            logger.info(f"  Training config: {config.get('experiment_name', 'unknown')}")
-
-        return {
-            'epoch': epoch,
-            'batch_idx': batch_idx,
-            'loss': loss,
-            'config': config,
-            'timestamp': timestamp
-        }
-
-    except Exception as e:
-        logger.error(f"Error loading checkpoint: {e}")
+    # Load model state
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        logger.error("No model_state_dict found in checkpoint")
         return None
+
+    # Extract metadata with fallbacks for older checkpoint formats
+    epoch = checkpoint.get('epoch', 0)
+    batch_idx = checkpoint.get('batch_idx', 0)
+    loss = checkpoint.get('loss', 0.0)
+    timestamp = checkpoint.get('timestamp', 'unknown')
+
+    logger.info(f"Checkpoint loaded successfully:")
+    logger.info(f"  Path: {checkpoint_path}")
+    logger.info(f"  Epoch: {epoch}")
+    logger.info(f"  Batch: {batch_idx}")
+    logger.info(f"  Loss: {loss:.6f}")
+    logger.info(f"  Timestamp: {timestamp}")
+
+    if config:
+        logger.info(f"  Training config: {config.get('experiment_name', 'unknown')}")
+
+    return {
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'loss': loss,
+        'config': config,
+        'timestamp': timestamp
+    }
 
 
 def tensor_to_image(tensor: torch.Tensor) -> Image.Image:
@@ -249,7 +259,8 @@ def main():
 
     # Load checkpoint
     logger.info(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint_info = load_checkpoint(model, args.checkpoint, device)
+    s3_manager = get_s3_manager_from_env()
+    checkpoint_info = load_checkpoint(args.checkpoint, device, s3_manager)
     if checkpoint_info is None:
         logger.error("Failed to load checkpoint")
         return

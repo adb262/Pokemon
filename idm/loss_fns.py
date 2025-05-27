@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-action_weight = 4
+action_weight = 5
 
 
 def reconstruction_loss(image_1: torch.Tensor, image_2: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
@@ -17,11 +17,12 @@ def reconstruction_loss(image_1: torch.Tensor, image_2: torch.Tensor, decoded: t
         Weighted reconstruction loss (scalar)
     """
     # Calculate element-wise MSE loss (no reduction)
-    mse_loss = F.mse_loss(decoded, image_2, reduction='none')  # [B, C, H, W]
+    residual = image_1 - image_2
+    mse_loss = F.mse_loss(decoded, residual, reduction='none')  # [B, C, H, W]
 
     # Detect pixels that changed between frames (with small threshold for numerical stability)
     threshold = 1e-3
-    changed_pixels = (torch.abs(image_1 - image_2) > threshold).float()  # [B, C, H, W]
+    changed_pixels = (torch.abs(residual) > threshold).float()  # [B, C, H, W]
 
     # Create weight mask: higher weight for changed pixels, normal weight for unchanged
     weight_mask = torch.where(changed_pixels > 0, action_weight, 1.0)  # [B, C, H, W]

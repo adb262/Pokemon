@@ -10,8 +10,10 @@ class NaiveCodebook(nn.Module):
         self._input_dim = input_dim
 
         # Create the codebook
-        self._project_in = nn.Linear(self._input_dim, self._embedding_dim)
-        self._project_out = nn.Linear(self._embedding_dim, self._input_dim)
+        # Coming in is (batch_size, num_images, num_patches, patch_embed_dim)
+        # Need CNN into (batch_size, num_images, embedding_dim)
+        self._project_in = nn.Conv2d(self._input_dim, self._embedding_dim, kernel_size=3, padding=1)
+        self._project_out = nn.Conv2d(self._embedding_dim, self._input_dim, kernel_size=3, padding=1)
         self._book = nn.Parameter(torch.randn(self._num_embeddings, self._embedding_dim), requires_grad=True)
 
     def forward(self, image_1: torch.Tensor, image_2: torch.Tensor):
@@ -40,3 +42,21 @@ class NaiveCodebook(nn.Module):
         quantized_input = input_data + vq_error
 
         return self._project_out(quantized_input)
+
+    @torch.inference_mode()
+    def inference(self, image_1: torch.Tensor, image_2: torch.Tensor) -> torch.Tensor:
+        # Project the images into the embedding space
+        image_1 = self._project_in(image_1.reshape(image_1.shape[0], -1))
+        image_2 = self._project_in(image_2.reshape(image_2.shape[0], -1))
+
+        input_data = image_1 - image_2
+
+        # Compute the distances between the images and the codebook
+        distances = torch.cdist(input_data, self._book)
+
+        # Get the indices of the closest codebook vectors
+        indices = distances.argmin(dim=1)
+
+        hard_quantized_input = self._book[indices]
+
+        return self._project_out(hard_quantized_input)

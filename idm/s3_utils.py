@@ -15,6 +15,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import torch
 from PIL import Image
+import botocore.config
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,9 @@ class S3Manager:
 
         try:
             self.session = boto3.Session(**session_kwargs)
-            self.s3_client = self.session.client('s3')
+            self.s3_client = self.session.client('s3', config=botocore.config.Config(
+                max_pool_connections=1000,
+            ))
             self.s3_resource = self.session.resource('s3')
             self.bucket = self.s3_resource.Bucket(bucket_name)
 
@@ -415,3 +418,6 @@ def get_s3_manager_from_env() -> S3Manager:
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key
     )
+
+
+default_s3_manager = get_s3_manager_from_env()

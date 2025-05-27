@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from idm.lapa.positional_bias import ContinuousPositionBias
+from lapa.positional_bias import ContinuousPositionBias
 
 
 class SpatialMultiHeadAttention(nn.Module):

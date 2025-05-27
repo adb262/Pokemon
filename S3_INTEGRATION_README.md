@@ -108,7 +108,7 @@ python idm/train.py \
 You can also configure S3 settings programmatically:
 
 ```python
-from idm.train import CONFIG, main
+from train import CONFIG, main
 
 # Configure S3 settings
 CONFIG.use_s3 = True

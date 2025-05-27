@@ -6,7 +6,7 @@ Extracts frames at 5fps and 360p resolution, removing audio and applying crops.
 Supports both local storage and S3.
 """
 
-from idm.s3_utils import S3Manager, get_s3_manager_from_env
+from s3_utils import S3Manager
 from data_collection.video_cleaner import CropRegion, PokemonVideoCleaner
 import cv2
 import logging
@@ -18,7 +18,7 @@ import sys
 import tempfile
 from PIL import Image
 from dataclasses import dataclass
-
+from s3_utils import default_s3_manager
 # Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -61,29 +61,12 @@ class PokemonFrameExtractor:
         self.raw_s3_prefix = raw_s3_prefix
         self.frames_s3_prefix = frames_s3_prefix
 
-        # Initialize S3 manager if needed
-        if use_s3:
-            if s3_manager is None:
-                try:
-                    self.s3_manager = get_s3_manager_from_env()
-                    logger.info(f"S3 manager initialized for bucket: {self.s3_manager.bucket_name}")
-                except Exception as e:
-                    logger.error(f"Failed to initialize S3 manager: {e}")
-                    logger.error("Falling back to local storage only")
-                    self.use_s3 = False
-                    self.s3_manager = None
-            else:
-                self.s3_manager = s3_manager
-        else:
-            self.s3_manager = None
-
-        self.cleaner = PokemonVideoCleaner(use_s3=use_s3, s3_manager=self.s3_manager)
+        self.cleaner = PokemonVideoCleaner(use_s3=use_s3)
 
     def _download_video_from_s3(self, s3_key: str) -> Optional[str]:
         """Download video from S3 to temporary file"""
-        if not self.use_s3 or not self.s3_manager:
+        if not self.use_s3:
             return None
-
         try:
             # Create temporary file
             temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
@@ -91,7 +74,7 @@ class PokemonFrameExtractor:
             temp_file.close()
 
             # Download from S3
-            success = self.s3_manager.download_file(s3_key, temp_path)
+            success = default_s3_manager.download_file(s3_key, temp_path)
             if success:
                 logger.debug(f"Downloaded video from S3 to temp file: {temp_path}")
                 return temp_path
@@ -116,7 +99,7 @@ class PokemonFrameExtractor:
 
     def _upload_frame_to_s3(self, local_path: str, game_name: str, video_id: str, frame_filename: str) -> bool:
         """Upload a frame to S3"""
-        if not self.use_s3 or not self.s3_manager:
+        if not self.use_s3:
             return False
 
         try:
@@ -125,7 +108,7 @@ class PokemonFrameExtractor:
             s3_key = f"{self.frames_s3_prefix}/{game_dir}/{video_id}/{frame_filename}"
 
             # Upload frame
-            success = self.s3_manager.upload_file(local_path, s3_key)
+            success = default_s3_manager.upload_file(local_path, s3_key)
             if success:
                 logger.debug(f"Uploaded frame to S3: {s3_key}")
                 return True
@@ -141,7 +124,7 @@ class PokemonFrameExtractor:
             self, metadata_dict: Dict[str, Any],
             game_name: str, video_id: str, filename: str) -> bool:
         """Upload metadata to S3"""
-        if not self.use_s3 or not self.s3_manager:
+        if not self.use_s3:
             return False
 
         try:
@@ -150,7 +133,7 @@ class PokemonFrameExtractor:
             s3_key = f"{self.frames_s3_prefix}/{game_dir}/{video_id}/{filename}"
 
             # Upload metadata
-            success = self.s3_manager.upload_json(metadata_dict, s3_key)
+            success = default_s3_manager.upload_json(metadata_dict, s3_key)
             if success:
                 logger.debug(f"Uploaded metadata to S3: {s3_key}")
                 return True
@@ -400,7 +383,7 @@ class PokemonFrameExtractor:
         """Get information about storage configuration"""
         return {
             'use_s3': self.use_s3,
-            's3_bucket': self.s3_manager.bucket_name if self.s3_manager else None,
+            's3_bucket': default_s3_manager.bucket_name,
             'raw_s3_prefix': self.raw_s3_prefix,
             'frames_s3_prefix': self.frames_s3_prefix,
             'target_fps': self.target_fps,
