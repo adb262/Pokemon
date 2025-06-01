@@ -2,10 +2,10 @@
 # from beartype.claw import beartype_all
 from typing import Callable, Optional
 from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from training_args import TrainingConfig
-from loss_fns import reconstruction_loss
-from vqvae import VQVAE
-from s3_utils import S3Manager
+from latent_action_model.training_args import VideoTrainingConfig
+from loss.loss_fns import reconstruction_loss
+from latent_action_vq_vae import LatentActionVQVAE
+from s3.s3_utils import S3Manager
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -19,10 +19,8 @@ from pathlib import Path
 from datetime import datetime
 import tempfile
 import logging
-import psutil
-import GPUtil
 import wandb
-from s3_utils import default_s3_manager
+from s3.s3_utils import default_s3_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +39,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 # AI BS generation here... use a real config class for god sake
 
 
-def upload_logs_to_s3(config: TrainingConfig, s3_manager: S3Manager):
+def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
     """Upload logs to S3"""
     if config._temp_log_file and os.path.exists(config._temp_log_file):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -54,29 +52,30 @@ def upload_logs_to_s3(config: TrainingConfig, s3_manager: S3Manager):
             logging.error(f"Failed to upload logs to S3: {s3_log_key}")
 
 
-def create_model(config: TrainingConfig):
+def create_model(config: VideoTrainingConfig):
     """Create and initialize the VQVAE model"""
-    num_patches = (config.image_size // config.patch_size) ** 2
-
-    model = VQVAE(
+    model = LatentActionVQVAE(
         channels=3,
-        image_size=(config.image_size, config.image_size),
-        patch_size=(config.patch_size, config.patch_size),
-        patch_embed_dim=config.hidden_dim,
-        hidden_dim=config.hidden_dim,
-        latent_dim=config.latent_dim,
-        num_embeddings=config.num_embeddings,
+        image_height=config.image_size,
+        image_width=config.image_size,
+        patch_height=config.patch_size,
+        patch_width=config.patch_size,
+        num_images_in_video=config.num_images_in_video,
+        d_model=config.d_model,
         num_heads=config.num_heads,
-        num_patches=num_patches,
-        num_transformer_layers=config.num_transformer_layers
+        num_layers=config.num_transformer_layers,
+        num_embeddings=config.num_embeddings,
+        embedding_dim=config.latent_dim,
+        use_temporal_transformer=True,
+        use_spatial_transformer=True,
     )
 
     return model
 
 
 def save_checkpoint(
-        model: VQVAE, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
-        batch_idx: int, loss: float, config: TrainingConfig, dataloader_state: dict, checkpoint_dir: str,
+        model: LatentActionVQVAE, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
+        batch_idx: int, loss: float, config: VideoTrainingConfig, dataloader_state: dict, checkpoint_dir: str,
         s3_manager: Optional[S3Manager] = None, is_best=False):
     """Save comprehensive model checkpoint to local storage or S3"""
 
@@ -199,7 +198,7 @@ def log_model_info(model, writer, step=0, wandb_logger=None):
     logger.info(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,}")
 
 
-def evaluate_model(model: VQVAE, dataloader: PokemonFrameLoader,
+def evaluate_model(model: LatentActionVQVAE, dataloader: PokemonFrameLoader,
                    criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
                    device: torch.device, num_batches: int = 10, wandb_logger=None, step=None):
     """Evaluate model on a subset of data"""
@@ -237,11 +236,11 @@ def evaluate_model(model: VQVAE, dataloader: PokemonFrameLoader,
 
 
 def train_epoch(
-        model: VQVAE, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
+        model: LatentActionVQVAE, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.CosineAnnealingLR,
         criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor],
                             torch.Tensor],
-        device: torch.device, epoch: int, writer: SummaryWriter, config: TrainingConfig,
+        device: torch.device, epoch: int, writer: SummaryWriter, config: VideoTrainingConfig,
         s3_manager: Optional[S3Manager] = None, start_batch: int = 0, wandb_logger=None):
     """Train for one epoch with comprehensive logging"""
     model.train()
@@ -258,7 +257,7 @@ def train_epoch(
     batch_start_time = time.time()
     batch_end_time = time.time()
 
-    for batch_idx, (image1_batch, image2_batch) in enumerate(dataloader):
+    for batch_idx, video_batch in enumerate(dataloader):
         logger.info(f"Time loading batch: {time.time() - batch_end_time}")
         # Skip batches if resuming
         if batch_idx < start_batch:
@@ -266,98 +265,86 @@ def train_epoch(
 
         batch_start_time = time.time()
 
-        # Move to device
-        image1_batch = image1_batch.to(device)
-        image2_batch = image2_batch.to(device)
-
         # Zero gradients
         optimizer.zero_grad()
 
+        # Move to device
+        video_batch = video_batch.to(device)
+
         # Forward pass
-        try:
-            decoded = model(image1_batch, image2_batch)
+        decoded, commitment_loss = model(video_batch)
 
-            # Calculate loss (reconstruction loss)
-            loss = criterion(image1_batch, image2_batch, decoded)
+        # Calculate loss (reconstruction loss)
+        loss = criterion(video_batch, decoded) + commitment_loss.mean()
 
-            # Backward pass
-            loss.backward()
+        # Backward pass
+        loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            optimizer.step()
-            scheduler.step()  # Step scheduler every batch for cosine annealing
+        optimizer.step()
+        scheduler.step()  # Step scheduler every batch for cosine annealing
 
-            total_loss += loss.item()
-            batch_time = time.time() - batch_start_time
+        total_loss += loss.item()
+        batch_time = time.time() - batch_start_time
 
-            # Calculate global step
-            global_step = epoch * num_batches + batch_idx
+        # Calculate global step
+        global_step = epoch * num_batches + batch_idx
 
-            # Log to tensorboard
-            writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-            writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
-            writer.add_scalar('Time/Batch_Time', batch_time, global_step)
+        # Log to tensorboard
+        writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+        writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
+        writer.add_scalar('Time/Batch_Time', batch_time, global_step)
 
-            # Log to wandb with system metrics
-            if wandb_logger:
-                wandb_metrics = {
-                    'train/loss': loss.item(),
-                    'train/learning_rate': scheduler.get_last_lr()[0],
-                    'train/batch_time': batch_time,
-                    'train/epoch': epoch,
-                    'train/batch': batch_idx,
-                }
+        # Log to wandb with system metrics
+        if wandb_logger:
+            wandb_metrics = {
+                'train/loss': loss.item(),
+                'train/learning_rate': scheduler.get_last_lr()[0],
+                'train/batch_time': batch_time,
+                'train/epoch': epoch,
+                'train/batch': batch_idx,
+            }
 
-                # Add system metrics every few batches to avoid overhead
-                if batch_idx % (config.log_interval * 2) == 0:
-                    system_metrics = get_system_metrics()
-                    for key, value in system_metrics.items():
-                        wandb_metrics[f'system/{key}'] = value
+            wandb_logger.log(wandb_metrics, step=global_step)
 
-                wandb_logger.log(wandb_metrics, step=global_step)
+        # Log progress
+        if batch_idx % config.log_interval == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            logger.info(
+                f'Epoch {epoch}, Batch {batch_idx}/{num_batches}, '
+                f'Loss: {loss.item():.6f}, LR: {current_lr:.2e}, '
+                f'Time: {batch_time:.2f}s'
+            )
 
-            # Log progress
-            if batch_idx % config.log_interval == 0:
-                current_lr = scheduler.get_last_lr()[0]
-                logger.info(
-                    f'Epoch {epoch}, Batch {batch_idx}/{num_batches}, '
-                    f'Loss: {loss.item():.6f}, LR: {current_lr:.2e}, '
-                    f'Time: {batch_time:.2f}s'
-                )
+        # Save checkpoint periodically
+        if batch_idx > 0 and batch_idx % config.save_interval == 0:
+            dataloader_state = dataloader.get_state()
+            is_best = loss.item() < best_loss
+            if is_best:
+                best_loss = loss.item()
 
-            # Save checkpoint periodically
-            if batch_idx > 0 and batch_idx % config.save_interval == 0:
-                dataloader_state = dataloader.get_state()
-                is_best = loss.item() < best_loss
-                if is_best:
-                    best_loss = loss.item()
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, batch_idx,
+                loss.item(), config, dataloader_state,
+                config.checkpoint_dir, s3_manager, is_best
+            )
 
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, batch_idx,
-                    loss.item(), config, dataloader_state,
-                    config.checkpoint_dir, s3_manager, is_best
-                )
+        batch_end_time = time.time()
 
-            batch_end_time = time.time()
+        # Evaluate periodically
+        if batch_idx > 0 and batch_idx % config.eval_interval == 0:
+            eval_loss = evaluate_model(
+                model, dataloader, criterion, device,
+                wandb_logger=wandb_logger, step=global_step
+            )
+            writer.add_scalar('Loss/Eval', eval_loss, global_step)
+            logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
 
-            # Evaluate periodically
-            if batch_idx > 0 and batch_idx % config.eval_interval == 0:
-                eval_loss = evaluate_model(
-                    model, dataloader, criterion, device,
-                    wandb_logger=wandb_logger, step=global_step
-                )
-                writer.add_scalar('Loss/Eval', eval_loss, global_step)
-                logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
-
-            # Upload logs to S3 periodically
-            if config.use_s3 and s3_manager and batch_idx > 0 and batch_idx % (config.save_interval * 2) == 0:
-                upload_logs_to_s3(config, s3_manager)
-
-        except Exception as e:
-            logging.error(f"Error in batch {batch_idx}: {e}")
-            continue
+        # Upload logs to S3 periodically
+        if config.use_s3 and s3_manager and batch_idx > 0 and batch_idx % (config.save_interval * 2) == 0:
+            upload_logs_to_s3(config, s3_manager)
 
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -373,10 +360,6 @@ def train_epoch(
             'train/epoch_time': epoch_time,
             'train/epoch': epoch,
         }
-        # Add final system metrics for the epoch
-        system_metrics = get_system_metrics()
-        for key, value in system_metrics.items():
-            epoch_metrics[f'system/{key}'] = value
 
         wandb_logger.log(epoch_metrics, step=epoch * num_batches)
 
@@ -384,7 +367,7 @@ def train_epoch(
     return avg_loss
 
 
-def create_tensorboard_writer(config: TrainingConfig, s3_manager: Optional[S3Manager] = None):
+def create_tensorboard_writer(config: VideoTrainingConfig, s3_manager: Optional[S3Manager] = None):
     """Create tensorboard writer with S3 support"""
     if config.use_s3 and s3_manager:
         # Create a temporary directory for tensorboard logs
@@ -405,60 +388,7 @@ def create_tensorboard_writer(config: TrainingConfig, s3_manager: Optional[S3Man
     return SummaryWriter(tensorboard_path)
 
 
-def upload_tensorboard_to_s3(config: TrainingConfig, s3_manager: S3Manager):
-    """Upload tensorboard logs to S3"""
-    if config._temp_tensorboard_dir and os.path.exists(config._temp_tensorboard_dir):
-        # Upload all files in the tensorboard directory
-        for root, dirs, files in os.walk(config._temp_tensorboard_dir):
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, config._temp_tensorboard_dir)
-                s3_key = f"{config.s3_tensorboard_prefix}/{relative_path}"
-
-                success = s3_manager.upload_file(local_path, s3_key)
-                if success:
-                    logging.debug(f"Uploaded tensorboard file to S3: {s3_key}")
-                else:
-                    logging.warning(f"Failed to upload tensorboard file to S3: {s3_key}")
-
-
-def get_system_metrics():
-    """Get system metrics including GPU utilization"""
-    metrics = {}
-
-    # CPU metrics
-    metrics['cpu_percent'] = psutil.cpu_percent(interval=1)
-    metrics['memory_percent'] = psutil.virtual_memory().percent
-
-    # GPU metrics
-    try:
-        gpus = GPUtil.getGPUs()
-        if gpus:
-            gpu = gpus[0]  # Use first GPU
-            metrics['gpu_utilization'] = gpu.load * 100
-            metrics['gpu_memory_utilization'] = gpu.memoryUtil * 100
-            metrics['gpu_temperature'] = gpu.temperature
-            metrics['gpu_memory_used'] = gpu.memoryUsed
-            metrics['gpu_memory_total'] = gpu.memoryTotal
-        else:
-            # Fallback for non-NVIDIA GPUs or when GPUtil doesn't work
-            if torch.cuda.is_available():
-                metrics['gpu_memory_allocated'] = torch.cuda.memory_allocated() / 1024**3  # GB
-                metrics['gpu_memory_reserved'] = torch.cuda.memory_reserved() / 1024**3  # GB
-                metrics['gpu_memory_cached'] = torch.cuda.memory_cached() / 1024**3  # GB
-    except Exception as e:
-        logging.warning(f"Could not get GPU metrics: {e}")
-        # Fallback for MPS or other devices
-        if torch.backends.mps.is_available():
-            try:
-                metrics['mps_memory_allocated'] = torch.mps.current_allocated_memory() / 1024**3  # GB
-            except:
-                pass
-
-    return metrics
-
-
-def setup_wandb(config: TrainingConfig):
+def setup_wandb(config: VideoTrainingConfig):
     """Initialize Weights & Biases logging"""
     if not config.use_wandb:
         return None
@@ -466,41 +396,19 @@ def setup_wandb(config: TrainingConfig):
     # Initialize wandb
     wandb.init(
         project=config.wandb_project,
-        group="vqvae-test",
+        group="video-vqvae-test",
         entity=config.wandb_entity,
         name=config.experiment_name,
         tags=config.wandb_tags,
         notes=config.wandb_notes,
-        config={
-            # Model config
-            'image_size': config.image_size,
-            'patch_size': config.patch_size,
-            'batch_size': config.batch_size,
-            'learning_rate': config.learning_rate,
-            'min_learning_rate': config.min_learning_rate,
-            'num_epochs': config.num_epochs,
-            'hidden_dim': config.hidden_dim,
-            'num_transformer_layers': config.num_transformer_layers,
-            'latent_dim': config.latent_dim,
-            'num_embeddings': config.num_embeddings,
-            'num_heads': config.num_heads,
-            'device': config.device,
-            'seed': config.seed,
-            # Training config
-            'log_interval': config.log_interval,
-            'save_interval': config.save_interval,
-            'eval_interval': config.eval_interval,
-            'frames_dir': config.frames_dir,
-            'use_s3': config.use_s3,
-            'seed_cache': config.seed_cache,
-        }
+        config=config.to_dict()
     )
 
     # Watch the model for gradients and parameters
     return wandb
 
 
-def main(config: TrainingConfig):
+def main(config: VideoTrainingConfig):
     """Main training function with resumable training support and S3 integration"""
 
     # Generate experiment name if not provided
@@ -528,6 +436,7 @@ def main(config: TrainingConfig):
     dataloader = PokemonFrameLoader(
         frames_dir=config.frames_dir,
         batch_size=config.batch_size,
+        num_frames_in_video=config.num_images_in_video,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
@@ -630,11 +539,6 @@ def main(config: TrainingConfig):
                 config.checkpoint_dir, s3_manager, is_best
             )
 
-            # Upload logs and tensorboard to S3 at end of epoch
-            if config.use_s3 and s3_manager:
-                upload_logs_to_s3(config, s3_manager)
-                upload_tensorboard_to_s3(config, s3_manager)
-
             # Reset start_batch for subsequent epochs
             start_batch = 0
 
@@ -657,11 +561,6 @@ def main(config: TrainingConfig):
         if wandb_logger:
             wandb_logger.finish()
 
-        # Final upload to S3
-        if config.use_s3 and s3_manager:
-            upload_logs_to_s3(config, s3_manager)
-            upload_tensorboard_to_s3(config, s3_manager)
-
         # Cleanup temporary directories
         if config._temp_log_file and os.path.exists(config._temp_log_file):
             os.unlink(config._temp_log_file)
@@ -683,7 +582,7 @@ def main(config: TrainingConfig):
 
 
 if __name__ == "__main__":
-    config = TrainingConfig.from_cli()
+    config = VideoTrainingConfig.from_cli()
 
     logger.info(f"Starting training... config: {config.to_dict()}")
     main(config)

@@ -8,38 +8,31 @@ from codebook import NaiveCodebook
 from lapa.positional_bias import Transformer
 
 
-class VQVAE(nn.Module):
+class VQVAENoPatching(nn.Module):
     def __init__(
         self,
         channels: int,
         image_size: tuple[int, int],
-        num_patches: int,
-        patch_size: tuple[int, int],
-        patch_embed_dim: int,
         hidden_dim: int,
         latent_dim: int,
         num_embeddings: int,
         num_heads: int,
         num_transformer_layers: int
     ):
-        super(VQVAE, self).__init__()
+        super(VQVAENoPatching, self).__init__()
         self.image_height, self.image_width = image_size
-        self.patch_height, self.patch_width = patch_size
-        patch_dim = channels * self.patch_height * self.patch_width
+        image_dim = channels * self.image_height * self.image_width
         self._embed_image_patches = nn.Sequential(
-            Rearrange(
-                'b c (h p1) (w p2) -> b (h w) (p1 p2 c)',  p1=self.patch_height, p2=self.patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, patch_embed_dim),
-            nn.LayerNorm(patch_embed_dim),)
-        self.patch_embed_dim = patch_embed_dim
+            nn.LayerNorm(image_dim),
+            nn.Linear(image_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),)
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.num_embeddings = num_embeddings
 
         self.project_to_pixels = nn.Sequential(
-            nn.LayerNorm(patch_embed_dim),
-            nn.Linear(patch_embed_dim, patch_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, image_dim),
         )
 
         # Spatial Transformer for per-frame understanding
@@ -143,9 +136,9 @@ class VQVAE(nn.Module):
         return encoded_first, encoded_last
 
     def quantize(self, encoded_first: torch.Tensor, encoded_last: torch.Tensor,
-                 mode: Literal["train", "inference"] = "train") -> torch.Tensor:
-        encoded_first = encoded_first.reshape(encoded_first.shape[0], -1)
-        encoded_last = encoded_last.reshape(encoded_last.shape[0], -1)
+                 mode: Literal["train", "inference"] = "train") -> tuple[torch.Tensor, torch.Tensor]:
+        # encoded_first = encoded_first.reshape(encoded_first.shape[0], -1)
+        # encoded_last = encoded_last.reshape(encoded_last.shape[0], -1)
         if mode == "train":
             return self.codebook(encoded_first, encoded_last)
         else:
@@ -160,16 +153,16 @@ class VQVAE(nn.Module):
         encoded_first, encoded_last = self.encode(image_1_batch, image_2_batch)
 
         # Quantize the latent vectors (batch_size, num_patches, latent_dim)
-        quantized = self.quantize(encoded_first, encoded_last)
+        quantized, _ = self.quantize(encoded_first, encoded_last)
 
         # Decode the quantized latent vectors into a sequence of patches (batch_size, num_patches, patch_dim)
         return self.decode(encoded_first.detach(), quantized)
 
     @torch.inference_mode()
-    def inference_step(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> torch.Tensor:
+    def inference_step(self, image_1_batch: torch.Tensor, image_2_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         encoded_first, encoded_last = self.encode(image_1_batch, image_2_batch)
-        quantized = self.quantize(encoded_first, encoded_last, mode="inference")
-        return self.decode(encoded_first.detach(), quantized)
+        quantized, indices = self.quantize(encoded_first, encoded_last, mode="inference")
+        return self.decode(encoded_first.detach(), quantized), indices
 
     def reshape_patches_to_images(self, patches: torch.Tensor) -> torch.Tensor:
         # Calculate number of patches per dimension

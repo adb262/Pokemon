@@ -23,9 +23,9 @@ class TrainingConfig:
     checkpoint_dir: str = 'checkpoints'
     tensorboard_dir: str = 'runs'
     seed: int = 42
-    hidden_dim: int = 256
+    hidden_dim: int = 128
     num_transformer_layers: int = 3
-    latent_dim: int = 128
+    latent_dim: int = 64
     num_embeddings: int = 8
     num_heads: int = 4
     resume_from: Optional[str] = None

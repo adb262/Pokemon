@@ -12,7 +12,7 @@ import numpy as np
 import logging
 import concurrent.futures
 from tqdm import tqdm
-from s3_utils import default_s3_manager
+from s3.s3_utils import default_s3_manager
 # Add the parent directory to the path so we can import from idm
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
@@ -29,6 +29,7 @@ class PokemonFrameDataset(Dataset):
         frames_dir: str,
         image_size: int = 400,
         transform=None,
+        num_frames_in_video: int = 2,
         min_frame_gap: int = 1,
         max_frame_gap: int = 5,
         seed: Optional[int] = None,
@@ -81,7 +82,7 @@ class PokemonFrameDataset(Dataset):
             self.cache_dir = None
 
         # Find all frame pairs
-        self.frame_pairs = self._find_frame_pairs()
+        self.frame_pairs = self._find_videos(num_frames_in_video)
         if stage == "test":
             self.frame_pairs = self.frame_pairs[int(len(self.frame_pairs) * 0.95):]
         else:
@@ -100,17 +101,17 @@ class PokemonFrameDataset(Dataset):
         if seed is not None:
             random.Random(seed).shuffle(self.frame_pairs)
 
-    def _find_frame_pairs(self) -> List[Tuple[str, str]]:
+    def _find_videos(self, num_frames_in_video: int) -> List[Tuple[str, str]]:
         """Find all valid consecutive frame pairs"""
         if self.use_s3:
-            return self._find_frame_pairs_s3(self.frames_dir)
+            return self._find_videos_s3(self.frames_dir, num_frames_in_video)
         else:
-            return self._find_frame_pairs_local()
+            return self._find_videos_local(num_frames_in_video)
 
-    def _find_frame_pairs_local(self) -> List[Tuple[str, str]]:
+    def _find_videos_local(self, num_frames_in_video: int) -> List[Tuple[str, ...]]:
         """Find frame pairs in local filesystem"""
-        frame_pairs = []
-        logger.info(f"Finding frame pairs in {self.frames_dir}")
+        videos = []
+        logger.info(f"Finding frame pairs in {self.frames_dir}.")
 
         # Walk through all subdirectories
         for root, dirs, files in os.walk(self.frames_dir):
@@ -130,19 +131,16 @@ class PokemonFrameDataset(Dataset):
             # Create pairs with varying gaps
             for i in range(len(frame_files) - self.max_frame_gap):
                 frame1_num, frame1_path = frame_files[i]
+                if i + num_frames_in_video < len(frame_files):
+                    # Verify both files exist
+                    if os.path.exists(frame1_path) and all(os.path.exists(frame_path)
+                                                           for frame_path in frame_files[i + 1: i + num_frames_in_video]):
 
-                # Try different gaps within the specified range
-                for gap in range(self.min_frame_gap, min(self.max_frame_gap + 1, len(frame_files) - i)):
-                    if i + gap < len(frame_files):
-                        frame2_num, frame2_path = frame_files[i + gap]
+                        videos.append((frame1_path, *frame_files[i + 1:i + num_frames_in_video]))
 
-                        # Verify both files exist
-                        if os.path.exists(frame1_path) and os.path.exists(frame2_path):
-                            frame_pairs.append((frame1_path, frame2_path))
+        return videos
 
-        return frame_pairs
-
-    def _find_frame_pairs_s3(self, source_dir: str) -> List[Tuple[str, str]]:
+    def _find_videos_s3(self, source_dir: str) -> List[Tuple[str, str]]:
         """Find frame pairs in S3"""
         logger.info(f"Finding frame pairs in {source_dir}")
 

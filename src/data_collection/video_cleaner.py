@@ -16,7 +16,7 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass
-from s3_utils import default_s3_manager
+from s3.s3_utils import default_s3_manager
 
 # Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))

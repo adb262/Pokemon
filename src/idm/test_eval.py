@@ -113,8 +113,8 @@ def test_visualization(
 
         # Forward pass
         try:
-            residual = model.inference_step(image1_batch, image2_batch)
-            reconstructed = image2_batch + residual
+            residual, indices = model.inference_step(image1_batch, image2_batch)
+            reconstructed, indices = image2_batch + residual
             logger.info(f"Reconstruction shape: {reconstructed.shape}")
 
             # Create visualization
@@ -138,7 +138,7 @@ def test_visualization(
                 # Reconstructed frame 2
                 recon = tensor_to_image(reconstructed[i])
                 axes[i, 2].imshow(recon)
-                axes[i, 2].set_title(f"Reconstructed Frame 2 (Sample {i+1})")
+                axes[i, 2].set_title(f"Reconstructed Frame 2 (Sample {i+1}). Action: {indices[i]}")
                 axes[i, 2].axis('off')
 
                 # Save individual images

@@ -7,7 +7,7 @@ Supports lazy loading, batch generation, resumable training, and S3 storage.
 
 from data_collection.frame_dataset import PokemonFrameDataset
 from data_collection.resumable_data_loader import ResumableDataLoader
-from s3_utils import S3Manager, get_s3_manager_from_env
+from s3.s3_utils import S3Manager, get_s3_manager_from_env
 import os
 from pathlib import Path
 from typing import Literal, Tuple, Iterator, Optional, Dict, Any
@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 import logging
 import json
-from s3_utils import default_s3_manager
+from s3.s3_utils import default_s3_manager
 
 # Add the parent directory to the path so we can import from idm
 import sys
@@ -31,6 +31,7 @@ class PokemonFrameLoader:
     def __init__(
         self,
         frames_dir: str,
+        num_frames_in_video: int = 2,
         batch_size: int = 8,
         image_size: int = 400,
         shuffle: bool = True,
@@ -72,6 +73,7 @@ class PokemonFrameLoader:
         self.dataset = PokemonFrameDataset(
             frames_dir=frames_dir,
             image_size=image_size,
+            num_frames_in_video=num_frames_in_video,
             min_frame_gap=min_frame_gap,
             max_frame_gap=max_frame_gap,
             seed=seed,

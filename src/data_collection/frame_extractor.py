@@ -6,7 +6,7 @@ Extracts frames at 5fps and 360p resolution, removing audio and applying crops.
 Supports both local storage and S3.
 """
 
-from s3_utils import S3Manager
+from s3.s3_utils import S3Manager
 from data_collection.video_cleaner import CropRegion, PokemonVideoCleaner
 import cv2
 import logging
@@ -18,7 +18,7 @@ import sys
 import tempfile
 from PIL import Image
 from dataclasses import dataclass
-from s3_utils import default_s3_manager
+from s3.s3_utils import default_s3_manager
 # Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))
 
