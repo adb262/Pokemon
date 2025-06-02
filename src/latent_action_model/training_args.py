@@ -23,12 +23,12 @@ class VideoTrainingConfig:
     checkpoint_dir: str = 'checkpoints'
     tensorboard_dir: str = 'runs'
     seed: int = 42
-    num_images_in_video: int = 3
-    d_model: int = 128
-    num_transformer_layers: int = 3
+    num_images_in_video: int = 5
+    d_model: int = 512
+    num_transformer_layers: int = 4
     latent_dim: int = 64
     num_embeddings: int = 8
-    num_heads: int = 4
+    num_heads: int = 8
     resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
@@ -47,6 +47,7 @@ class VideoTrainingConfig:
     s3_logs_prefix: str = 'baseten_test_logs'
     local_cache_dir: Optional[str] = os.environ.get('BT_RW_CACHE_DIR', 'cache')
     max_cache_size: int = 100000
+    no_wandb: bool = False
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None

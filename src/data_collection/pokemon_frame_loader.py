@@ -43,7 +43,8 @@ class PokemonFrameLoader:
         cache_dir: Optional[str] = None,
         max_cache_size: int = 100000,
         stage: Literal["train", "test"] = "train",
-        seed_cache: bool = False
+        seed_cache: bool = False,
+        limit: Optional[int] = None
     ):
         """
         Args:
@@ -81,7 +82,8 @@ class PokemonFrameLoader:
             cache_dir=cache_dir,
             max_cache_size=max_cache_size,
             stage=stage,
-            seed_cache=seed_cache
+            seed_cache=seed_cache,
+            limit=limit
         )
 
         # Create data loader

@@ -9,15 +9,12 @@ from s3.s3_utils import S3Manager
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.tensorboard import SummaryWriter
 import logging
 import sys
 import os
-import json
 import time
 from pathlib import Path
 from datetime import datetime
-import tempfile
 import logging
 import wandb
 from s3.s3_utils import default_s3_manager
@@ -181,23 +178,6 @@ def load_checkpoint(checkpoint_path, optimizer, scheduler, device,
     }
 
 
-def log_model_info(model, writer, step=0, wandb_logger=None):
-    """Log model information to tensorboard and wandb"""
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    writer.add_scalar('Model/TotalParameters', total_params, step)
-    writer.add_scalar('Model/TrainableParameters', trainable_params, step)
-
-    if wandb_logger:
-        wandb_logger.log({
-            'model/total_parameters': total_params,
-            'model/trainable_parameters': trainable_params,
-        }, step=step)
-
-    logger.info(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,}")
-
-
 def evaluate_model(model: LatentActionVQVAE, dataloader: PokemonFrameLoader,
                    criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
                    device: torch.device, num_batches: int = 10, wandb_logger=None, step=None):
@@ -240,10 +220,9 @@ def train_epoch(
         scheduler: optim.lr_scheduler.CosineAnnealingLR,
         criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor],
                             torch.Tensor],
-        device: torch.device, epoch: int, writer: SummaryWriter, config: VideoTrainingConfig,
+        device: torch.device, epoch: int, config: VideoTrainingConfig,
         s3_manager: Optional[S3Manager] = None, start_batch: int = 0, wandb_logger=None):
     """Train for one epoch with comprehensive logging"""
-    model.train()
     total_loss = 0.0
     num_batches = len(dataloader)
     best_loss = float('inf')
@@ -255,10 +234,9 @@ def train_epoch(
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
-    batch_end_time = time.time()
+    commit_beta = 0.1
 
     for batch_idx, video_batch in enumerate(dataloader):
-        logger.info(f"Time loading batch: {time.time() - batch_end_time}")
         # Skip batches if resuming
         if batch_idx < start_batch:
             continue
@@ -275,7 +253,8 @@ def train_epoch(
         decoded, commitment_loss = model(video_batch)
 
         # Calculate loss (reconstruction loss)
-        loss = criterion(video_batch, decoded) + commitment_loss.mean()
+        mse_loss = criterion(video_batch, decoded)
+        loss = mse_loss + commitment_loss.mean() * commit_beta
 
         # Backward pass
         loss.backward()
@@ -292,11 +271,6 @@ def train_epoch(
         # Calculate global step
         global_step = epoch * num_batches + batch_idx
 
-        # Log to tensorboard
-        writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-        writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
-        writer.add_scalar('Time/Batch_Time', batch_time, global_step)
-
         # Log to wandb with system metrics
         if wandb_logger:
             wandb_metrics = {
@@ -305,6 +279,8 @@ def train_epoch(
                 'train/batch_time': batch_time,
                 'train/epoch': epoch,
                 'train/batch': batch_idx,
+                'train/commitment_loss': commitment_loss.mean().item(),
+                'train/mse_loss': mse_loss.item(),
             }
 
             wandb_logger.log(wandb_metrics, step=global_step)
@@ -339,7 +315,6 @@ def train_epoch(
                 model, dataloader, criterion, device,
                 wandb_logger=wandb_logger, step=global_step
             )
-            writer.add_scalar('Loss/Eval', eval_loss, global_step)
             logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
 
         # Upload logs to S3 periodically
@@ -350,9 +325,6 @@ def train_epoch(
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch metrics
-    writer.add_scalar('Loss/Train_Epoch', avg_loss, epoch)
-    writer.add_scalar('Time/Epoch_Time', epoch_time, epoch)
-
     # Log epoch summary to wandb
     if wandb_logger:
         epoch_metrics = {
@@ -365,27 +337,6 @@ def train_epoch(
 
     logger.info(f'Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s')
     return avg_loss
-
-
-def create_tensorboard_writer(config: VideoTrainingConfig, s3_manager: Optional[S3Manager] = None):
-    """Create tensorboard writer with S3 support"""
-    if config.use_s3 and s3_manager:
-        # Create a temporary directory for tensorboard logs
-        temp_dir = tempfile.mkdtemp(prefix="tensorboard_")
-        if config.experiment_name:
-            tensorboard_path = os.path.join(temp_dir, config.experiment_name)
-        else:
-            tensorboard_path = temp_dir
-
-        # Store temp directory for later S3 upload
-        config._temp_tensorboard_dir = temp_dir
-    else:
-        if config.experiment_name:
-            tensorboard_path = os.path.join(config.tensorboard_dir, config.experiment_name)
-        else:
-            tensorboard_path = config.tensorboard_dir
-
-    return SummaryWriter(tensorboard_path)
 
 
 def setup_wandb(config: VideoTrainingConfig):
@@ -440,14 +391,13 @@ def main(config: VideoTrainingConfig):
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
-        min_frame_gap=1,
-        max_frame_gap=3,
         seed=config.seed,
         use_s3=config.use_s3,
         cache_dir=config.local_cache_dir,
         max_cache_size=config.max_cache_size,
         stage="train",
-        seed_cache=config.seed_cache
+        seed_cache=config.seed_cache,
+        limit=10000
     )
 
     # Print dataset info
@@ -485,16 +435,6 @@ def main(config: VideoTrainingConfig):
     criterion = reconstruction_loss
     s3_manager = default_s3_manager
 
-    # Create tensorboard writer
-    writer = create_tensorboard_writer(config, s3_manager)
-
-    # Log model info
-    log_model_info(model, writer, wandb_logger=wandb_logger)
-
-    # Log configuration
-    config_text = json.dumps({**config.__dict__}, indent=2, default=str)
-    writer.add_text('Config', config_text, 0)
-
     # Resume from checkpoint if specified
     start_epoch = 0
     start_batch = 0
@@ -519,28 +459,29 @@ def main(config: VideoTrainingConfig):
     best_loss = float('inf')
 
     try:
+        model.train()
         for epoch in range(start_epoch, config.num_epochs):
             epoch_start_batch = start_batch if epoch == start_epoch else 0
 
             avg_loss = train_epoch(
                 model, dataloader, optimizer, scheduler, criterion, device,
-                epoch, writer, config, s3_manager, epoch_start_batch, wandb_logger
+                epoch, config, s3_manager, epoch_start_batch, wandb_logger
             )
 
             # Save end-of-epoch checkpoint
-            dataloader_state = dataloader.get_state()
-            is_best = avg_loss < best_loss
-            if is_best:
-                best_loss = avg_loss
+            # dataloader_state = dataloader.get_state()
+            # is_best = avg_loss < best_loss
+            # if is_best:
+            #     best_loss = avg_loss
 
             save_checkpoint(
                 model, optimizer, scheduler, epoch, len(dataloader),
-                avg_loss, config, dataloader_state,
-                config.checkpoint_dir, s3_manager, is_best
+                avg_loss, config, dataloader.get_state(),
+                config.checkpoint_dir, s3_manager, False
             )
 
-            # Reset start_batch for subsequent epochs
-            start_batch = 0
+            # # Reset start_batch for subsequent epochs
+            # start_batch = 0
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -555,8 +496,6 @@ def main(config: VideoTrainingConfig):
         logging.error(f"Training error: {e}")
         raise
     finally:
-        writer.close()
-
         # Finish wandb run
         if wandb_logger:
             wandb_logger.finish()

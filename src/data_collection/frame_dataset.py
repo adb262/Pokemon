@@ -38,7 +38,8 @@ class PokemonFrameDataset(Dataset):
         max_cache_size: int = 100000,
         stage: Literal["train", "test"] = "train",
         seed_cache: bool = False,
-        num_concurrent_downloads: int = 50
+        num_concurrent_downloads: int = 50,
+        limit: Optional[int] = None
     ):
         """
         Args:
@@ -83,10 +84,14 @@ class PokemonFrameDataset(Dataset):
 
         # Find all frame pairs
         self.frame_pairs = self._find_videos(num_frames_in_video)
+
         if stage == "test":
             self.frame_pairs = self.frame_pairs[int(len(self.frame_pairs) * 0.95):]
         else:
             self.frame_pairs = self.frame_pairs[:int(len(self.frame_pairs) * 0.95)]
+
+        if limit is not None:
+            self.frame_pairs = self.frame_pairs[:limit]
 
         if seed_cache:
             logger.info("Seeding cache...")
@@ -242,7 +247,10 @@ class PokemonFrameDataset(Dataset):
             image = image.resize((self.image_size, self.image_size))
 
         # Convert to tensors (C, H, W)
-        image_tensor = torch.tensor(np.array(image), dtype=torch.int8).permute(2, 0, 1) / 255.0
+        # Convert PIL Image to numpy array (uint8)
+        image_np = np.array(image)
+        # Convert numpy array to float32 tensor and normalize to [0, 1]
+        image_tensor = torch.tensor(image_np, dtype=torch.float32).permute(2, 0, 1) / 255.0
 
         # Apply transforms if provided
         if self.transform:

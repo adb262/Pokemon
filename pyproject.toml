@@ -16,6 +16,7 @@ dependencies = [
     "psutil>=6.1.0",
     "tensorboard>=2.19.0",
     "torch>=2.7.0",
+    "torchmetrics>=1.7.2",
     "tqdm>=4.67.1",
     "truss>=0.9.95",
     "vector-quantize-pytorch>=1.22.16",
