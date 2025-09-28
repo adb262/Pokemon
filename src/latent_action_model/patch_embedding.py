@@ -1,6 +1,10 @@
-from einops.layers.torch import Rearrange
+import logging
+
 import torch
 import torch.nn as nn
+from einops.layers.torch import Rearrange
+
+logger = logging.getLogger(__name__)
 
 
 class PatchEmbedding(nn.Module):
@@ -19,4 +23,8 @@ class PatchEmbedding(nn.Module):
             nn.LayerNorm(d_model),)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._embed_image_patches(x)
+        # x is of shape (batch_size, num_images_in_video, c, h, w)
+        logger.debug(f"x shape after embed_image_patches: {x.shape}")
+        x = self._embed_image_patches(x)
+        logger.debug(f"x shape after embed_image_patches: {x.shape}")
+        return x

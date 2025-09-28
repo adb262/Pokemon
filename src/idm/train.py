@@ -1,28 +1,28 @@
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from training_args import TrainingConfig
-from src.loss.loss_fns import reconstruction_residual_loss
-from vqvae import VQVAE
-from s3.s3_utils import S3Manager
+
+import GPUtil
+import psutil
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
-import logging
-import sys
-import os
-import json
-import time
-from pathlib import Path
-from datetime import datetime
-import tempfile
-import logging
-import psutil
-import GPUtil
+from training_args import TrainingConfig
+from vqvae import VQVAE
+
 import wandb
-from s3.s3_utils import default_s3_manager
+from data_collection.pokemon_frame_loader import PokemonFrameLoader
+from s3.s3_utils import S3Manager, default_s3_manager
+from src.loss.loss_fns import reconstruction_residual_loss
 
 logging.basicConfig(
     level=logging.INFO,

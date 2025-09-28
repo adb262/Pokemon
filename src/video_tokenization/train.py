@@ -1,23 +1,21 @@
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
+import logging
+import os
+import time
+from datetime import datetime
 from typing import Callable, Optional
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from latent_action_model.training_args import VideoTrainingConfig
-from loss.loss_fns import reconstruction_residual_loss
-from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
-from s3.s3_utils import S3Manager
+
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import logging
-import sys
-import os
-import time
-from pathlib import Path
-from datetime import datetime
-import logging
+
 import wandb
-from s3.s3_utils import default_s3_manager
+from data_collection.pokemon_frame_loader import PokemonFrameLoader
+from latent_action_model.training_args import VideoTrainingConfig
+from loss.loss_fns import reconstruction_residual_loss
+from s3.s3_utils import S3Manager, default_s3_manager
+from video_tokenization.tokenizer import VideoTokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,31 +25,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Add the parent dir
-# ectory to the path so we can import from data_collection
-sys.path.append(str(Path(__file__).parent.parent))
-
-
-# beartype_all(conf=BeartypeConf(violation_type=UserWarning))
-# AI BS generation here... use a real config class for god sake
-
-
-def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
-    """Upload logs to S3"""
-    if config._temp_log_file and os.path.exists(config._temp_log_file):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        s3_log_key = f"{config.s3_logs_prefix}/{config.experiment_name}/training_{timestamp}.log"
-
-        success = s3_manager.upload_file(config._temp_log_file, s3_log_key)
-        if success:
-            logger.info(f"Uploaded logs to S3: {s3_log_key}")
-        else:
-            logging.error(f"Failed to upload logs to S3: {s3_log_key}")
-
-
 def create_model(config: VideoTrainingConfig):
     """Create and initialize the VQVAE model"""
-    model = LatentActionVQVAE(
+    model = VideoTokenizer(
         channels=3,
         image_height=config.image_size,
         image_width=config.image_size,
@@ -61,168 +37,44 @@ def create_model(config: VideoTrainingConfig):
         d_model=config.d_model,
         num_heads=config.num_heads,
         num_layers=config.num_transformer_layers,
-        num_embeddings=config.num_embeddings,
         embedding_dim=config.latent_dim,
-        use_temporal_transformer=True,
-        use_spatial_transformer=True,
     )
 
     return model
 
-
-def save_checkpoint(
-        model: LatentActionVQVAE, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
-        batch_idx: int, loss: float, config: VideoTrainingConfig, dataloader_state: dict, checkpoint_dir: str,
-        s3_manager: Optional[S3Manager] = None, is_best=False):
-    """Save comprehensive model checkpoint to local storage or S3"""
-
+def save_checkpoint(model: VideoTokenizer, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
+        batch_idx: int, loss: float, config: VideoTrainingConfig, best_loss: float, dataloader_state: dict):
     checkpoint = {
         'epoch': epoch,
-        'batch_idx': batch_idx,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'loss': loss,
+        'best_loss': best_loss,
         'config': config.to_dict(),
         'dataloader_state': dataloader_state,
-        'timestamp': datetime.now().isoformat(),
-        'total_batches_processed': epoch * len(dataloader_state['loader_state']['dataset_state']) // config.batch_size + batch_idx
     }
+    checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_epoch{epoch}_batch{batch_idx}.pt')
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Saved checkpoint: {checkpoint_path}")
 
-    if config.use_s3 and s3_manager:
-        # Save to S3
-        checkpoint_key = f"{config.s3_checkpoint_prefix}/{config.experiment_name}/checkpoint_epoch_{epoch}_batch_{batch_idx}.pt"
-        latest_key = f"{config.s3_checkpoint_prefix}/{config.experiment_name}/checkpoint_latest.pt"
-
-        # Upload checkpoint
-        success = s3_manager.upload_pytorch_model(checkpoint, checkpoint_key)
-        if success:
-            logger.info(f"Checkpoint saved to S3: {checkpoint_key}")
-
-            # Also save as latest
-            s3_manager.upload_pytorch_model(checkpoint, latest_key)
-
-            # Save best checkpoint if this is the best
-            if is_best:
-                best_key = f"{config.s3_checkpoint_prefix}/{config.experiment_name}/checkpoint_best.pt"
-                s3_manager.upload_pytorch_model(checkpoint, best_key)
-                logger.info(f"New best checkpoint saved to S3: {best_key}")
-
-            return checkpoint_key
-        else:
-            logging.error(f"Failed to save checkpoint to S3: {checkpoint_key}")
-            return None
-    else:
-        # Save locally
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}_batch_{batch_idx}.pt')
-        torch.save(checkpoint, checkpoint_path)
-
-        # Save latest checkpoint
-        latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pt')
-        torch.save(checkpoint, latest_path)
-
-        # Save best checkpoint if this is the best
-        if is_best:
-            best_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
-            torch.save(checkpoint, best_path)
-            logger.info(f"New best checkpoint saved: {best_path}")
-
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
-        return checkpoint_path
-
-
-def load_checkpoint(checkpoint_path, optimizer, scheduler, device,
-                    s3_manager: Optional[S3Manager] = None):
-    """Load comprehensive model checkpoint from local storage or S3"""
-
-    if checkpoint_path.startswith('s3://') or (s3_manager and not os.path.exists(checkpoint_path)):
-        # Load from S3
-        if s3_manager is None:
-            logging.error("S3Manager required for S3 checkpoint loading")
-            return None
-
-        checkpoint = s3_manager.download_pytorch_model(checkpoint_path, map_location=device)
-        if checkpoint is None:
-            logging.error(f"Checkpoint not found in S3: {checkpoint_path}")
-            return None
-    else:
-        # Load locally
-        if not os.path.exists(checkpoint_path):
-            logging.error(f"Checkpoint not found: {checkpoint_path}")
-            return None
-
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    config = checkpoint['config']
-    model = create_model(config)
+def load_checkpoint(checkpoint_path: str, model: VideoTokenizer, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, device: torch.device) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.CosineAnnealingLR, dict]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-    epoch = checkpoint['epoch']
-    batch_idx = checkpoint.get('batch_idx', 0)
-    loss = checkpoint['loss']
-    dataloader_state = checkpoint.get('dataloader_state', {})
-
-    logger.info(f"Checkpoint loaded: {checkpoint_path}")
-    logger.info(f"Resuming from epoch {epoch}, batch {batch_idx}, loss: {loss:.6f}")
-
-    return {
-        'epoch': epoch,
-        'batch_idx': batch_idx,
-        'loss': loss,
-        'config': config,
-        'dataloader_state': dataloader_state
-    }
-
-
-def evaluate_model(model: LatentActionVQVAE, dataloader: PokemonFrameLoader,
-                   criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
-                   device: torch.device, num_batches: int = 10, wandb_logger=None, step=None):
-    """Evaluate model on a subset of data"""
-    model.eval()
-    total_loss = 0.0
-    total_samples = 0
-
-    with torch.no_grad():
-        for batch_idx, (image1_batch, image2_batch) in enumerate(dataloader):
-            if batch_idx >= num_batches:
-                break
-
-            image1_batch = image1_batch.to(device)
-            image2_batch = image2_batch.to(device)
-
-            try:
-                decoded = model(image1_batch, image2_batch)
-                loss = criterion(image1_batch, image2_batch, decoded)
-
-                total_loss += loss.item() * image1_batch.size(0)
-                total_samples += image1_batch.size(0)
-
-            except Exception as e:
-                logging.warning(f"Error in evaluation batch {batch_idx}: {e}")
-                continue
-
-    avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
-
-    # Log to wandb if available
-    if wandb_logger and step is not None:
-        wandb_logger.log({'eval/loss': avg_loss}, step=step)
-
-    model.train()  # Switch back to training mode
-    return avg_loss
+    dataloader_state = PokemonFrameLoader.load_state(checkpoint['dataloader_state'])
+    return model, optimizer, scheduler, dataloader_state
 
 
 def train_epoch(
-        model: LatentActionVQVAE, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
+        model: VideoTokenizer, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.CosineAnnealingLR,
-        criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor],
+        criterion: Callable[[torch.Tensor, torch.Tensor],
                             torch.Tensor],
         device: torch.device, epoch: int, config: VideoTrainingConfig,
         s3_manager: Optional[S3Manager] = None, start_batch: int = 0, wandb_logger=None):
-    """Train for one epoch with comprehensive logging"""
     total_loss = 0.0
     num_batches = len(dataloader)
     best_loss = float('inf')
@@ -234,7 +86,6 @@ def train_epoch(
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
-    commit_beta = 0.2
 
     for batch_idx, video_batch in enumerate(dataloader):
         # Skip batches if resuming
@@ -249,12 +100,13 @@ def train_epoch(
         # Move to device
         video_batch = video_batch.to(device)
 
-        # Forward pass
-        decoded, commitment_loss = model(video_batch)
+        # Forward pass with decoder
+        # Outputs a tensor of shape (batch_size, num_images_in_video, channels, image_height, image_width)
+        decoded = model(video_batch)
 
         # Calculate loss (reconstruction loss)
-        mse_loss = criterion(video_batch, decoded)
-        loss = mse_loss + commitment_loss.mean() * commit_beta
+        # TODO: Consider patch level loss
+        loss = criterion(video_batch, decoded)
 
         # Backward pass
         loss.backward()
@@ -279,8 +131,6 @@ def train_epoch(
                 'train/batch_time': batch_time,
                 'train/epoch': epoch,
                 'train/batch': batch_idx,
-                'train/commitment_loss': commitment_loss.mean().item(),
-                'train/mse_loss': mse_loss.item(),
             }
 
             wandb_logger.log(wandb_metrics, step=global_step)
@@ -297,29 +147,22 @@ def train_epoch(
         # Save checkpoint periodically
         if batch_idx > 0 and batch_idx % config.save_interval == 0:
             dataloader_state = dataloader.get_state()
-            is_best = loss.item() < best_loss
+            is_best = loss < best_loss
             if is_best:
                 best_loss = loss.item()
 
             save_checkpoint(
                 model, optimizer, scheduler, epoch, batch_idx,
-                loss.item(), config, dataloader_state,
-                config.checkpoint_dir, s3_manager, is_best
+                loss.item(), config, best_loss, dataloader_state
             )
 
-        batch_end_time = time.time()
-
-        # Evaluate periodically
-        if batch_idx > 0 and batch_idx % config.eval_interval == 0:
-            eval_loss = evaluate_model(
-                model, dataloader, criterion, device,
-                wandb_logger=wandb_logger, step=global_step
-            )
-            logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
-
-        # Upload logs to S3 periodically
-        if config.use_s3 and s3_manager and batch_idx > 0 and batch_idx % (config.save_interval * 2) == 0:
-            upload_logs_to_s3(config, s3_manager)
+        # # Evaluate periodically
+        # if batch_idx > 0 and batch_idx % config.eval_interval == 0:
+        #     eval_loss = evaluate_model(
+        #         model, dataloader, criterion, device,
+        #         wandb_logger=wandb_logger, step=global_step
+        #     )
+        #     logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
 
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -347,7 +190,7 @@ def setup_wandb(config: VideoTrainingConfig):
     # Initialize wandb
     wandb.init(
         project=config.wandb_project,
-        group="video-vqvae-test",
+        group="video-tokenizer-test",
         entity=config.wandb_entity,
         name=config.experiment_name,
         tags=config.wandb_tags,
@@ -397,7 +240,7 @@ def main(config: VideoTrainingConfig):
         max_cache_size=config.max_cache_size,
         stage="train",
         seed_cache=config.seed_cache,
-        limit=10000
+        limit=100
     )
 
     # Print dataset info
@@ -414,6 +257,8 @@ def main(config: VideoTrainingConfig):
     logger.info(f"Creating model on device {device}...")
     model = create_model(config)
     model.to(device)
+
+    logger.info(f"Num params: {sum(p.numel() for p in model.parameters())} on device {device}")
 
     # Watch model with wandb
     if wandb_logger:
@@ -441,7 +286,7 @@ def main(config: VideoTrainingConfig):
 
     if config.resume_from:
         checkpoint_info = load_checkpoint(
-            config.resume_from, optimizer, scheduler, device, s3_manager
+            config.resume_from, model, optimizer, scheduler, device
         )
         if checkpoint_info:
             start_epoch = checkpoint_info['epoch']
@@ -468,20 +313,12 @@ def main(config: VideoTrainingConfig):
                 epoch, config, s3_manager, epoch_start_batch, wandb_logger
             )
 
-            # Save end-of-epoch checkpoint
-            # dataloader_state = dataloader.get_state()
-            # is_best = avg_loss < best_loss
-            # if is_best:
-            #     best_loss = avg_loss
-
             save_checkpoint(
                 model, optimizer, scheduler, epoch, len(dataloader),
                 avg_loss, config, dataloader.get_state(),
                 config.checkpoint_dir, s3_manager, False
             )
 
-            # # Reset start_batch for subsequent epochs
-            # start_batch = 0
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")

@@ -1,12 +1,13 @@
-import torch
-from vector_quantize_pytorch import ResidualVQ
-import torch.nn as nn
-
 import logging
 
+import torch
+import torch.nn as nn
+
+from idm.lapa.nsvq import NSVQ
 from latent_action_model.decoder import VideoDecoder
 from latent_action_model.patch_embedding import PatchEmbedding
 from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransformer
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +72,8 @@ class LatentActionVQVAE(nn.Module):
             use_temporal_transformer=use_temporal_transformer,
         )
 
+        self.conv_down = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1, stride=1)
+
         num_patches_h = image_height // patch_height
         num_patches_w = image_width // patch_width
         self.num_patches_per_image = num_patches_h * num_patches_w
@@ -81,12 +84,21 @@ class LatentActionVQVAE(nn.Module):
             d_model_output=d_model
         )
 
-        self.quantizer = ResidualVQ(
+        # self.quantizer = VectorQuantize(
+        #     dim=d_model,
+        #     codebook_size=num_embeddings,
+        #     decay=0.8,
+        # )
+        self.quantizer = NSVQ(
             dim=d_model,
-            num_quantizers=8,
-            codebook_size=num_embeddings,
-            codebook_dim=embedding_dim,
-            shared_codebook=True,
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            patch_size=patch_height,
+            image_size=image_height,
+            device="mps",
+            discarding_threshold=0.1,
+            initialization='normal',
+            code_seq_len=1,
         )
 
         self.decoder = VideoDecoder(
@@ -115,14 +127,28 @@ class LatentActionVQVAE(nn.Module):
         x_encoded_full = self.encoder(patched_video_from_embedder)
         logger.debug(f"x_encoded_full shape after encoder: {x_encoded_full.shape}")
 
-        # Condense features for each of these frames
-        # Shape of each after action_condenser is (batch_size, num_images_in_video, d_model)
-        action_continuous = self.action_condenser(x_encoded_full)
-        logger.debug(f"action_continuous shape: {action_continuous.shape}")
+        x_encoded_full = x_encoded_full.reshape(0, 1, -1)
+        # Shape is now (batch_size, 1, num_patches, num_frames * d_model)
 
-        quantized, indices, commitment_loss = self.quantizer(action_continuous)
-        logger.debug(f"quantized shape: {quantized.shape}")
-        logger.debug(f"indices shape: {indices.shape}")
+        # Condense features for each of these frames using a 3x3 convolution
+        x_encoded_full = self.conv_down(x_encoded_full)
+        logger.debug(f"x_encoded_full shape after conv_down: {x_encoded_full.shape}")
+
+        # Shape is now (batch_size, d_model, num_patches * num_frames)
+
+        # Shape of each after action_condenser is (batch_size, num_images_in_video, d_model)
+        # action_continuous = self.action_condenser(x_encoded_full)
+        # logger.debug(f"action_continuous shape: {action_continuous.shape}")
+
+        logger.info(f"x_encoded_full shape: {x_encoded_full.shape} {x_encoded_full}")
+        # Pass in second to last frame and last frame
+        quantized, perplexity, commitment_loss, indices = self.quantizer(
+            x_encoded_full[:, :1, :, :], x_encoded_full[:, 1:, :, :]
+        )
+
+        # quantized, indices, commitment_loss = self.quantizer(action_continuous)
+        logger.info(f"quantized shape: {quantized.shape}")
+        logger.info(f"indices shape: {indices}. {indices.shape}")
         logger.debug(f"commitment_loss: {commitment_loss}")
 
         # Trim off the final image from the video for decoder input
@@ -130,6 +156,6 @@ class LatentActionVQVAE(nn.Module):
         patch_video_for_decoder = patched_video_from_embedder[:, :-1, :, :]
 
         # Now, we need to decode. The decoder aims to predict frame T-1 using frames 0 to T-2 and the quantized_action.
-        decoded = self.decoder(patch_video_for_decoder, quantized[:, -1, :])  # quantized is (B, D_model)
+        decoded = self.decoder(patch_video_for_decoder, quantized)  # quantized is (B, 2*h, D_model)
         logger.debug(f"decoded shape: {decoded.shape}")  # Decoder outputs a single frame (B, C, H, W)
         return decoded, commitment_loss

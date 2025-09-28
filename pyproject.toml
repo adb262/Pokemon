@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "beartype>=0.21.0",
     "dataclasses>=0.8",
+    "dotenv>=0.9.9",
     "einops>=0.8.1",
     "gputil>=1.4.0",
     "httpx>=0.28.1",

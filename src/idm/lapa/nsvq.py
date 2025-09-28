@@ -64,7 +64,7 @@ class NSVQ(torch.nn.Module):
                 torch.nn.ReLU(),
                 torch.nn.Conv2d(
                 in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=4, stride=1, padding=0),)
+                kernel_size=13, stride=1, padding=0),)
         elif code_seq_len == 2:
             self.cnn_encoder = torch.nn.Sequential(torch.nn.Conv2d(
                 in_channels=embedding_dim, out_channels=embedding_dim,

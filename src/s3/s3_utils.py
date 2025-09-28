@@ -4,19 +4,22 @@ S3 Utilities for Pokemon Training
 Handles all S3 operations including file uploads, downloads, and listing.
 """
 
-import os
 import io
 import json
 import logging
+import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
-import torch
-from PIL import Image
-import botocore.config
 
+import boto3
+import botocore.config
+import torch
+from botocore.exceptions import ClientError, NoCredentialsError
+from dotenv import load_dotenv
+from PIL import Image
+
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 
