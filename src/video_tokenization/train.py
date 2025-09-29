@@ -1,3 +1,4 @@
+# python -m src.video_tokenization.train --use_s3 true --frames_dir pokemon --seed_cache --num_frames_in_video 2 --batch_size 2
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import logging
@@ -19,11 +20,12 @@ from video_tokenization.tokenizer import VideoTokenizer
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 
 logger = logging.getLogger(__name__)
+
 
 def create_model(config: VideoTrainingConfig):
     """Create and initialize the VQVAE model"""
@@ -42,42 +44,67 @@ def create_model(config: VideoTrainingConfig):
 
     return model
 
-def save_checkpoint(model: VideoTokenizer, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
-        batch_idx: int, loss: float, config: VideoTrainingConfig, best_loss: float, dataloader_state: dict):
+
+def save_checkpoint(
+    model: VideoTokenizer,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    epoch: int,
+    batch_idx: int,
+    loss: float,
+    config: VideoTrainingConfig,
+    best_loss: float,
+    dataloader_state: dict,
+):
     checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss,
-        'best_loss': best_loss,
-        'config': config.to_dict(),
-        'dataloader_state': dataloader_state,
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "loss": loss,
+        "best_loss": best_loss,
+        "config": config.to_dict(),
+        "dataloader_state": dataloader_state,
     }
-    checkpoint_path = os.path.join(config.checkpoint_dir, f'checkpoint_epoch{epoch}_batch{batch_idx}.pt')
+    checkpoint_path = os.path.join(
+        config.checkpoint_dir, f"checkpoint_epoch{epoch}_batch{batch_idx}.pt"
+    )
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Saved checkpoint: {checkpoint_path}")
 
-def load_checkpoint(checkpoint_path: str, model: VideoTokenizer, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, device: torch.device) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.CosineAnnealingLR, dict]:
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: VideoTokenizer,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    device: torch.device,
+) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.CosineAnnealingLR, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    dataloader_state = PokemonFrameLoader.load_state(checkpoint['dataloader_state'])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    dataloader_state = PokemonFrameLoader.load_state(checkpoint["dataloader_state"])
     return model, optimizer, scheduler, dataloader_state
 
 
 def train_epoch(
-        model: VideoTokenizer, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
-        scheduler: optim.lr_scheduler.CosineAnnealingLR,
-        criterion: Callable[[torch.Tensor, torch.Tensor],
-                            torch.Tensor],
-        device: torch.device, epoch: int, config: VideoTrainingConfig,
-        s3_manager: Optional[S3Manager] = None, start_batch: int = 0, wandb_logger=None):
+    model: VideoTokenizer,
+    dataloader: PokemonFrameLoader,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    device: torch.device,
+    epoch: int,
+    config: VideoTrainingConfig,
+    s3_manager: Optional[S3Manager] = None,
+    start_batch: int = 0,
+    wandb_logger=None,
+):
     total_loss = 0.0
     num_batches = len(dataloader)
-    best_loss = float('inf')
+    best_loss = float("inf")
 
     # Set up resumable dataloader
     if start_batch > 0:
@@ -126,11 +153,11 @@ def train_epoch(
         # Log to wandb with system metrics
         if wandb_logger:
             wandb_metrics = {
-                'train/loss': loss.item(),
-                'train/learning_rate': scheduler.get_last_lr()[0],
-                'train/batch_time': batch_time,
-                'train/epoch': epoch,
-                'train/batch': batch_idx,
+                "train/loss": loss.item(),
+                "train/learning_rate": scheduler.get_last_lr()[0],
+                "train/batch_time": batch_time,
+                "train/epoch": epoch,
+                "train/batch": batch_idx,
             }
 
             wandb_logger.log(wandb_metrics, step=global_step)
@@ -139,9 +166,9 @@ def train_epoch(
         if batch_idx % config.log_interval == 0:
             current_lr = scheduler.get_last_lr()[0]
             logger.info(
-                f'Epoch {epoch}, Batch {batch_idx}/{num_batches}, '
-                f'Loss: {loss.item():.6f}, LR: {current_lr:.2e}, '
-                f'Time: {batch_time:.2f}s'
+                f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
+                f"Loss: {loss.item():.6f}, LR: {current_lr:.2e}, "
+                f"Time: {batch_time:.2f}s"
             )
 
         # Save checkpoint periodically
@@ -152,8 +179,15 @@ def train_epoch(
                 best_loss = loss.item()
 
             save_checkpoint(
-                model, optimizer, scheduler, epoch, batch_idx,
-                loss.item(), config, best_loss, dataloader_state
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                batch_idx,
+                loss.item(),
+                config,
+                best_loss,
+                dataloader_state,
             )
 
         # # Evaluate periodically
@@ -171,14 +205,16 @@ def train_epoch(
     # Log epoch summary to wandb
     if wandb_logger:
         epoch_metrics = {
-            'train/epoch_loss': avg_loss,
-            'train/epoch_time': epoch_time,
-            'train/epoch': epoch,
+            "train/epoch_loss": avg_loss,
+            "train/epoch_time": epoch_time,
+            "train/epoch": epoch,
         }
 
         wandb_logger.log(epoch_metrics, step=epoch * num_batches)
 
-    logger.info(f'Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s')
+    logger.info(
+        f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
+    )
     return avg_loss
 
 
@@ -195,7 +231,7 @@ def setup_wandb(config: VideoTrainingConfig):
         name=config.experiment_name,
         tags=config.wandb_tags,
         notes=config.wandb_notes,
-        config=config.to_dict()
+        config=config.to_dict(),
     )
 
     # Watch the model for gradients and parameters
@@ -213,7 +249,9 @@ def main(config: VideoTrainingConfig):
     # Setup wandb
     wandb_logger = setup_wandb(config)
 
-    logger.info(f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}")
+    logger.info(
+        f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}"
+    )
     logger.info(f"Using S3: {config.use_s3}")
     logger.info(f"Using Wandb: {config.use_wandb}")
 
@@ -240,7 +278,7 @@ def main(config: VideoTrainingConfig):
         max_cache_size=config.max_cache_size,
         stage="train",
         seed_cache=config.seed_cache,
-        limit=100
+        limit=10000,
     )
 
     # Print dataset info
@@ -251,29 +289,31 @@ def main(config: VideoTrainingConfig):
 
     # Log dataset info to wandb
     if wandb_logger:
-        wandb_logger.log({f'dataset/{key}': value for key, value in info.items()})
+        wandb_logger.log({f"dataset/{key}": value for key, value in info.items()})
 
     # Create model
     logger.info(f"Creating model on device {device}...")
     model = create_model(config)
     model.to(device)
 
-    logger.info(f"Num params: {sum(p.numel() for p in model.parameters())} on device {device}")
+    logger.info(
+        f"Num params: {sum(p.numel() for p in model.parameters())} on device {device}"
+    )
 
     # Watch model with wandb
     if wandb_logger:
-        wandb_logger.watch(model, log='all', log_freq=config.log_interval * 10)
+        wandb_logger.watch(model, log="all", log_freq=config.log_interval * 10)
 
     # Create optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        model.parameters(), lr=config.learning_rate, weight_decay=1e-4
+    )
     logger.info(f"Optimizer created with learning rate: {config.learning_rate}")
 
     # Cosine annealing scheduler
     total_steps = config.num_epochs * len(dataloader)
     scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps,
-        eta_min=config.min_learning_rate
+        optimizer, T_max=total_steps, eta_min=config.min_learning_rate
     )
 
     # Loss function
@@ -289,19 +329,19 @@ def main(config: VideoTrainingConfig):
             config.resume_from, model, optimizer, scheduler, device
         )
         if checkpoint_info:
-            start_epoch = checkpoint_info['epoch']
-            start_batch = checkpoint_info.get('batch_idx', 0)
+            start_epoch = checkpoint_info["epoch"]
+            start_batch = checkpoint_info.get("batch_idx", 0)
 
             # Restore dataloader state
-            if 'dataloader_state' in checkpoint_info:
-                dataloader_state = checkpoint_info['dataloader_state']
+            if "dataloader_state" in checkpoint_info:
+                dataloader_state = checkpoint_info["dataloader_state"]
                 dataloader.resumable_loader = dataloader.create_resumable_loader(
                     start_epoch, start_batch
                 )
 
     # Training loop
     logger.info("Starting training loop...")
-    best_loss = float('inf')
+    best_loss = float("inf")
 
     try:
         model.train()
@@ -309,25 +349,46 @@ def main(config: VideoTrainingConfig):
             epoch_start_batch = start_batch if epoch == start_epoch else 0
 
             avg_loss = train_epoch(
-                model, dataloader, optimizer, scheduler, criterion, device,
-                epoch, config, s3_manager, epoch_start_batch, wandb_logger
+                model,
+                dataloader,
+                optimizer,
+                scheduler,
+                criterion,
+                device,
+                epoch,
+                config,
+                s3_manager,
+                epoch_start_batch,
+                wandb_logger,
             )
 
             save_checkpoint(
-                model, optimizer, scheduler, epoch, len(dataloader),
-                avg_loss, config, dataloader.get_state(),
-                config.checkpoint_dir, s3_manager, False
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                len(dataloader),
+                avg_loss,
+                config,
+                best_loss,
+                dataloader.get_state(),
             )
-
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         # Save checkpoint on interruption
         dataloader_state = dataloader.get_state()
         save_checkpoint(
-            model, optimizer, scheduler, epoch,
+            model,
+            optimizer,
+            scheduler,
+            epoch,
             dataloader.resumable_loader.current_batch,
-            avg_loss, config, dataloader_state, config.checkpoint_dir, s3_manager
+            avg_loss,
+            config,
+            dataloader_state,
+            config.checkpoint_dir,
+            s3_manager,
         )
     except Exception as e:
         logging.error(f"Training error: {e}")
@@ -340,18 +401,24 @@ def main(config: VideoTrainingConfig):
         # Cleanup temporary directories
         if config._temp_log_file and os.path.exists(config._temp_log_file):
             os.unlink(config._temp_log_file)
-        if config._temp_tensorboard_dir and os.path.exists(config._temp_tensorboard_dir):
+        if config._temp_tensorboard_dir and os.path.exists(
+            config._temp_tensorboard_dir
+        ):
             import shutil
+
             shutil.rmtree(config._temp_tensorboard_dir)
 
     logger.info("Training completed!")
     logger.info(f"Best loss achieved: {best_loss:.6f}")
 
     if config.use_s3 and s3_manager:
-        logger.info(f"Checkpoints and logs saved to S3 bucket: {s3_manager.bucket_name}")
+        logger.info(
+            f"Checkpoints and logs saved to S3 bucket: {s3_manager.bucket_name}"
+        )
     else:
         logger.info(
-            f"Tensorboard logs saved to: {os.path.join(config.tensorboard_dir, config.experiment_name or 'default')}")
+            f"Tensorboard logs saved to: {os.path.join(config.tensorboard_dir, config.experiment_name or 'default')}"
+        )
 
     if config.use_wandb:
         logger.info(f"Training metrics logged to Wandb project: {config.wandb_project}")

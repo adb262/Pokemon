@@ -1,38 +1,35 @@
 {
-  "workbench.colorTheme": "Default Dark Modern",
-  "[json]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode",
-    "editor.formatOnSave": true
+  "editor.codeActionsOnSave": {},
+  "python.languageServer": "None",
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/.DS_Store/**": true,
+    "**/node_modules/**": true,
+    "**/__pycache__": true,
+    "**/venv/lib/python3.11/site-packages/prisma/**": true,
+    "**/prisma/client/**": true
   },
-  "[javascript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode",
-    "editor.formatOnSave": true
-  },
-  "editor.codeActionsOnSave": {
-    "source.organizeImports": "explicit"
-  },
-  "[typescript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  },
-  "[python]": {
-    "diffEditor.ignoreTrimWhitespace": false,
-    "gitlens.codeLens.symbolScopes": ["!Module"],
-    "editor.formatOnType": true,
-    "editor.wordBasedSuggestions": "off",
-    "editor.formatOnSave": true,
-    "editor.defaultFormatter": "ms-python.autopep8"
-  },
-  "autopep8.args": [
-    "--indent-size=4",
-    "--max-line-length=120",
-    "--experimental"
+  "python.analysis.ignore": [
+    "**/venv/lib/python3.11/site-packages/prisma",
+    "/var/tmp/node_modules",
+    "**/prisma/client",
+    "**/lib/db/client",
+    "**/.venv/**"
   ],
+  "python.analysis.exclude": [
+    "**/venv/lib/python3.11/site-packages/prisma",
+    "/var/tmp/node_modules",
+    "**/prisma/client",
+    "**/lib/db/client",
+    "**/.venv/**"
+  ],
+  "python.analysis.typeCheckingMode": "basic",
   "python.analysis.autoImportCompletions": true,
-  "editor.formatOnSave": true,
-  "[typescriptreact]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  },
-  "[jsonc]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  }
+  "python.analysis.indexing": false,
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.extraPaths": [
+    "./apps/consumer_ask_precompute/src",
+    "./packages/form2/src/form2",
+    "./packages/form2/src"
+  ]
 }

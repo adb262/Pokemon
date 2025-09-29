@@ -5,20 +5,21 @@ Loads consecutive frame pairs from Pokemon gameplay videos for training.
 Supports lazy loading, batch generation, resumable training, and S3 storage.
 """
 
-from data_collection.frame_dataset import PokemonFrameDataset
-from data_collection.resumable_data_loader import ResumableDataLoader
-from s3.s3_utils import S3Manager, get_s3_manager_from_env
-import os
-from pathlib import Path
-from typing import Literal, Tuple, Iterator, Optional, Dict, Any
-import torch
-from torch.utils.data import DataLoader
-import logging
 import json
-from s3.s3_utils import default_s3_manager
+import logging
+import os
 
 # Add the parent directory to the path so we can import from idm
 import sys
+from pathlib import Path
+from typing import Any, Dict, Iterator, Literal, Optional, Tuple
+
+import torch
+from data_collection.frame_dataset import PokemonFrameDataset
+from data_collection.resumable_data_loader import ResumableDataLoader
+from s3.s3_utils import S3Manager, default_s3_manager, get_s3_manager_from_env
+from torch.utils.data import DataLoader
+
 sys.path.append(str(Path(__file__).parent.parent))
 
 
@@ -44,7 +45,7 @@ class PokemonFrameLoader:
         max_cache_size: int = 100000,
         stage: Literal["train", "test"] = "train",
         seed_cache: bool = False,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
     ):
         """
         Args:
@@ -83,8 +84,9 @@ class PokemonFrameLoader:
             max_cache_size=max_cache_size,
             stage=stage,
             seed_cache=seed_cache,
-            limit=limit
+            limit=limit,
         )
+        logger.info(f"Dataset length: {len(self.dataset)}")
 
         # Create data loader
         self.dataloader = DataLoader(
@@ -93,13 +95,15 @@ class PokemonFrameLoader:
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
         )
 
         # Create resumable wrapper
         self.resumable_loader = ResumableDataLoader(self.dataloader)
 
-    def create_resumable_loader(self, start_epoch: int = 0, start_batch: int = 0) -> ResumableDataLoader:
+    def create_resumable_loader(
+        self, start_epoch: int = 0, start_batch: int = 0
+    ) -> ResumableDataLoader:
         """Create a resumable data loader starting from specific epoch/batch"""
         return ResumableDataLoader(self.dataloader, start_epoch, start_batch)
 
@@ -118,31 +122,31 @@ class PokemonFrameLoader:
     def get_dataset_info(self) -> dict:
         """Get information about the dataset"""
         return {
-            'total_frame_pairs': len(self.dataset),
-            'batch_size': self.batch_size,
-            'num_batches': len(self.dataloader),
-            'image_size': self.image_size,
-            'frames_directory': str(self.frames_dir),
-            'seed': self.seed,
-            'use_s3': self.use_s3,
-            'cache_dir': self.cache_dir,
-            'max_cache_size': self.max_cache_size
+            "total_frame_pairs": len(self.dataset),
+            "batch_size": self.batch_size,
+            "num_batches": len(self.dataloader),
+            "image_size": self.image_size,
+            "frames_directory": str(self.frames_dir),
+            "seed": self.seed,
+            "use_s3": self.use_s3,
+            "cache_dir": self.cache_dir,
+            "max_cache_size": self.max_cache_size,
         }
 
     def get_state(self) -> Dict[str, Any]:
         """Get the current state for checkpointing"""
         return {
-            'frames_dir': self.frames_dir,
-            'batch_size': self.batch_size,
-            'image_size': self.image_size,
-            'shuffle': self.shuffle,
-            'num_workers': self.num_workers,
-            'seed': self.seed,
-            'use_s3': self.use_s3,
-            'cache_dir': self.cache_dir,
-            'max_cache_size': self.max_cache_size,
-            'dataset_state': self.dataset.get_state(),
-            'loader_state': self.resumable_loader.get_state()
+            "frames_dir": self.frames_dir,
+            "batch_size": self.batch_size,
+            "image_size": self.image_size,
+            "shuffle": self.shuffle,
+            "num_workers": self.num_workers,
+            "seed": self.seed,
+            "use_s3": self.use_s3,
+            "cache_dir": self.cache_dir,
+            "max_cache_size": self.max_cache_size,
+            "dataset_state": self.dataset.get_state(),
+            "loader_state": self.resumable_loader.get_state(),
         }
 
     def save_state(self, filepath: str):
@@ -158,16 +162,20 @@ class PokemonFrameLoader:
                 logger.error(f"Failed to save DataLoader state to S3: {filepath}")
         else:
             # Save locally
-            with open(filepath, 'w') as f:
+            with open(filepath, "w") as f:
                 json.dump(state, f, indent=2)
             logger.info(f"DataLoader state saved to: {filepath}")
 
     @classmethod
-    def load_state(cls, filepath: str, s3_manager: Optional[S3Manager] = None) -> 'PokemonFrameLoader':
+    def load_state(
+        cls, filepath: str, s3_manager: Optional[S3Manager] = None
+    ) -> "PokemonFrameLoader":
         """Load state from a file or S3 and create a new loader"""
 
         # Determine if we should load from S3
-        use_s3_for_state = filepath.startswith('s3://') or (s3_manager is not None and not os.path.exists(filepath))
+        use_s3_for_state = filepath.startswith("s3://") or (
+            s3_manager is not None and not os.path.exists(filepath)
+        )
 
         if use_s3_for_state:
             if s3_manager is None:
@@ -176,27 +184,27 @@ class PokemonFrameLoader:
             if state is None:
                 raise ValueError(f"Failed to load state from S3: {filepath}")
         else:
-            with open(filepath, 'r') as f:
+            with open(filepath, "r") as f:
                 state = json.load(f)
 
         loader = cls(
-            frames_dir=state['frames_dir'],
-            batch_size=state['batch_size'],
-            image_size=state['image_size'],
-            shuffle=state['shuffle'],
-            num_workers=state['num_workers'],
-            seed=state['seed'],
-            use_s3=state.get('use_s3', False),
-            cache_dir=state.get('cache_dir'),
-            max_cache_size=state.get('max_cache_size', 1000)
+            frames_dir=state["frames_dir"],
+            batch_size=state["batch_size"],
+            image_size=state["image_size"],
+            shuffle=state["shuffle"],
+            num_workers=state["num_workers"],
+            seed=state["seed"],
+            use_s3=state.get("use_s3", False),
+            cache_dir=state.get("cache_dir"),
+            max_cache_size=state.get("max_cache_size", 1000),
         )
 
         # Restore loader state
-        loader_state = state['loader_state']
+        loader_state = state["loader_state"]
         loader.resumable_loader = ResumableDataLoader(
             loader.dataloader,
-            start_epoch=loader_state['current_epoch'],
-            start_batch=loader_state['current_batch']
+            start_epoch=loader_state["current_epoch"],
+            start_batch=loader_state["current_batch"],
         )
 
         logger.info(f"DataLoader state loaded from {filepath}")
@@ -204,7 +212,7 @@ class PokemonFrameLoader:
 
     def cleanup(self):
         """Clean up resources"""
-        if hasattr(self.dataset, 'cleanup_cache'):
+        if hasattr(self.dataset, "cleanup_cache"):
             self.dataset.cleanup_cache()
 
 
@@ -212,14 +220,18 @@ def main():
     """Test the frame loader"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Pokemon Frame Loader')
-    parser.add_argument('--frames-dir', default='pokemon_frames', help='Path to frames directory or S3 prefix')
-    parser.add_argument('--batch-size', type=int, default=4, help='Batch size')
-    parser.add_argument('--image-size', type=int, default=400, help='Image size')
-    parser.add_argument('--test', action='store_true', help='Run test')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--use-s3', action='store_true', help='Use S3 storage')
-    parser.add_argument('--cache-dir', help='Local cache directory for S3 images')
+    parser = argparse.ArgumentParser(description="Pokemon Frame Loader")
+    parser.add_argument(
+        "--frames-dir",
+        default="pokemon_frames",
+        help="Path to frames directory or S3 prefix",
+    )
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--image-size", type=int, default=400, help="Image size")
+    parser.add_argument("--test", action="store_true", help="Run test")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--use-s3", action="store_true", help="Use S3 storage")
+    parser.add_argument("--cache-dir", help="Local cache directory for S3 images")
 
     args = parser.parse_args()
 
@@ -230,7 +242,7 @@ def main():
         image_size=args.image_size,
         seed=args.seed,
         use_s3=args.use_s3,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
     )
 
     # Print info
@@ -264,6 +276,7 @@ def main():
         except Exception as e:
             print(f"✗ Error loading data: {e}")
             import traceback
+
             traceback.print_exc()
         finally:
             # Cleanup
