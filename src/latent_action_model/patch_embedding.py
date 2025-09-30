@@ -5,7 +5,7 @@ import torch.nn as nn
 from einops.layers.torch import Rearrange
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG)
 
 
 class PatchEmbedding(nn.Module):

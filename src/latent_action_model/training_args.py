@@ -15,7 +15,7 @@ class VideoTrainingConfig:
     batch_size: int = 1
     learning_rate: float = 1e-4
     min_learning_rate: float = 1e-6
-    num_epochs: int = 2
+    num_epochs: int = 5
     device: str = "mps" if torch.backends.mps.is_available() else "cuda"
     frames_dir: str = "pokemon_frames"
     log_interval: int = 10
@@ -25,11 +25,11 @@ class VideoTrainingConfig:
     tensorboard_dir: str = "runs"
     seed: int = 42
     num_images_in_video: int = 2
-    d_model: int = 512
+    d_model: int = 256
     num_transformer_layers: int = 4
     latent_dim: int = 64
     num_embeddings: int = 8
-    num_heads: int = 8
+    num_heads: int = 2
     resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
@@ -69,7 +69,7 @@ class VideoTrainingConfig:
         parser.add_argument("--learning_rate", type=float, help="Learning rate")
         parser.add_argument("--num_epochs", type=int, help="Number of epochs")
         parser.add_argument(
-            "--num_frames_in_video", type=int, help="Number of frames in video"
+            "--num_images_in_video", type=int, help="Number of frames in video"
         )
         parser.add_argument(
             "--use_s3", type=str, choices=["true", "false"], help="Use S3 for storage"

@@ -24,6 +24,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class PokemonFrameDataset(Dataset):
@@ -67,6 +68,7 @@ class PokemonFrameDataset(Dataset):
         self.use_s3 = use_s3
         self.max_cache_size = max_cache_size
         self.num_concurrent_downloads = num_concurrent_downloads
+        self.limit = limit
 
         # Set random seed if provided
         if seed is not None:
@@ -109,7 +111,7 @@ class PokemonFrameDataset(Dataset):
 
             self.seed_cache(unique_frame_keys)
 
-        logger.info(f"Found {len(self.frame_pairs)} valid frame pairs")
+        logger.warning(f"Found {len(self.frame_pairs)} valid frame pairs")
 
         # Shuffle with seed for reproducibility
         if seed is not None:
@@ -141,6 +143,7 @@ class PokemonFrameDataset(Dataset):
 
             # Sort by frame number
             frame_files.sort(key=lambda x: x[0])
+            frame_files = [(x[0], Image.open(x[1]).convert("RGB")) for x in frame_files]
             frame_files = filter_frame_sequence(frame_files)
 
             # Create pairs with varying gaps
@@ -194,28 +197,34 @@ class PokemonFrameDataset(Dataset):
                     directories[dir_path].append((frame_num, obj_key))
 
         # Create pairs for each directory
-        for dir_path, frame_files in directories.items():
+        for dir_path, frame_files in tqdm(
+            directories.items(), desc="Processing directories"
+        ):
             # Sort by frame number
             frame_files.sort(key=lambda x: x[0])
-            frame_files = filter_frame_sequence(frame_files)
+            # Bring all frame paths to local directory
 
             # Create pairs with varying gaps
-            for i in range(len(frame_files) - self.max_frame_gap):
-                frame1_num, frame1_path = frame_files[i]
-                if i + num_frames_in_video < len(frame_files):
-                    # Verify both files exist
-                    if os.path.exists(frame1_path) and all(
-                        os.path.exists(frame_path)
-                        for _, frame_path in frame_files[
-                            i + 1 : i + num_frames_in_video
-                        ]
-                    ):
-                        videos.append(
-                            [
-                                path
-                                for _, path in frame_files[i : i + num_frames_in_video]
-                            ]
-                        )
+            for i in tqdm(
+                range(0, len(frame_files) - self.max_frame_gap, num_frames_in_video),
+                desc="Processing frame files",
+            ):
+                frame_files_to_process = frame_files[i : i + num_frames_in_video]
+                frame_files_to_process = [
+                    (x[1], self._load_image_from_s3(x[1]))
+                    for x in frame_files_to_process
+                ]
+                frame_files_to_process = filter(bool, frame_files_to_process)
+                frame_paths_to_process = filter_frame_sequence(frame_files_to_process)
+                if len(frame_paths_to_process) < num_frames_in_video // 2:
+                    continue
+
+                # Verify both files exist
+                logger.warning(f"Found {len(frame_paths_to_process)} frame files")
+                videos.append(frame_paths_to_process[: num_frames_in_video // 2])
+
+                if self.limit is not None and len(videos) >= self.limit:
+                    break
 
         return videos
 
@@ -350,7 +359,9 @@ class PokemonFrameDataset(Dataset):
 
         video_tensors = [self._preprocess_image(video) for video in video]
 
-        return torch.stack(video_tensors)
+        out = torch.stack(video_tensors)
+        logger.warning(f"Out shape: {out.shape}")
+        return out
 
     def get_state(self) -> Dict[str, Any]:
         """Get the current state of the dataset for checkpointing"""

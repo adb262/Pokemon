@@ -35,7 +35,7 @@ def create_model(config: VideoTrainingConfig):
         image_width=config.image_size,
         patch_height=config.patch_size,
         patch_width=config.patch_size,
-        num_images_in_video=config.num_images_in_video,
+        num_images_in_video=config.num_images_in_video // 2,
         d_model=config.d_model,
         num_heads=config.num_heads,
         num_layers=config.num_transformer_layers,
@@ -278,7 +278,7 @@ def main(config: VideoTrainingConfig):
         max_cache_size=config.max_cache_size,
         stage="train",
         seed_cache=config.seed_cache,
-        limit=10000,
+        limit=100,
     )
 
     # Print dataset info

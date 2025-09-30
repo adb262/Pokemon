@@ -47,11 +47,6 @@ def is_frame_valid(image: Image.Image) -> bool:
     total_pixel_count = sum(pixel_counts.values())
     threshold = 0.4 if most_common_pixel == "[255, 255, 255]" else 0.2
 
-    print(
-        most_common_pixel_count,
-        total_pixel_count,
-        most_common_pixel_count / total_pixel_count,
-    )
     if most_common_pixel_count / total_pixel_count > threshold:
         return False
 
@@ -75,24 +70,24 @@ def get_frame_similarity(frame1: Image.Image, frame2: Image.Image):
     return np.mean(np.abs(np.array(frame1) - np.array(frame2))) / 255.0
 
 
-def filter_frame_sequence(frame_sequence: list[str]) -> list[str]:
-    frames = [Image.open(frame) for frame in frame_sequence]
-    valid_frames = [
-        (i, frame) for i, frame in enumerate(frames) if is_frame_valid(frame)
-    ]
+def filter_frame_sequence(
+    frame_sequence: list[tuple[str, Image.Image]],
+) -> list[str]:
+    frames = [(path, frame) for (path, frame) in frame_sequence]
+    valid_frames = [(path, frame) for (path, frame) in frames if is_frame_valid(frame)]
     if len(valid_frames) < 2:
         return []
 
-    valid_frame_paths = []
+    valid_frame_paths: list[str] = []
 
     for i in range(len(valid_frames) - 1):
-        curr_frame = valid_frames[i][1]
-        next_frame = valid_frames[i + 1][1]
+        curr_frame_path, curr_frame = valid_frames[i]
+        next_frame_path, next_frame = valid_frames[i + 1]
         similarity = get_frame_similarity(curr_frame, next_frame)
-        if similarity >= 0.5 and similarity <= 0.99:
+        if similarity >= 0.0 and similarity <= 0.99:
             if len(valid_frame_paths) == 0:
-                valid_frame_paths.append(valid_frames[i][0])
-            valid_frame_paths.append(valid_frames[i + 1][0])
+                valid_frame_paths.append(curr_frame_path)
+            valid_frame_paths.append(next_frame_path)
 
     return valid_frame_paths
 
