@@ -17,6 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from data_collection.frame_filterer import filter_frame_sequence
 from s3.s3_utils import default_s3_manager
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -114,14 +115,14 @@ class PokemonFrameDataset(Dataset):
         if seed is not None:
             random.Random(seed).shuffle(self.frame_pairs)
 
-    def _find_videos(self, num_frames_in_video: int) -> List[Tuple[str, str]]:
+    def _find_videos(self, num_frames_in_video: int) -> List[list[str]]:
         """Find all valid consecutive frame pairs"""
         if self.use_s3:
             return self._find_videos_s3(self.frames_dir, num_frames_in_video)
         else:
             return self._find_videos_local(num_frames_in_video)
 
-    def _find_videos_local(self, num_frames_in_video: int) -> List[Tuple[str, ...]]:
+    def _find_videos_local(self, num_frames_in_video: int) -> List[list[str]]:
         """Find frame pairs in local filesystem"""
         videos = []
         logger.info(f"Finding frame pairs in {self.frames_dir}.")
@@ -140,6 +141,7 @@ class PokemonFrameDataset(Dataset):
 
             # Sort by frame number
             frame_files.sort(key=lambda x: x[0])
+            frame_files = filter_frame_sequence(frame_files)
 
             # Create pairs with varying gaps
             for i in range(len(frame_files) - self.max_frame_gap):
@@ -163,11 +165,11 @@ class PokemonFrameDataset(Dataset):
 
     def _find_videos_s3(
         self, source_dir: str, num_frames_in_video: int
-    ) -> List[Tuple[str, str]]:
+    ) -> List[list[str]]:
         """Find frame pairs in S3"""
         logger.info(f"Finding frame pairs in {source_dir}")
 
-        frame_pairs = []
+        videos: list[list[str]] = []
 
         # List all objects with the frames prefix
         frame_objects = default_s3_manager.list_objects(
@@ -195,21 +197,27 @@ class PokemonFrameDataset(Dataset):
         for dir_path, frame_files in directories.items():
             # Sort by frame number
             frame_files.sort(key=lambda x: x[0])
+            frame_files = filter_frame_sequence(frame_files)
 
             # Create pairs with varying gaps
             for i in range(len(frame_files) - self.max_frame_gap):
-                frame1_num, frame1_key = frame_files[i]
+                frame1_num, frame1_path = frame_files[i]
+                if i + num_frames_in_video < len(frame_files):
+                    # Verify both files exist
+                    if os.path.exists(frame1_path) and all(
+                        os.path.exists(frame_path)
+                        for _, frame_path in frame_files[
+                            i + 1 : i + num_frames_in_video
+                        ]
+                    ):
+                        videos.append(
+                            [
+                                path
+                                for _, path in frame_files[i : i + num_frames_in_video]
+                            ]
+                        )
 
-                # Try different gaps within the specified range
-                for gap in range(
-                    self.min_frame_gap,
-                    min(self.max_frame_gap + 1, len(frame_files) - i),
-                ):
-                    if i + gap < len(frame_files):
-                        frame2_num, frame2_key = frame_files[i + gap]
-                        frame_pairs.append((frame1_key, frame2_key))
-
-        return frame_pairs
+        return videos
 
     def seed_cache(self, frames: list[str]):
         """Seed the cache with all images in the frames directory"""
@@ -256,8 +264,10 @@ class PokemonFrameDataset(Dataset):
                 # Remove corrupted cache file
                 try:
                     os.remove(cache_path)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"Error removing corrupted cache file {cache_path}: {e}"
+                    )
 
         # Download from S3
         image = default_s3_manager.download_image(s3_key)
