@@ -1,23 +1,23 @@
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
+import logging
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from latent_action_model.training_args import VideoTrainingConfig
-from loss.loss_fns import reconstruction_residual_loss
-from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
-from s3.s3_utils import S3Manager
+
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import logging
-import sys
-import os
-import time
-from pathlib import Path
-from datetime import datetime
-import logging
+
 import wandb
-from s3.s3_utils import default_s3_manager
+from data_collection.pokemon_frame_loader import PokemonFrameLoader
+from latent_action_model.laqa import LatentActionQuantization
+from latent_action_model.training_args import VideoTrainingConfig
+from loss.loss_fns import reconstruction_residual_loss
+from s3.s3_utils import S3Manager, default_s3_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,29 +51,24 @@ def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
 
 def create_model(config: VideoTrainingConfig):
     """Create and initialize the VQVAE model"""
-    model = LatentActionVQVAE(
+    model = LatentActionQuantization(
+        dim=config.d_model,
+        quant_dim=config.latent_dim,
+        codebook_size=config.num_embeddings,
+        image_size=config.image_size,
+        patch_size=config.patch_size,
+        spatial_depth=config.num_transformer_layers,
+        temporal_depth=config.num_transformer_layers,
         channels=3,
-        image_height=config.image_size,
-        image_width=config.image_size,
-        patch_height=config.patch_size,
-        patch_width=config.patch_size,
-        num_images_in_video=config.num_images_in_video,
-        d_model=config.d_model,
-        num_heads=config.num_heads,
-        num_layers=config.num_transformer_layers,
-        num_embeddings=config.num_embeddings,
-        embedding_dim=config.latent_dim,
-        use_temporal_transformer=True,
-        use_spatial_transformer=True,
     )
 
     return model
 
 
-def save_checkpoint(
-        model: LatentActionVQVAE, optimizer: optim.Optimizer, scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int,
-        batch_idx: int, loss: float, config: VideoTrainingConfig, dataloader_state: dict, checkpoint_dir: str,
-        s3_manager: Optional[S3Manager] = None, is_best=False):
+def save_checkpoint(model: LatentActionQuantization, optimizer: optim.Optimizer,
+                    scheduler: optim.lr_scheduler.CosineAnnealingLR, epoch: int, batch_idx: int, loss: float,
+                    config: VideoTrainingConfig, dataloader_state: dict, checkpoint_dir: str,
+                    s3_manager: Optional[S3Manager] = None, is_best=False):
     """Save comprehensive model checkpoint to local storage or S3"""
 
     checkpoint = {
@@ -178,7 +173,7 @@ def load_checkpoint(checkpoint_path, optimizer, scheduler, device,
     }
 
 
-def evaluate_model(model: LatentActionVQVAE, dataloader: PokemonFrameLoader,
+def evaluate_model(model: LatentActionQuantization, dataloader: PokemonFrameLoader,
                    criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
                    device: torch.device, num_batches: int = 10, wandb_logger=None, step=None):
     """Evaluate model on a subset of data"""
@@ -216,7 +211,7 @@ def evaluate_model(model: LatentActionVQVAE, dataloader: PokemonFrameLoader,
 
 
 def train_epoch(
-        model: LatentActionVQVAE, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
+        model: LatentActionQuantization, dataloader: PokemonFrameLoader, optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.CosineAnnealingLR,
         criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor],
                             torch.Tensor],
@@ -250,11 +245,11 @@ def train_epoch(
         video_batch = video_batch.to(device)
 
         # Forward pass
-        decoded, commitment_loss = model(video_batch)
+        loss, num_unique_indices = model(video_batch.permute(0, 2, 1, 3, 4))
 
         # Calculate loss (reconstruction loss)
-        mse_loss = criterion(video_batch, decoded)
-        loss = mse_loss + commitment_loss.mean() * commit_beta
+        # mse_loss = criterion(video_batch, recon_loss) /
+        # loss = mse_loss
 
         # Backward pass
         loss.backward()
@@ -279,8 +274,6 @@ def train_epoch(
                 'train/batch_time': batch_time,
                 'train/epoch': epoch,
                 'train/batch': batch_idx,
-                'train/commitment_loss': commitment_loss.mean().item(),
-                'train/mse_loss': mse_loss.item(),
             }
 
             wandb_logger.log(wandb_metrics, step=global_step)
@@ -310,12 +303,12 @@ def train_epoch(
         batch_end_time = time.time()
 
         # Evaluate periodically
-        if batch_idx > 0 and batch_idx % config.eval_interval == 0:
-            eval_loss = evaluate_model(
-                model, dataloader, criterion, device,
-                wandb_logger=wandb_logger, step=global_step
-            )
-            logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
+        # if batch_idx > 0 and batch_idx % config.eval_interval == 0:
+        #     eval_loss = evaluate_model(
+        #         model, dataloader, criterion, device,
+        #         wandb_logger=wandb_logger, step=global_step
+        #     )
+        #     logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
 
         # Upload logs to S3 periodically
         if config.use_s3 and s3_manager and batch_idx > 0 and batch_idx % (config.save_interval * 2) == 0:

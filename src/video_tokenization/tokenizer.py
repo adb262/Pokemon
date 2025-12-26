@@ -1,0 +1,206 @@
+import logging
+
+import torch
+import torch.nn as nn
+
+from latent_action_model.patch_embedding import PatchEmbedding
+from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransformer
+from video_tokenization.fsq import FiniteScalarQuantizer
+
+logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
+
+
+class VideoTokenizerEncoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_images_in_video: int,
+        image_height: int,
+        image_width: int,
+        channels: int,
+        patch_height: int,
+        patch_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        embedding_dim: int,
+    ):
+        super(VideoTokenizerEncoder, self).__init__()
+        self.num_images_in_video = num_images_in_video
+        self.image_height = image_height
+        self.image_width = image_width
+        self.channels = channels
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+        self.d_model = d_model
+
+        self.embed_image_patches = PatchEmbedding(
+            num_images_in_video=num_images_in_video,
+            channels=channels,
+            patch_height=patch_height,
+            patch_width=patch_width,
+            d_model=d_model,
+        )
+
+        self.encoder = SpatioTemporalTransformer(
+            num_images_in_video=num_images_in_video,
+            num_heads=num_heads,
+            d_model=d_model,
+            num_layers=num_layers,
+            use_spatial_transformer=True,
+            use_temporal_transformer=True,
+        )
+
+        self.latent_projection = nn.Linear(d_model, embedding_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is of shape (batch_size, num_images_in_video, c, h, w)
+        logger.debug(f"x shape before embed_image_patches: {x.shape}")
+        x = self.embed_image_patches(x)
+        logger.debug(f"x shape after embed_image_patches: {x.shape}")
+        x = self.encoder(x)
+        logger.debug(f"x shape after encoder: {x.shape}")
+        x = self.latent_projection(x)
+        logger.debug(f"x shape after latent_projection: {x.shape}")
+        return x
+
+
+class PixelShuffleFrameHead(nn.Module):
+    # conv2D embeddings to pixels head
+    def __init__(self, embed_dim, patch_size=8, channels=3, H=128, W=128):
+        super().__init__()
+        self.patch_size = patch_size
+        self.Hp, self.Wp = H // patch_size, W // patch_size
+        self.to_pixels = nn.Conv2d(embed_dim, channels * (patch_size**2), kernel_size=1)
+
+    def forward(self, tokens):  # [B, T, P, E]
+        from einops import rearrange
+
+        B, T, P, E = tokens.shape
+        x = rearrange(
+            tokens, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
+        )  # [(B*T), E, Hp, Wp]
+        x = self.to_pixels(x)  # [(B*T), C*p^2, Hp, Wp]
+        x = rearrange(
+            x,
+            "(b t) (c p1 p2) hp wp -> b t c (hp p1) (wp p2)",
+            p1=self.patch_size,
+            p2=self.patch_size,
+            b=B,
+            t=T,
+        )  # [B, T, C, H, W]
+        return x
+
+
+class VideoTokenizerDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_images_in_video: int,
+        image_height: int,
+        image_width: int,
+        channels: int,
+        patch_height: int,
+        patch_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        embedding_dim: int,
+    ):
+        super(VideoTokenizerDecoder, self).__init__()
+        self.num_images_in_video = num_images_in_video
+        self.image_height = image_height
+        self.image_width = image_width
+        self.channels = channels
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+        self.d_model = d_model
+
+        self.latent_projection = nn.Linear(embedding_dim, d_model)
+
+        self.encoder = SpatioTemporalTransformer(
+            num_images_in_video=num_images_in_video,
+            num_heads=num_heads,
+            d_model=d_model,
+            num_layers=num_layers,
+            use_spatial_transformer=True,
+            use_temporal_transformer=True,
+        )
+
+        self.patch_to_pixels = PixelShuffleFrameHead(
+            embed_dim=d_model,
+            patch_size=patch_height,
+            channels=channels,
+            H=image_height,
+            W=image_width,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is of shape (batch_size, num_images_in_video, num_patches, embedding_dim)
+        logger.debug(f"x shape before latent_projection in decoder: {x.shape}")
+        x = self.latent_projection(x)
+        logger.debug(f"x shape before encoder in decoder: {x.shape}")
+        x = self.encoder(x)
+        logger.debug(f"x shape after latent_projection in decoder: {x.shape}")
+
+        x = self.patch_to_pixels(x)
+        logger.debug(f"x shape after patch_to_pixels in decoder: {x.shape}")
+        return x
+
+
+class VideoTokenizer(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_images_in_video: int,
+        image_height: int,
+        image_width: int,
+        channels: int,
+        patch_height: int,
+        patch_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        embedding_dim: int,
+        num_bins: int = 4,
+    ):
+        super(VideoTokenizer, self).__init__()
+        self.encoder = VideoTokenizerEncoder(
+            num_images_in_video=num_images_in_video,
+            image_height=image_height,
+            image_width=image_width,
+            channels=channels,
+            patch_height=patch_height,
+            patch_width=patch_width,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            embedding_dim=embedding_dim,
+        )
+
+        self.fsq = FiniteScalarQuantizer(
+            latent_dim=embedding_dim,
+            num_bins=num_bins,
+        )
+
+        self.decoder = VideoTokenizerDecoder(
+            num_images_in_video=num_images_in_video,
+            image_height=image_height,
+            image_width=image_width,
+            channels=channels,
+            patch_height=patch_height,
+            patch_width=patch_width,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            embedding_dim=embedding_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.encoder(x)
+
+        x = self.fsq(x)
+
+        x = self.decoder(x)
+        return x

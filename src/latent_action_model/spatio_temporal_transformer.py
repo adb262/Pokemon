@@ -1,6 +1,7 @@
+import logging
+
 import torch
 import torch.nn as nn
-import logging
 
 from latent_action_model.spatio_temporal_encoder_block import SpatioTemporalEncoderBlock
 

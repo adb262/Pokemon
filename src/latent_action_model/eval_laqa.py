@@ -6,10 +6,9 @@ Loads a trained model and visualizes reconstruction results.
 
 from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from s3.s3_utils import get_s3_manager_from_env, parse_s3_path
-from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
+from latent_action_model.laqa import LatentActionQuantization
 from latent_action_model.training_args import VideoTrainingConfig
 import torch
-import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 import logging
@@ -19,7 +18,7 @@ from pathlib import Path
 import argparse
 from PIL import Image
 
-from latent_action_model.train import create_model
+from latent_action_model.train_laqa import create_model
 
 # Add the parent directory to the path so we can import from data_collection
 sys.path.append(str(Path(__file__).parent.parent))
@@ -93,7 +92,7 @@ def tensor_to_image(tensor: torch.Tensor) -> Image.Image:
 
 
 def visualize_reconstruction(
-        model: LatentActionVQVAE, dataloader: PokemonFrameLoader, num_images_in_video: int, device: torch.device,
+        model: LatentActionQuantization, dataloader: PokemonFrameLoader, num_images_in_video: int, device: torch.device,
         num_samples: int = 4, save_dir: str = "eval_results"):
     """Visualize reconstruction results"""
     model.eval()
@@ -105,7 +104,7 @@ def visualize_reconstruction(
         video_batch = video_batch.to(device)
 
         # Forward pass
-        residual, commitment_loss = model(video_batch)
+        residual = model.inference(video_batch.permute(0, 2, 1, 3, 4))
 
         # Create visualization
         fig, axes = plt.subplots(num_samples, num_images_in_video + 1, figsize=(15, 5 * num_samples))
@@ -121,7 +120,7 @@ def visualize_reconstruction(
                 axes[i, j].axis('off')
 
             # Reconstructed frame
-            recon = tensor_to_image(video_batch[i, -2] + residual[i])
+            recon = tensor_to_image(residual[i])
             axes[i, -1].imshow(recon)
             axes[i, -1].set_title(f"Reconstructed Frame (Sample {i+1})")
             axes[i, -1].axis('off')
@@ -135,12 +134,6 @@ def visualize_reconstruction(
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "reconstruction_comparison.png"), dpi=150, bbox_inches='tight')
         plt.show()
-
-        # Calculate and display reconstruction loss
-        mse_loss = nn.MSELoss()(decoded, video_batch)
-        logger.info(f"Reconstruction MSE Loss: {mse_loss.item():.6f}")
-
-        return mse_loss.item()
 
 
 def main():

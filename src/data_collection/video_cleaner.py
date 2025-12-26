@@ -6,16 +6,18 @@ Ensures only clean Pokemon gameplay footage is retained.
 Supports both local storage and S3.
 """
 
-import cv2
-import numpy as np
-import logging
-from pathlib import Path
-from typing import Tuple, Optional, List, Dict, Any
 import json
+import logging
 import os
 import sys
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
 from s3.s3_utils import default_s3_manager
 
 # Add the parent directory to the path so we can import from idm
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CropRegion:
     """Represents a crop region for a video"""
+
     x: int
     y: int
     width: int
@@ -38,8 +41,13 @@ class CropRegion:
 class PokemonVideoCleaner:
     """Cleans Pokemon videos by detecting and removing commentary/UI overlays with S3 support"""
 
-    def __init__(self, min_gameplay_ratio: float = 0.6, use_s3: bool = False, s3_prefix: str = "raw_videos",
-                 clean_s3_prefix: str = "clean_videos"):
+    def __init__(
+        self,
+        min_gameplay_ratio: float = 0.6,
+        use_s3: bool = False,
+        s3_prefix: str = "raw_videos",
+        clean_s3_prefix: str = "clean_videos",
+    ):
         """
         Initialize the Pokemon video cleaner
 
@@ -54,7 +62,6 @@ class PokemonVideoCleaner:
         self.use_s3 = use_s3
         self.s3_prefix = s3_prefix
         self.clean_s3_prefix = clean_s3_prefix
-        self.pokemon_colors = self._get_pokemon_game_colors()
 
     def _download_video_from_s3(self, s3_key: str) -> Optional[str]:
         """Download video from S3 to temporary file"""
@@ -63,7 +70,7 @@ class PokemonVideoCleaner:
 
         try:
             # Create temporary file
-            temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            temp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
             temp_path = temp_file.name
             temp_file.close()
 
@@ -91,7 +98,9 @@ class PokemonVideoCleaner:
         except Exception as e:
             logger.warning(f"Error cleaning up temp file {temp_path}: {e}")
 
-    def _upload_crop_info_to_s3(self, crop_region: CropRegion, video_path: str, game_name: str) -> bool:
+    def _upload_crop_info_to_s3(
+        self, crop_region: CropRegion, video_path: str, game_name: str
+    ) -> bool:
         """Upload crop information to S3"""
         if not self.use_s3:
             return False
@@ -99,18 +108,16 @@ class PokemonVideoCleaner:
         try:
             # Create crop info data
             crop_info = {
-                'source_video': video_path,
-                'game': game_name,
-                'crop_region': {
-                    'x': crop_region.x,
-                    'y': crop_region.y,
-                    'width': crop_region.width,
-                    'height': crop_region.height,
-                    'confidence': crop_region.confidence
+                "source_video": video_path,
+                "game": game_name,
+                "crop_region": {
+                    "x": crop_region.x,
+                    "y": crop_region.y,
+                    "width": crop_region.width,
+                    "height": crop_region.height,
+                    "confidence": crop_region.confidence,
                 },
-                'analysis_settings': {
-                    'min_gameplay_ratio': self.min_gameplay_ratio
-                }
+                "analysis_settings": {"min_gameplay_ratio": self.min_gameplay_ratio},
             }
 
             # Create S3 key
@@ -131,18 +138,9 @@ class PokemonVideoCleaner:
             logger.error(f"Error uploading crop info to S3: {e}")
             return False
 
-    def _get_pokemon_game_colors(self) -> Dict[str, List[Tuple[int, int, int]]]:
-        """Get characteristic colors for each Pokemon game for validation"""
-        return {
-            'emerald': [(34, 139, 34), (0, 100, 0), (144, 238, 144)],  # Green tones
-            'fire_red': [(178, 34, 34), (255, 69, 0), (220, 20, 60)],  # Red tones
-            'ruby': [(178, 34, 34), (139, 0, 0), (205, 92, 92)],       # Ruby red
-            'sapphire': [(0, 0, 139), (30, 144, 255), (70, 130, 180)],  # Blue tones
-            'heart_gold': [(255, 215, 0), (255, 140, 0), (255, 165, 0)],  # Gold tones
-            'soul_silver': [(192, 192, 192), (169, 169, 169), (211, 211, 211)]  # Silver tones
-        }
-
-    def analyze_video_structure(self, video_path: str, sample_frames: int = 30) -> Optional[CropRegion]:
+    def analyze_video_structure(
+        self, video_path: str, sample_frames: int = 30
+    ) -> Optional[CropRegion]:
         """
         Analyze video to detect consistent borders/overlays that should be cropped out.
         Returns the optimal crop region for gameplay content.
@@ -152,9 +150,15 @@ class PokemonVideoCleaner:
         actual_video_path = video_path
 
         # Check if this is an S3 path and download if needed
-        if self.use_s3 and (video_path.startswith('s3://') or not os.path.exists(video_path)):
+        if self.use_s3 and (
+            video_path.startswith("s3://") or not os.path.exists(video_path)
+        ):
             # Assume it's an S3 key if not a local file
-            s3_key = video_path if not video_path.startswith('s3://') else video_path[5:].split('/', 1)[1]
+            s3_key = (
+                video_path
+                if not video_path.startswith("s3://")
+                else video_path[5:].split("/", 1)[1]
+            )
             temp_file = self._download_video_from_s3(s3_key)
             if not temp_file:
                 logger.error(f"Could not download video from S3: {s3_key}")
@@ -172,14 +176,18 @@ class PokemonVideoCleaner:
             duration = total_frames / fps if fps > 0 else 0
 
             if duration < 300:  # Less than 5 minutes
-                logger.info(f"Video too short ({duration:.1f}s), skipping: {video_path}")
+                logger.info(
+                    f"Video too short ({duration:.1f}s), skipping: {video_path}"
+                )
                 cap.release()
                 return None
 
             # Sample frames throughout the video (skip first/last 10%)
             start_frame = int(total_frames * 0.1)
             end_frame = int(total_frames * 0.9)
-            frame_indices = np.linspace(start_frame, end_frame, sample_frames, dtype=int)
+            frame_indices = np.linspace(
+                start_frame, end_frame, sample_frames, dtype=int
+            )
 
             frames = []
             for frame_idx in frame_indices:
@@ -201,7 +209,9 @@ class PokemonVideoCleaner:
             if temp_file:
                 self._cleanup_temp_file(temp_file)
 
-    def _detect_gameplay_region(self, frames: List[np.ndarray], video_path: str) -> Optional[CropRegion]:
+    def _detect_gameplay_region(
+        self, frames: List[np.ndarray], video_path: str
+    ) -> Optional[CropRegion]:
         """Detect the main gameplay region by analyzing frame consistency"""
         if not frames:
             return None
@@ -251,9 +261,14 @@ class PokemonVideoCleaner:
         logger.warning(f"No valid gameplay region found for {video_path}")
         return None
 
-    def _find_optimal_crop_region(self, consistent_edges: np.ndarray,
-                                  h_projection: np.ndarray, v_projection: np.ndarray,
-                                  width: int, height: int) -> Optional[CropRegion]:
+    def _find_optimal_crop_region(
+        self,
+        consistent_edges: np.ndarray,
+        h_projection: np.ndarray,
+        v_projection: np.ndarray,
+        width: int,
+        height: int,
+    ) -> Optional[CropRegion]:
         """Find the optimal rectangular crop region"""
 
         # Find borders based on edge density
@@ -306,14 +321,21 @@ class PokemonVideoCleaner:
 
         return CropRegion(left, top, crop_width, crop_height, confidence)
 
-    def _validate_gameplay_content(self, frames: List[np.ndarray], crop_region: CropRegion) -> bool:
+    def _validate_gameplay_content(
+        self, frames: List[np.ndarray], crop_region: CropRegion
+    ) -> bool:
         """Validate that the crop region contains actual Pokemon gameplay"""
 
         # Extract cropped regions
         cropped_frames = []
         for frame in frames[:10]:  # Check first 10 frames
-            x, y, w, h = crop_region.x, crop_region.y, crop_region.width, crop_region.height
-            cropped = frame[y:y+h, x:x+w]
+            x, y, w, h = (
+                crop_region.x,
+                crop_region.y,
+                crop_region.width,
+                crop_region.height,
+            )
+            cropped = frame[y : y + h, x : x + w]
             if cropped.size > 0:
                 cropped_frames.append(cropped)
 
@@ -330,10 +352,11 @@ class PokemonVideoCleaner:
         ui_score = self._detect_pokemon_ui_elements(cropped_frames)
 
         # Combined score
-        total_score = (movement_score * 0.4 + color_score * 0.3 + ui_score * 0.3)
+        total_score = movement_score * 0.4 + color_score * 0.3 + ui_score * 0.3
 
         logger.debug(
-            f"Validation scores - Movement: {movement_score:.2f}, Color: {color_score:.2f}, UI: {ui_score:.2f}, Total: {total_score:.2f}")
+            f"Validation scores - Movement: {movement_score:.2f}, Color: {color_score:.2f}, UI: {ui_score:.2f}, Total: {total_score:.2f}"
+        )
 
         return total_score > 0.5
 
@@ -345,7 +368,7 @@ class PokemonVideoCleaner:
         movement_scores = []
         for i in range(1, len(frames)):
             # Calculate frame difference
-            gray1 = cv2.cvtColor(frames[i-1], cv2.COLOR_BGR2GRAY)
+            gray1 = cv2.cvtColor(frames[i - 1], cv2.COLOR_BGR2GRAY)
             gray2 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
 
             diff = cv2.absdiff(gray1, gray2)
@@ -372,7 +395,11 @@ class PokemonVideoCleaner:
         for frame in frames[:5]:  # Check first 5 frames
             # Sample pixels from the frame
             h, w = frame.shape[:2]
-            sample_points = [(h//4, w//4), (h//2, w//2), (3*h//4, 3*w//4)]
+            sample_points = [
+                (h // 4, w // 4),
+                (h // 2, w // 2),
+                (3 * h // 4, 3 * w // 4),
+            ]
 
             for y, x in sample_points:
                 if y < h and x < w:
@@ -390,7 +417,11 @@ class PokemonVideoCleaner:
             b, g, r = color
 
             # Check for natural/game-like colors
-            if (g > r and g > b) or (b > r and b > g) or (50 < r < 200 and 50 < g < 200 and 50 < b < 200):
+            if (
+                (g > r and g > b)
+                or (b > r and b > g)
+                or (50 < r < 200 and 50 < g < 200 and 50 < b < 200)
+            ):
                 pokemon_like_colors += 1
 
         return pokemon_like_colors / total_colors if total_colors > 0 else 0.0
@@ -409,7 +440,9 @@ class PokemonVideoCleaner:
         edges = cv2.Canny(gray, 50, 150)
 
         # Find contours
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         rectangular_regions = 0
         for contour in contours:
@@ -468,7 +501,13 @@ class PokemonVideoCleaner:
 
         return True, crop_region
 
-    def save_crop_info(self, video_path: str, crop_region: CropRegion, output_dir: str, game_name: str = ""):
+    def save_crop_info(
+        self,
+        video_path: str,
+        crop_region: CropRegion,
+        output_dir: str,
+        game_name: str = "",
+    ):
         """Save crop information to local file and/or S3"""
         # Determine game name if not provided
         if not game_name:
@@ -480,18 +519,16 @@ class PokemonVideoCleaner:
 
         # Save locally (always, as backup)
         crop_info = {
-            'source_video': video_path,
-            'game': game_name,
-            'crop_region': {
-                'x': crop_region.x,
-                'y': crop_region.y,
-                'width': crop_region.width,
-                'height': crop_region.height,
-                'confidence': crop_region.confidence
+            "source_video": video_path,
+            "game": game_name,
+            "crop_region": {
+                "x": crop_region.x,
+                "y": crop_region.y,
+                "width": crop_region.width,
+                "height": crop_region.height,
+                "confidence": crop_region.confidence,
             },
-            'analysis_settings': {
-                'min_gameplay_ratio': self.min_gameplay_ratio
-            }
+            "analysis_settings": {"min_gameplay_ratio": self.min_gameplay_ratio},
         }
 
         # Create output file path
@@ -501,7 +538,7 @@ class PokemonVideoCleaner:
         # Ensure output directory exists
         crop_file.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(crop_file, 'w') as f:
+        with open(crop_file, "w") as f:
             json.dump(crop_info, f, indent=2)
 
         logger.info(f"Saved crop info to: {crop_file}")
@@ -510,13 +547,27 @@ class PokemonVideoCleaner:
         """Determine game name from video path"""
         path_str = str(video_path).lower()
 
-        for game in ["emerald", "fire_red", "ruby", "sapphire", "heart_gold", "soul_silver"]:
+        for game in [
+            "emerald",
+            "fire_red",
+            "ruby",
+            "sapphire",
+            "heart_gold",
+            "soul_silver",
+        ]:
             if game.replace("_", " ") in path_str or game in path_str:
                 return game.replace("_", " ").title()
 
         # Check parent directory
         parent_name = video_path.parent.name.lower()
-        for game in ["emerald", "fire_red", "ruby", "sapphire", "heart_gold", "soul_silver"]:
+        for game in [
+            "emerald",
+            "fire_red",
+            "ruby",
+            "sapphire",
+            "heart_gold",
+            "soul_silver",
+        ]:
             if game.replace("_", " ") in parent_name or game in parent_name:
                 return game.replace("_", " ").title()
 
@@ -525,11 +576,11 @@ class PokemonVideoCleaner:
     def get_storage_info(self) -> Dict[str, Any]:
         """Get information about storage configuration"""
         return {
-            'use_s3': self.use_s3,
-            's3_bucket': default_s3_manager.bucket_name,
-            's3_prefix': self.s3_prefix,
-            'clean_s3_prefix': self.clean_s3_prefix,
-            'min_gameplay_ratio': self.min_gameplay_ratio
+            "use_s3": self.use_s3,
+            "s3_bucket": default_s3_manager.bucket_name,
+            "s3_prefix": self.s3_prefix,
+            "clean_s3_prefix": self.clean_s3_prefix,
+            "min_gameplay_ratio": self.min_gameplay_ratio,
         }
 
 

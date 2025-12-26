@@ -9,6 +9,8 @@ from typing import Tuple
 from einops import rearrange, repeat
 
 # helpers
+import logging
+logger = logging.getLogger(__name__)
 
 
 def exists(val):

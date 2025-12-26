@@ -46,7 +46,7 @@ class VideoDecoder(nn.Module):
             nn.Linear(d_model, patch_dim),
             nn.LayerNorm(patch_dim),
             nn.Sigmoid(),
-            Rearrange('b (h w) (p1 p2 c) -> b c (h p1) (w p2)', h=h_patches, w=w_patches,
+            Rearrange('b h w (p1 p2 c) -> b c (h p1) (w p2)', h=h_patches, w=w_patches,
                       p1=self.patch_height, p2=self.patch_width, c=3)
         )
 
@@ -70,11 +70,23 @@ class VideoDecoder(nn.Module):
 
         # Then, we need to perform cross attention between x and latent_action
         # x is of shape (batch_size, num_patches, d_model)
-        # latent_action is of shape (batch_size, d_model)
-        # We need to expand latent_action to match the shape of x
-        latent_action = latent_action.unsqueeze(1).expand(-1, x.shape[1], -1)
+        # latent_action is of shape (batch_size, h, w, d_model)
+        # resize x to be (batch_size, h, w, d_model)
+        batch_size, num_patches, d_model = x.shape
+        x = x.reshape(batch_size, self.image_height // self.patch_height, self.image_width // self.patch_width, d_model)
+        logger.debug(f"x shape after reshape: {x.shape}")
+
+        # Now, we need to perform cross attention between x and latent_action
+        # x is of shape (batch_size, h, w, d_model)
+        # latent_action is of shape (batch_size, num_frames, d_model)
+        # So, we take the last frame from x as our "prediction" token
         logger.debug(f"latent_action shape after unsqueeze and expand: {latent_action.shape}")
         x, _ = self.attention(latent_action, x, x)
+
+        if x.shape[0] > 1:
+            logger.info(f"Std of x AFTER conditioning (summed over D, mean over B, F): {torch.std(x, dim=0).mean()}")
+            logger.info(f"Mean of x AFTER conditioning (summed over D, mean over B, F): {torch.mean(x, dim=0).mean()}")
+
         logger.debug(f"x shape after attention: {x.shape}")
         # Now we need to decode the patches into images
         return self.out_projection(x)
