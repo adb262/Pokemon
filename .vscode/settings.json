@@ -19,6 +19,7 @@
   "python.analysis.exclude": [
     "**/venv/lib/python3.11/site-packages/prisma",
     "/var/tmp/node_modules",
+    
     "**/prisma/client",
     "**/lib/db/client",
     "**/.venv/**"

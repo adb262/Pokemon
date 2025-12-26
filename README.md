@@ -18,3 +18,8 @@ Our end state is to have groups (starting with "pairs" i.e. group of 2) from whi
 ### TODOS:
 [] Flow Matching Transformer
 [] Larger group dynamics (not just pairs)
+
+Data
+[X] Process parallelism
+[] Loss is wrong
+    - You shouldn't be using future frames, it's the current

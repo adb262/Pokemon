@@ -8,7 +8,7 @@ from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransf
 from video_tokenization.fsq import FiniteScalarQuantizer
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class VideoTokenizerEncoder(nn.Module):
@@ -163,6 +163,7 @@ class VideoTokenizer(nn.Module):
         num_heads: int,
         num_layers: int,
         embedding_dim: int,
+        fsq_latent_dim: int,
         num_bins: int = 4,
     ):
         super(VideoTokenizer, self).__init__()
@@ -180,8 +181,11 @@ class VideoTokenizer(nn.Module):
         )
 
         self.fsq = FiniteScalarQuantizer(
-            latent_dim=embedding_dim,
-            num_bins=num_bins,
+            # latent_dim=fsq_latent_dim,
+            # num_bins=num_bins,
+            levels=[8, 8, 6, 5],
+            embedding_dim=embedding_dim,
+            device=torch.device("mps"),
         )
 
         self.decoder = VideoTokenizerDecoder(
@@ -194,7 +198,7 @@ class VideoTokenizer(nn.Module):
             d_model=d_model,
             num_heads=num_heads,
             num_layers=num_layers,
-            embedding_dim=embedding_dim,
+            embedding_dim=4,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

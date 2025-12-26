@@ -372,7 +372,7 @@ class PokemonVideoCleaner:
             gray2 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
 
             diff = cv2.absdiff(gray1, gray2)
-            movement = np.mean(diff) / 255.0
+            movement = np.mean(diff.astype(np.float32)) / 255.0
             movement_scores.append(movement)
 
         avg_movement = np.mean(movement_scores)
@@ -383,7 +383,7 @@ class PokemonVideoCleaner:
         elif avg_movement < 0.01:
             return 0.0  # Too static
         else:
-            return max(0.0, 1.0 - (avg_movement - 0.3) / 0.7)
+            return max(0.0, 1.0 - (float(avg_movement) - 0.3) / 0.7)
 
     def _calculate_pokemon_color_score(self, frames: List[np.ndarray]) -> float:
         """Calculate how much the frames look like Pokemon gameplay based on colors"""

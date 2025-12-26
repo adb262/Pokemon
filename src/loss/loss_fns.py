@@ -4,28 +4,45 @@ import torch.nn.functional as F
 action_weight = 5
 
 
-def reconstruction_residual_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
+def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
     """
     Reconstruction loss that gives higher weight to pixels that changed between frames.
+    """
+    return F.mse_loss(video, decoded, reduction="mean").mean()
+
+
+def next_frame_reconstruction_residual_loss(
+    video: torch.Tensor, decoded: torch.Tensor
+) -> torch.Tensor:
+    """
+    Reconstruction loss for residual prediction that gives higher weight to pixels that changed between frames.
 
     Args:
-        image_1: Previous frame [B, C, H, W]
-        image_2: Current frame (target) [B, C, H, W] 
-        decoded: Reconstructed frame [B, C, H, W]
+        video: Input video tensor [B, num_images_in_video, C, H, W]
+        decoded: Predicted residuals [B, num_images_in_video - 1, C, H, W]
 
     Returns:
         Weighted reconstruction loss (scalar)
     """
-    # Calculate element-wise MSE loss (no reduction)
-    residual = video[:, -1, :, :, :] - video[:, -2, :, :, :]
-    mse_loss = F.mse_loss(decoded, residual, reduction='none')  # [B, C, H, W]
+    # Calculate ground truth residuals between consecutive frames
+    # [B, num_images_in_video, C, H, W] -> [B, num_images_in_video - 1, C, H, W]
+    target_residuals = video[:, 1:, :, :, :] - video[:, :-1, :, :, :]
+
+    # Calculate element-wise MSE loss between predicted and target residuals
+    mse_loss = F.mse_loss(
+        decoded, target_residuals, reduction="none"
+    )  # [B, num_images_in_video - 1, C, H, W]
 
     # Detect pixels that changed between frames (with small threshold for numerical stability)
     threshold = 1e-3
-    changed_pixels = (torch.abs(residual) > threshold).float()  # [B, C, H, W]
+    changed_pixels = (
+        torch.abs(target_residuals) > threshold
+    ).float()  # [B, num_images_in_video - 1, C, H, W]
 
     # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = torch.where(changed_pixels > 0, action_weight, 1.0)  # [B, C, H, W]
+    weight_mask = torch.where(
+        changed_pixels > 0, action_weight, 1.0
+    )  # [B, num_images_in_video - 1, C, H, W]
 
     # Apply weights and reduce to scalar
     weighted_loss = (mse_loss * weight_mask).mean()
@@ -33,7 +50,9 @@ def reconstruction_residual_loss(video: torch.Tensor, decoded: torch.Tensor) -> 
     return weighted_loss
 
 
-def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
+def next_frame_reconstruction_loss(
+    video: torch.Tensor, decoded: torch.Tensor
+) -> torch.Tensor:
     """
     Reconstruction loss that gives higher weight to pixels that changed between frames.
 
@@ -45,20 +64,23 @@ def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Ten
         Weighted reconstruction loss (scalar)
     """
     # Calculate element-wise MSE loss (no reduction)
-    target_frame = video[:, -1, :, :, :]
-    video_prefix = video[:, :-1, :, :, :]
-
-    last_frame = video_prefix[:, -1, :, :, :]
-    residual = last_frame - target_frame
+    target_frames = video[:, 1:, :, :, :]
+    previous_frames = video[:, :-1, :, :, :]
 
     # Detect pixels that changed between frames (with small threshold for numerical stability)
     threshold = 1e-3
-    changed_pixels = (torch.abs(residual) > threshold).float()  # [B, C, H, W]
+    changed_pixels = (
+        torch.abs(target_frames - previous_frames) > threshold
+    ).float()  # [B, Num_images_in_video - 1, C, H, W]
 
     # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = torch.where(changed_pixels > 0, action_weight, 1.0)  # [B, C, H, W]
+    weight_mask = torch.where(
+        changed_pixels > 0, action_weight, 1.0
+    )  # [B, Num_images_in_video - 1, C, H, W]
 
     # Apply weights and reduce to scalar
-    mse_loss = F.mse_loss(decoded, target_frame, reduction='mean', weight=weight_mask)  # [B, C, H, W]
+    mse_loss = F.mse_loss(
+        decoded, target_frames, reduction="none"
+    )  # [B, Num_images_in_video - 1, C, H, W]
 
-    return mse_loss
+    return (mse_loss * weight_mask).mean()

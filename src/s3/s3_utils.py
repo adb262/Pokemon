@@ -26,9 +26,13 @@ logger = logging.getLogger(__name__)
 class S3Manager:
     """Manages S3 operations for the Pokemon training pipeline"""
 
-    def __init__(self, bucket_name: str, region_name: str = 'us-east-1',
-                 aws_access_key_id: Optional[str] = None,
-                 aws_secret_access_key: Optional[str] = None):
+    def __init__(
+        self,
+        bucket_name: str,
+        region_name: str = "us-east-1",
+        aws_access_key_id: Optional[str] = None,
+        aws_secret_access_key: Optional[str] = None,
+    ):
         """
         Initialize S3 manager
 
@@ -42,20 +46,25 @@ class S3Manager:
         self.region_name = region_name
 
         # Initialize S3 client
-        session_kwargs = {'region_name': region_name}
+        session_kwargs = {"region_name": region_name}
         if aws_access_key_id and aws_secret_access_key:
-            session_kwargs.update({
-                'aws_access_key_id': aws_access_key_id,
-                'aws_secret_access_key': aws_secret_access_key
-            })
+            session_kwargs.update(
+                {
+                    "aws_access_key_id": aws_access_key_id,
+                    "aws_secret_access_key": aws_secret_access_key,
+                }
+            )
 
         try:
             self.session = boto3.Session(**session_kwargs)
-            self.s3_client = self.session.client('s3', config=botocore.config.Config(
-                max_pool_connections=1000,
-            ))
-            self.s3_resource = self.session.resource('s3')
-            self.bucket = self.s3_resource.Bucket(bucket_name)
+            self.s3_client = self.session.client(
+                "s3",
+                config=botocore.config.Config(
+                    max_pool_connections=1000,
+                ),
+            )
+            self.s3_resource = self.session.resource("s3")
+            self.bucket = self.s3_resource.Bucket(bucket_name)  # type: ignore
 
             # Test connection
             self.s3_client.head_bucket(Bucket=bucket_name)
@@ -63,14 +72,19 @@ class S3Manager:
 
         except NoCredentialsError:
             logger.error(
-                "AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables or configure AWS CLI.")
+                "AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables or configure AWS CLI."
+            )
             raise
         except ClientError as e:
             logger.error(f"Error connecting to S3 bucket {bucket_name}: {e}")
             raise
 
-    def upload_file(self, local_path: Union[str, Path], s3_key: str,
-                    extra_args: Optional[Dict] = None) -> bool:
+    def upload_file(
+        self,
+        local_path: Union[str, Path],
+        s3_key: str,
+        extra_args: Optional[Dict] = None,
+    ) -> bool:
         """
         Upload a file to S3
 
@@ -84,8 +98,7 @@ class S3Manager:
         """
         try:
             self.s3_client.upload_file(
-                str(local_path), self.bucket_name, s3_key,
-                ExtraArgs=extra_args or {}
+                str(local_path), self.bucket_name, s3_key, ExtraArgs=extra_args or {}
             )
             logger.debug(f"Uploaded {local_path} to s3://{self.bucket_name}/{s3_key}")
             return True
@@ -115,8 +128,9 @@ class S3Manager:
             logger.error(f"Error downloading {s3_key} from S3: {e}")
             return False
 
-    def upload_bytes(self, data: bytes, s3_key: str,
-                     content_type: Optional[str] = None) -> bool:
+    def upload_bytes(
+        self, data: bytes, s3_key: str, content_type: Optional[str] = None
+    ) -> bool:
         """
         Upload bytes data to S3
 
@@ -131,13 +145,10 @@ class S3Manager:
         try:
             extra_args = {}
             if content_type:
-                extra_args['ContentType'] = content_type
+                extra_args["ContentType"] = content_type
 
             self.s3_client.put_object(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                Body=data,
-                **extra_args
+                Bucket=self.bucket_name, Key=s3_key, Body=data, **extra_args
             )
             logger.debug(f"Uploaded bytes to s3://{self.bucket_name}/{s3_key}")
             return True
@@ -157,12 +168,12 @@ class S3Manager:
         """
         try:
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
-            return response['Body'].read()
+            return response["Body"].read()
         except Exception as e:
             logger.error(f"Error downloading bytes from S3: {e}")
             return None
 
-    def list_objects(self, prefix: str = '', suffix: str = '') -> List[str]:
+    def list_objects(self, prefix: str = "", suffix: str = "") -> List[str]:
         """
         List objects in S3 bucket with optional prefix and suffix filtering
 
@@ -175,12 +186,12 @@ class S3Manager:
         """
         try:
             objects = []
-            paginator = self.s3_client.get_paginator('list_objects_v2')
+            paginator = self.s3_client.get_paginator("list_objects_v2")
 
             for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        key = obj['Key']
+                if "Contents" in page:
+                    for obj in page["Contents"]:
+                        key = obj["Key"]
                         if not suffix or key.endswith(suffix):
                             objects.append(key)
 
@@ -235,8 +246,8 @@ class S3Manager:
             True if successful, False otherwise
         """
         try:
-            json_bytes = json.dumps(data, indent=2).encode('utf-8')
-            return self.upload_bytes(json_bytes, s3_key, 'application/json')
+            json_bytes = json.dumps(data, indent=2).encode("utf-8")
+            return self.upload_bytes(json_bytes, s3_key, "application/json")
         except Exception as e:
             logger.error(f"Error uploading JSON to S3: {e}")
             return False
@@ -254,13 +265,15 @@ class S3Manager:
         try:
             json_bytes = self.download_bytes(s3_key)
             if json_bytes:
-                return json.loads(json_bytes.decode('utf-8'))
+                return json.loads(json_bytes.decode("utf-8"))
             return None
         except Exception as e:
             logger.error(f"Error downloading JSON from S3: {e}")
             return None
 
-    def upload_pytorch_model(self, model_state_dict: Dict[str, Any], s3_key: str) -> bool:
+    def upload_pytorch_model(
+        self, model_state_dict: Dict[str, Any], s3_key: str
+    ) -> bool:
         """
         Upload PyTorch model state dict to S3
 
@@ -277,12 +290,16 @@ class S3Manager:
             torch.save(model_state_dict, buffer)
             buffer.seek(0)
 
-            return self.upload_bytes(buffer.getvalue(), s3_key, 'application/octet-stream')
+            return self.upload_bytes(
+                buffer.getvalue(), s3_key, "application/octet-stream"
+            )
         except Exception as e:
             logger.error(f"Error uploading PyTorch model to S3: {e}")
             return False
 
-    def download_pytorch_model(self, s3_key: str, map_location: str = 'cpu') -> Optional[Dict[str, Any]]:
+    def download_pytorch_model(
+        self, s3_key: str, map_location: str = "cpu"
+    ) -> Optional[Dict[str, Any]]:
         """
         Download PyTorch model state dict from S3
 
@@ -303,7 +320,9 @@ class S3Manager:
             logger.error(f"Error downloading PyTorch model from S3: {e}")
             return None
 
-    def upload_image(self, image: Image.Image, s3_key: str, format: str = 'PNG') -> bool:
+    def upload_image(
+        self, image: Image.Image, s3_key: str, format: str = "PNG"
+    ) -> bool:
         """
         Upload PIL Image to S3
 
@@ -320,7 +339,7 @@ class S3Manager:
             image.save(buffer, format=format)
             buffer.seek(0)
 
-            content_type = f'image/{format.lower()}'
+            content_type = f"image/{format.lower()}"
             return self.upload_bytes(buffer.getvalue(), s3_key, content_type)
         except Exception as e:
             logger.error(f"Error uploading image to S3: {e}")
@@ -359,10 +378,10 @@ class S3Manager:
         try:
             response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
             return {
-                'size': response.get('ContentLength'),
-                'last_modified': response.get('LastModified'),
-                'content_type': response.get('ContentType'),
-                'etag': response.get('ETag')
+                "size": response.get("ContentLength"),
+                "last_modified": response.get("LastModified"),
+                "content_type": response.get("ContentType"),
+                "etag": response.get("ETag"),
             }
         except Exception as e:
             logger.error(f"Error getting object info from S3: {e}")
@@ -379,12 +398,12 @@ def parse_s3_path(s3_path: str) -> tuple[str, str]:
     Returns:
         Tuple of (bucket_name, key)
     """
-    if s3_path.startswith('s3://'):
+    if s3_path.startswith("s3://"):
         parsed = urlparse(s3_path)
-        return parsed.netloc, parsed.path.lstrip('/')
+        return parsed.netloc, parsed.path.lstrip("/")
     else:
         # Assume format is bucket/key
-        parts = s3_path.split('/', 1)
+        parts = s3_path.split("/", 1)
         if len(parts) == 2:
             return parts[0], parts[1]
         else:
@@ -404,22 +423,24 @@ def get_s3_manager_from_env() -> S3Manager:
     Returns:
         S3Manager instance
     """
-    bucket_name = os.getenv('S3_BUCKET_NAME')
+    bucket_name = os.getenv("S3_BUCKET_NAME")
     if not bucket_name:
         raise ValueError("S3_BUCKET_NAME environment variable is required")
 
-    region_name = os.getenv('AWS_REGION', 'us-east-1')
-    aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
-    aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    region_name = os.getenv("AWS_REGION", "us-east-1")
+    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
 
     if not aws_access_key_id or not aws_secret_access_key:
-        raise ValueError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables are required")
+        raise ValueError(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables are required"
+        )
 
     return S3Manager(
         bucket_name=bucket_name,
         region_name=region_name,
         aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key
+        aws_secret_access_key=aws_secret_access_key,
     )
 
 

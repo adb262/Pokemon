@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from typing import Counter
 
 import numpy as np
@@ -70,19 +71,26 @@ def get_frame_similarity(frame1: Image.Image, frame2: Image.Image):
     return np.mean(np.abs(np.array(frame1) - np.array(frame2))) / 255.0
 
 
+@dataclass
+class FrameWithPath:
+    path: str
+    frame: Image.Image
+
+
 def filter_frame_sequence(
-    frame_sequence: list[tuple[str, Image.Image]],
+    frame_sequence: list[FrameWithPath],
 ) -> list[str]:
-    frames = [(path, frame) for (path, frame) in frame_sequence]
-    valid_frames = [(path, frame) for (path, frame) in frames if is_frame_valid(frame)]
+    valid_frames = [frame for frame in frame_sequence if is_frame_valid(frame.frame)]
     if len(valid_frames) < 2:
         return []
 
     valid_frame_paths: list[str] = []
-
     for i in range(len(valid_frames) - 1):
-        curr_frame_path, curr_frame = valid_frames[i]
-        next_frame_path, next_frame = valid_frames[i + 1]
+        curr_frame_path, curr_frame = valid_frames[i].path, valid_frames[i].frame
+        next_frame_path, next_frame = (
+            valid_frames[i + 1].path,
+            valid_frames[i + 1].frame,
+        )
         similarity = get_frame_similarity(curr_frame, next_frame)
         if similarity >= 0.0 and similarity <= 0.99:
             if len(valid_frame_paths) == 0:

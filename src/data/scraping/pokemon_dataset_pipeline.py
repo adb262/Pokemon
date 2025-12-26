@@ -7,25 +7,25 @@ Main script that orchestrates the entire Pokemon video dataset creation process:
 4. Create organized dataset structure
 """
 
-import logging
-from pathlib import Path
-from typing import Dict, Any
 import json
+import logging
 import time
+from pathlib import Path
+from typing import Any, Dict
 
-from data_collection.scrape_videos import PokemonVideoScraper
-from data_collection.video_cleaner import PokemonVideoCleaner
-from data_collection.frame_extractor import PokemonFrameExtractor
-from data_collection.data_config import PokemonDatasetPipelineConfig, parse_args
+from data.scraping.data_config import PokemonDatasetPipelineConfig, parse_args
+from data.scraping.frame_extractor import PokemonFrameExtractor
+from data.scraping.scrape_videos import PokemonVideoScraper
+from data.scraping.video_cleaner import PokemonVideoCleaner
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('pokemon_dataset_pipeline.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("pokemon_dataset_pipeline.log"),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -44,14 +44,11 @@ class PokemonDatasetPipeline:
         self._target_height = config.target_height
         self.scraper = PokemonVideoScraper(
             output_dir=self._raw_videos_dir,
-            max_videos_per_game=self._max_videos_per_game
+            max_videos_per_game=self._max_videos_per_game,
         )
-        self.cleaner = PokemonVideoCleaner(
-            min_gameplay_ratio=self._min_gameplay_ratio
-        )
+        self.cleaner = PokemonVideoCleaner(min_gameplay_ratio=self._min_gameplay_ratio)
         self.extractor = PokemonFrameExtractor(
-            target_fps=self._target_fps,
-            target_height=self._target_height
+            target_fps=self._target_fps, target_height=self._target_height
         )
         self._scrape = config.scrape
         self._clean = config.clean
@@ -81,7 +78,7 @@ class PokemonDatasetPipeline:
             self._raw_videos_dir,
             self._clean_videos_dir,
             self._frames_dir,
-            self._logs_dir
+            self._logs_dir,
         ]
 
         for directory in directories:
@@ -118,7 +115,7 @@ class PokemonDatasetPipeline:
                 return False
 
             # Find all video files
-            video_extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv']
+            video_extensions = [".mp4", ".avi", ".mkv", ".mov", ".wmv"]
             video_files = []
 
             for ext in video_extensions:
@@ -158,7 +155,9 @@ class PokemonDatasetPipeline:
                     # Move rejected video
                     self._move_rejected_video(video_file)
 
-            logger.info(f"Video cleaning completed: {clean_count} clean, {rejected_count} rejected")
+            logger.info(
+                f"Video cleaning completed: {clean_count} clean, {rejected_count} rejected"
+            )
             return True
 
         except Exception as e:
@@ -174,8 +173,7 @@ class PokemonDatasetPipeline:
         try:
             # Process all videos in raw_videos directory
             self.extractor.process_video_directory(
-                self._raw_videos_dir,
-                self._frames_dir
+                self._raw_videos_dir, self._frames_dir
             )
 
             # Create dataset index
@@ -205,32 +203,34 @@ class PokemonDatasetPipeline:
                 logger.error("Dataset index not found")
                 return False
 
-            with open(index_file, 'r') as f:
+            with open(index_file, "r") as f:
                 dataset_index = json.load(f)
 
             # Create comprehensive summary
             summary = {
                 **self._get_config().__dict__,
-                'dataset_statistics': dataset_index,
-                'creation_timestamp': time.time(),
-                'games_included': list(dataset_index['games'].keys()),
-                'total_videos_processed': sum(
-                    len(game_data['videos'])
-                    for game_data in dataset_index['games'].values()
+                "dataset_statistics": dataset_index,
+                "creation_timestamp": time.time(),
+                "games_included": list(dataset_index["games"].keys()),
+                "total_videos_processed": sum(
+                    len(game_data["videos"])
+                    for game_data in dataset_index["games"].values()
                 ),
-                'total_frames': dataset_index['total_frames'],
-                'average_frames_per_video': 0,
-                'storage_info': self._calculate_storage_info(frames_path)
+                "total_frames": dataset_index["total_frames"],
+                "average_frames_per_video": 0,
+                "storage_info": self._calculate_storage_info(frames_path),
             }
 
             # Calculate average frames per video
-            total_videos = summary['total_videos_processed']
+            total_videos = summary["total_videos_processed"]
             if total_videos > 0:
-                summary['average_frames_per_video'] = summary['total_frames'] / total_videos
+                summary["average_frames_per_video"] = (
+                    summary["total_frames"] / total_videos
+                )
 
             # Save summary
             summary_file = frames_path / "dataset_summary.json"
-            with open(summary_file, 'w') as f:
+            with open(summary_file, "w") as f:
                 json.dump(summary, f, indent=2)
 
             # Print summary
@@ -248,15 +248,15 @@ class PokemonDatasetPipeline:
         path_str = str(video_path).lower().replace(" ", "_")
 
         game_mappings = {
-            'emerald': 'Pokemon Emerald',
-            'fire_red': 'Pokemon Fire Red',
-            'firered': 'Pokemon Fire Red',
-            'ruby': 'Pokemon Ruby',
-            'sapphire': 'Pokemon Sapphire',
-            'heart_gold': 'Pokemon Heart Gold',
-            'heartgold': 'Pokemon Heart Gold',
-            'soul_silver': 'Pokemon Soul Silver',
-            'soulsilver': 'Pokemon Soul Silver'
+            "emerald": "Pokemon Emerald",
+            "fire_red": "Pokemon Fire Red",
+            "firered": "Pokemon Fire Red",
+            "ruby": "Pokemon Ruby",
+            "sapphire": "Pokemon Sapphire",
+            "heart_gold": "Pokemon Heart Gold",
+            "heartgold": "Pokemon Heart Gold",
+            "soul_silver": "Pokemon Soul Silver",
+            "soulsilver": "Pokemon Soul Silver",
         }
 
         for key, game_name in game_mappings.items():
@@ -290,11 +290,13 @@ class PokemonDatasetPipeline:
                 continue
 
         return {
-            'total_size_bytes': total_size,
-            'total_size_mb': round(total_size / (1024 * 1024), 2),
-            'total_size_gb': round(total_size / (1024 * 1024 * 1024), 2),
-            'total_files': total_files,
-            'average_file_size_kb': round(total_size / total_files / 1024, 2) if total_files > 0 else 0
+            "total_size_bytes": total_size,
+            "total_size_mb": round(total_size / (1024 * 1024), 2),
+            "total_size_gb": round(total_size / (1024 * 1024 * 1024), 2),
+            "total_files": total_files,
+            "average_file_size_kb": round(total_size / total_files / 1024, 2)
+            if total_files > 0
+            else 0,
         }
 
     def _print_final_summary(self, summary: Dict[str, Any]):
@@ -306,10 +308,14 @@ class PokemonDatasetPipeline:
         logger.info(f"Games: {', '.join(summary['games_included'])}")
         logger.info(f"Total Videos Processed: {summary['total_videos_processed']}")
         logger.info(f"Total Frames Extracted: {summary['total_frames']:,}")
-        logger.info(f"Average Frames per Video: {summary['average_frames_per_video']:.1f}")
+        logger.info(
+            f"Average Frames per Video: {summary['average_frames_per_video']:.1f}"
+        )
         logger.info(f"Dataset Size: {summary['storage_info']['total_size_gb']:.2f} GB")
         logger.info(f"Total Files: {summary['storage_info']['total_files']:,}")
-        logger.info(f"Average File Size: {summary['storage_info']['average_file_size_kb']:.1f} KB")
+        logger.info(
+            f"Average File Size: {summary['storage_info']['average_file_size_kb']:.1f} KB"
+        )
         logger.info("=" * 80)
 
     def run_full_pipeline(self) -> bool:

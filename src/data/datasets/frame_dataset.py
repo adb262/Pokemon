@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from data_collection.frame_filterer import filter_frame_sequence
+from data.scraping.frame_filterer import filter_frame_sequence
 from s3.s3_utils import default_s3_manager
 
 sys.path.append(str(Path(__file__).parent.parent))
