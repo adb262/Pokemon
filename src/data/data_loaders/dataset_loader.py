@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-Pokemon Dataset Loader
-Utility for loading and accessing the Pokemon frame dataset.
-Provides convenient methods for iterating through frames, filtering by game, etc.
-"""
-
 import json
 import logging
 import random

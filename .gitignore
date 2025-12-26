@@ -21,3 +21,4 @@ runs/
 *.jpg
 wandb/
 .env
+*.json

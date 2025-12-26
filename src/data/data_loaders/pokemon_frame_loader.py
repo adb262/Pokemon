@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Literal, Optional, Tuple
 
 import torch
-from data_collection.frame_dataset import PokemonFrameDataset
-from data_collection.resumable_data_loader import ResumableDataLoader
-from s3.s3_utils import S3Manager, default_s3_manager, get_s3_manager_from_env
 from torch.utils.data import DataLoader
+
+from data.data_loaders.resumable_data_loader import ResumableDataLoader
+from data.datasets.frame_dataset import PokemonFrameDataset
+from s3.s3_utils import S3Manager, default_s3_manager, get_s3_manager_from_env
 
 sys.path.append(str(Path(__file__).parent.parent))
 

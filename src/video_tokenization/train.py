@@ -1,22 +1,34 @@
-# python -m src.video_tokenization.train --use_s3 true --frames_dir pokemon --seed_cache --num_frames_in_video 2 --batch_size 2
+# python -m src.video_tokenization.train --use_s3 true --frames_dir pokemon --seed_cache --num_images_in_video 2 --batch_size 2
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import logging
 import os
 import time
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-import wandb
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
-from latent_action_model.training_args import VideoTrainingConfig
-from loss.loss_fns import reconstruction_residual_loss
-from s3.s3_utils import S3Manager, default_s3_manager
+from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.datasets.cache import Cache
+from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
+from data.datasets.open_world.open_world_running_dataset_creator import (
+    OpenWorldRunningDatasetCreator,
+)
+from loss.loss_fns import reconstruction_loss
+from monitoring.setup_wandb import setup_wandb
+from s3.s3_utils import default_s3_manager
+from video_tokenization.checkpoints import save_checkpoint
+from video_tokenization.create_tokenizer import create_model
+from video_tokenization.eval import (
+    convert_video_to_images,
+    eval_model,
+    save_comparison_images,
+)
 from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.training_args import VideoTokenizerTrainingConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,78 +39,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_model(config: VideoTrainingConfig):
-    """Create and initialize the VQVAE model"""
-    model = VideoTokenizer(
-        channels=3,
-        image_height=config.image_size,
-        image_width=config.image_size,
-        patch_height=config.patch_size,
-        patch_width=config.patch_size,
-        num_images_in_video=config.num_images_in_video // 2,
-        d_model=config.d_model,
-        num_heads=config.num_heads,
-        num_layers=config.num_transformer_layers,
-        embedding_dim=config.latent_dim,
-    )
-
-    return model
-
-
-def save_checkpoint(
-    model: VideoTokenizer,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    epoch: int,
-    batch_idx: int,
-    loss: float,
-    config: VideoTrainingConfig,
-    best_loss: float,
-    dataloader_state: dict,
-):
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "loss": loss,
-        "best_loss": best_loss,
-        "config": config.to_dict(),
-        "dataloader_state": dataloader_state,
-    }
-    checkpoint_path = os.path.join(
-        config.checkpoint_dir, f"checkpoint_epoch{epoch}_batch{batch_idx}.pt"
-    )
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Saved checkpoint: {checkpoint_path}")
-
-
-def load_checkpoint(
-    checkpoint_path: str,
-    model: VideoTokenizer,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    device: torch.device,
-) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.CosineAnnealingLR, dict]:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    dataloader_state = PokemonFrameLoader.load_state(checkpoint["dataloader_state"])
-    return model, optimizer, scheduler, dataloader_state
-
-
 def train_epoch(
     model: VideoTokenizer,
-    dataloader: PokemonFrameLoader,
+    dataloader: PokemonOpenWorldLoader,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.CosineAnnealingLR,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     epoch: int,
-    config: VideoTrainingConfig,
-    s3_manager: Optional[S3Manager] = None,
+    config: VideoTokenizerTrainingConfig,
     start_batch: int = 0,
     wandb_logger=None,
 ):
@@ -140,6 +89,13 @@ def train_epoch(
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        if not batch_idx % 30:
+            images = convert_video_to_images(video_batch)
+            decoded_images = convert_video_to_images(decoded)
+            save_comparison_images(
+                decoded_images, images, f"train_results/epoch_{epoch}_batch_{batch_idx}"
+            )
 
         optimizer.step()
         scheduler.step()  # Step scheduler every batch for cosine annealing
@@ -190,14 +146,6 @@ def train_epoch(
                 dataloader_state,
             )
 
-        # # Evaluate periodically
-        # if batch_idx > 0 and batch_idx % config.eval_interval == 0:
-        #     eval_loss = evaluate_model(
-        #         model, dataloader, criterion, device,
-        #         wandb_logger=wandb_logger, step=global_step
-        #     )
-        #     logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
-
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
 
@@ -218,27 +166,7 @@ def train_epoch(
     return avg_loss
 
 
-def setup_wandb(config: VideoTrainingConfig):
-    """Initialize Weights & Biases logging"""
-    if not config.use_wandb:
-        return None
-
-    # Initialize wandb
-    wandb.init(
-        project=config.wandb_project,
-        group="video-tokenizer-test",
-        entity=config.wandb_entity,
-        name=config.experiment_name,
-        tags=config.wandb_tags,
-        notes=config.wandb_notes,
-        config=config.to_dict(),
-    )
-
-    # Watch the model for gradients and parameters
-    return wandb
-
-
-def main(config: VideoTrainingConfig):
+def main(config: VideoTokenizerTrainingConfig):
     """Main training function with resumable training support and S3 integration"""
 
     # Generate experiment name if not provided
@@ -247,7 +175,15 @@ def main(config: VideoTrainingConfig):
         config.experiment_name = f"pokemon_vqvae_{timestamp}"
 
     # Setup wandb
-    wandb_logger = setup_wandb(config)
+    wandb_logger = setup_wandb(
+        project=config.wandb_project,
+        group="video-tokenizer-test",
+        entity=config.wandb_entity or "",
+        name=config.experiment_name,
+        tags=config.wandb_tags or [],
+        notes=config.wandb_notes or "",
+        config=config.to_dict(),
+    )
 
     logger.info(
         f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}"
@@ -265,10 +201,46 @@ def main(config: VideoTrainingConfig):
 
     # Create data loader
     logger.info("Creating data loader...")
-    dataloader = PokemonFrameLoader(
-        frames_dir=config.frames_dir,
-        batch_size=config.batch_size,
+    if config.local_cache_dir is None:
+        raise ValueError("local_cache_dir is required")
+
+    local_cache = Cache(
+        max_size=config.max_cache_size,
+        cache_dir=config.local_cache_dir,
+    )
+
+    dataset_creator = OpenWorldRunningDatasetCreator(
+        dataset_dir=config.frames_dir,
         num_frames_in_video=config.num_images_in_video,
+        output_log_json_file_name="log_dir_10000.json",
+        local_cache=local_cache,
+        limit=10000,
+        image_size=config.image_size,
+    )
+
+    logger.info("Setting up dataset...")
+    train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+
+    # Lets overfit
+    test_dataset = train_dataset
+
+    train_dataset = OpenWorldRunningDataset(
+        dataset=train_dataset,
+        local_cache=local_cache,
+        image_size=config.image_size,
+    )
+
+    test_dataset = OpenWorldRunningDataset(
+        dataset=test_dataset,
+        local_cache=local_cache,
+        image_size=config.image_size,
+    )
+
+    logger.info("Creating data loader...")
+    train_dataloader = PokemonOpenWorldLoader(
+        frames_dir=config.frames_dir,
+        dataset=train_dataset,
+        batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
@@ -276,20 +248,36 @@ def main(config: VideoTrainingConfig):
         use_s3=config.use_s3,
         cache_dir=config.local_cache_dir,
         max_cache_size=config.max_cache_size,
-        stage="train",
-        seed_cache=config.seed_cache,
-        limit=100,
+    )
+    test_dataloader = PokemonOpenWorldLoader(
+        frames_dir=config.frames_dir,
+        dataset=test_dataset,
+        batch_size=config.batch_size,
+        image_size=config.image_size,
+        shuffle=True,
+        num_workers=8,
+        seed=config.seed,
+        use_s3=config.use_s3,
+        cache_dir=config.local_cache_dir,
+        max_cache_size=config.max_cache_size,
     )
 
     # Print dataset info
-    info = dataloader.get_dataset_info()
+    train_info = train_dataloader.get_dataset_info()
+    test_info = test_dataloader.get_dataset_info()
     logger.info("Dataset Info:")
-    for key, value in info.items():
+    for key, value in train_info.items():
+        logger.info(f"  {key}: {value}")
+
+    for key, value in test_info.items():
         logger.info(f"  {key}: {value}")
 
     # Log dataset info to wandb
     if wandb_logger:
-        wandb_logger.log({f"dataset/{key}": value for key, value in info.items()})
+        wandb_logger.log({f"dataset/{key}": value for key, value in train_info.items()})
+        wandb_logger.log(
+            {f"test_dataset/{key}": value for key, value in test_info.items()}
+        )
 
     # Create model
     logger.info(f"Creating model on device {device}...")
@@ -311,37 +299,32 @@ def main(config: VideoTrainingConfig):
     logger.info(f"Optimizer created with learning rate: {config.learning_rate}")
 
     # Cosine annealing scheduler
-    total_steps = config.num_epochs * len(dataloader)
+    total_steps = config.num_epochs * len(train_dataloader)
     scheduler = CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=config.min_learning_rate
     )
 
     # Loss function
-    criterion = reconstruction_residual_loss
+    criterion = reconstruction_loss
     s3_manager = default_s3_manager
 
     # Resume from checkpoint if specified
     start_epoch = 0
     start_batch = 0
-
-    if config.resume_from:
-        checkpoint_info = load_checkpoint(
-            config.resume_from, model, optimizer, scheduler, device
-        )
-        if checkpoint_info:
-            start_epoch = checkpoint_info["epoch"]
-            start_batch = checkpoint_info.get("batch_idx", 0)
-
-            # Restore dataloader state
-            if "dataloader_state" in checkpoint_info:
-                dataloader_state = checkpoint_info["dataloader_state"]
-                dataloader.resumable_loader = dataloader.create_resumable_loader(
-                    start_epoch, start_batch
-                )
-
     # Training loop
     logger.info("Starting training loop...")
     best_loss = float("inf")
+
+    # first, evaluate on test dataset
+    test_loss = eval_model(
+        model,
+        test_dataloader,
+        criterion,
+        device,
+        epoch=0,
+        wandb_logger=wandb_logger,
+    )
+    logger.info(f"Test loss: {test_loss:.6f}")
 
     try:
         model.train()
@@ -350,45 +333,56 @@ def main(config: VideoTrainingConfig):
 
             avg_loss = train_epoch(
                 model,
-                dataloader,
+                train_dataloader,
                 optimizer,
                 scheduler,
                 criterion,
                 device,
                 epoch,
                 config,
-                s3_manager,
                 epoch_start_batch,
                 wandb_logger,
             )
+
+            eval_loss = eval_model(
+                model,
+                test_dataloader,
+                criterion,
+                device,
+                epoch,
+                wandb_logger=wandb_logger,
+            )
+            logger.info(f"Test loss: {eval_loss:.6f}")
+
+            if eval_loss < best_loss:
+                best_loss = eval_loss
 
             save_checkpoint(
                 model,
                 optimizer,
                 scheduler,
                 epoch,
-                len(dataloader),
+                len(train_dataloader),
                 avg_loss,
                 config,
                 best_loss,
-                dataloader.get_state(),
+                train_dataloader.get_state(),
             )
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         # Save checkpoint on interruption
-        dataloader_state = dataloader.get_state()
+        dataloader_state = train_dataloader.get_state()
         save_checkpoint(
             model,
             optimizer,
             scheduler,
             epoch,
-            dataloader.resumable_loader.current_batch,
+            train_dataloader.resumable_loader.current_batch,
             avg_loss,
             config,
+            best_loss,
             dataloader_state,
-            config.checkpoint_dir,
-            s3_manager,
         )
     except Exception as e:
         logging.error(f"Training error: {e}")
@@ -425,7 +419,7 @@ def main(config: VideoTrainingConfig):
 
 
 if __name__ == "__main__":
-    config = VideoTrainingConfig.from_cli()
+    config = VideoTokenizerTrainingConfig.from_cli()
 
     logger.info(f"Starting training... config: {config.to_dict()}")
     main(config)

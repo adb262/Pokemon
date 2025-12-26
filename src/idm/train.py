@@ -14,15 +14,15 @@ import GPUtil
 import psutil
 import torch
 import torch.optim as optim
+from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from training_args import TrainingConfig
 from vqvae import VQVAE
 
 import wandb
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from s3.s3_utils import S3Manager, default_s3_manager
-from src.loss.loss_fns import reconstruction_residual_loss
+from src.loss.loss_fns import next_frame_reconstruction_residual_loss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -648,7 +648,7 @@ def main(config: TrainingConfig):
     )
 
     # Loss function
-    criterion = reconstruction_residual_loss
+    criterion = next_frame_reconstruction_residual_loss
     s3_manager = default_s3_manager
 
     # Create tensorboard writer
