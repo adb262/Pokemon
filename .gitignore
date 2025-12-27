@@ -18,6 +18,7 @@ runs/
 *.pt
 *.pth
 *.png
+!public/*.png
 *.jpg
 wandb/
 .env

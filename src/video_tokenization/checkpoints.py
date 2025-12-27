@@ -4,6 +4,7 @@ import os
 import torch
 import torch.optim as optim
 
+from video_tokenization.create_tokenizer import create_model
 from video_tokenization.tokenizer import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 
@@ -51,4 +52,37 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    logger.info(f"Loaded checkpoint: {checkpoint_path}")
+    logger.info(f"FSQ shape: {model.fsq._levels_np.shape}")
+    logger.info(f"FSQ levels: {model.fsq._levels_np}")
     return model, optimizer, scheduler
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: str, device: torch.device
+) -> tuple[VideoTokenizer, VideoTokenizerTrainingConfig]:
+    """
+    Load a VideoTokenizer and its training config from a checkpoint.
+
+    This reconstructs the model using the saved config (including FSQ bins)
+    so that quantization levels and related hyperparameters match training.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config_dict = checkpoint.get("config", {})
+
+    # Start from default config, then apply saved values
+    config = VideoTokenizerTrainingConfig()
+    for key, value in config_dict.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+
+    model = create_model(config)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    logger.info(f"Loaded model from checkpoint: {checkpoint_path}")
+    logger.info(f"FSQ shape: {model.fsq._levels_np.shape}")
+    logger.info(f"FSQ levels: {model.fsq._levels_np}")
+
+    return model, config

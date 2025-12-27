@@ -15,7 +15,7 @@ def create_model(config: VideoTokenizerTrainingConfig):
         num_heads=config.num_heads,
         num_layers=config.num_transformer_layers,
         embedding_dim=config.latent_dim,
-        fsq_latent_dim=config.fsq_latent_dim,
+        bins=config.bins,
     )
 
     return model

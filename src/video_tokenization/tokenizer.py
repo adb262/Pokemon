@@ -163,8 +163,7 @@ class VideoTokenizer(nn.Module):
         num_heads: int,
         num_layers: int,
         embedding_dim: int,
-        fsq_latent_dim: int,
-        num_bins: int = 4,
+        bins: list[int],
     ):
         super(VideoTokenizer, self).__init__()
         self.encoder = VideoTokenizerEncoder(
@@ -181,9 +180,7 @@ class VideoTokenizer(nn.Module):
         )
 
         self.fsq = FiniteScalarQuantizer(
-            # latent_dim=fsq_latent_dim,
-            # num_bins=num_bins,
-            levels=[8, 8, 6, 5],
+            levels=bins,
             embedding_dim=embedding_dim,
             device=torch.device("mps"),
         )
@@ -198,7 +195,7 @@ class VideoTokenizer(nn.Module):
             d_model=d_model,
             num_heads=num_heads,
             num_layers=num_layers,
-            embedding_dim=4,
+            embedding_dim=len(bins),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

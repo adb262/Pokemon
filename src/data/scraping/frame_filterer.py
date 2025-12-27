@@ -17,7 +17,7 @@ def get_counts_of_pixels(arr: np.ndarray) -> Counter:
     return counter
 
 
-def is_frame_valid(image: Image.Image) -> bool:
+def is_frame_within_navigable_environment(image: Image.Image) -> bool:
     """
     Returns True if the frame is likely to be in a navigable environment.
     Heuristics:
@@ -80,7 +80,11 @@ class FrameWithPath:
 def filter_frame_sequence(
     frame_sequence: list[FrameWithPath],
 ) -> list[str]:
-    valid_frames = [frame for frame in frame_sequence if is_frame_valid(frame.frame)]
+    valid_frames = [
+        frame
+        for frame in frame_sequence
+        if is_frame_within_navigable_environment(frame.frame)
+    ]
     if len(valid_frames) < 2:
         return []
 
@@ -105,7 +109,7 @@ if __name__ == "__main__":
         with open(os.path.join("cache", frame), "rb") as f:
             image = Image.open(f)
 
-            if is_valid := is_frame_valid(image):
+            if is_valid := is_frame_within_navigable_environment(image):
                 # visualize the frame
                 image.show()
                 print(f"Frame {frame} is valid: {is_valid}")
