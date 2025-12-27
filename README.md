@@ -28,6 +28,7 @@ Ablation results (see below):
 ### TODOS:
 [] Flow Matching Transformer
 [] Larger group dynamics (not just pairs)
+[] Do we really need video tokenization or would frame tokenization suffice?
 
 Data
 [X] Process parallelism

@@ -1,10 +1,10 @@
-from einops.layers.torch import Rearrange
-import torch
-import torch.nn as nn
-
 import logging
 
-from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransformer
+import torch
+import torch.nn as nn
+from einops.layers.torch import Rearrange
+
+from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.DEBUG)
@@ -12,9 +12,20 @@ logger = logging.getLogger(__name__)
 
 class VideoDecoder(nn.Module):
     def __init__(
-            self, *, num_images_in_video: int, image_height: int, image_width: int, channels: int, patch_height: int,
-            patch_width: int, d_model: int, num_heads: int, num_layers: int, use_spatial_transformer: bool,
-            use_temporal_transformer: bool):
+        self,
+        *,
+        num_images_in_video: int,
+        image_height: int,
+        image_width: int,
+        channels: int,
+        patch_height: int,
+        patch_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        use_spatial_transformer: bool,
+        use_temporal_transformer: bool,
+    ):
         super(VideoDecoder, self).__init__()
         self.num_images_in_video = num_images_in_video
         self.image_height = image_height
@@ -34,7 +45,9 @@ class VideoDecoder(nn.Module):
         )
 
         # Need a cross attention layer that takes in the latent action and the collapsed x
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=num_heads, batch_first=True
+        )
 
         h_patches = self.image_height // self.patch_height
         w_patches = self.image_width // self.patch_width
@@ -46,8 +59,14 @@ class VideoDecoder(nn.Module):
             nn.Linear(d_model, patch_dim),
             nn.LayerNorm(patch_dim),
             nn.Sigmoid(),
-            Rearrange('b h w (p1 p2 c) -> b c (h p1) (w p2)', h=h_patches, w=w_patches,
-                      p1=self.patch_height, p2=self.patch_width, c=3)
+            Rearrange(
+                "b h w (p1 p2 c) -> b c (h p1) (w p2)",
+                h=h_patches,
+                w=w_patches,
+                p1=self.patch_height,
+                p2=self.patch_width,
+                c=3,
+            ),
         )
 
     def forward(self, x: torch.Tensor, latent_action: torch.Tensor) -> torch.Tensor:
@@ -66,26 +85,39 @@ class VideoDecoder(nn.Module):
         # And latent action is (batch_size, num_frame, d_model)
         # So, we take the last frame from x as our "prediction" token
         x = x[:, -1, :, :].squeeze(1)
-        logger.debug(f"x shape after taking last patch: {x.shape} and latent_action shape: {latent_action.shape}")
+        logger.debug(
+            f"x shape after taking last patch: {x.shape} and latent_action shape: {latent_action.shape}"
+        )
 
         # Then, we need to perform cross attention between x and latent_action
         # x is of shape (batch_size, num_patches, d_model)
         # latent_action is of shape (batch_size, h, w, d_model)
         # resize x to be (batch_size, h, w, d_model)
         batch_size, num_patches, d_model = x.shape
-        x = x.reshape(batch_size, self.image_height // self.patch_height, self.image_width // self.patch_width, d_model)
+        x = x.reshape(
+            batch_size,
+            self.image_height // self.patch_height,
+            self.image_width // self.patch_width,
+            d_model,
+        )
         logger.debug(f"x shape after reshape: {x.shape}")
 
         # Now, we need to perform cross attention between x and latent_action
         # x is of shape (batch_size, h, w, d_model)
         # latent_action is of shape (batch_size, num_frames, d_model)
         # So, we take the last frame from x as our "prediction" token
-        logger.debug(f"latent_action shape after unsqueeze and expand: {latent_action.shape}")
+        logger.debug(
+            f"latent_action shape after unsqueeze and expand: {latent_action.shape}"
+        )
         x, _ = self.attention(latent_action, x, x)
 
         if x.shape[0] > 1:
-            logger.info(f"Std of x AFTER conditioning (summed over D, mean over B, F): {torch.std(x, dim=0).mean()}")
-            logger.info(f"Mean of x AFTER conditioning (summed over D, mean over B, F): {torch.mean(x, dim=0).mean()}")
+            logger.info(
+                f"Std of x AFTER conditioning (summed over D, mean over B, F): {torch.std(x, dim=0).mean()}"
+            )
+            logger.info(
+                f"Mean of x AFTER conditioning (summed over D, mean over B, F): {torch.mean(x, dim=0).mean()}"
+            )
 
         logger.debug(f"x shape after attention: {x.shape}")
         # Now we need to decode the patches into images

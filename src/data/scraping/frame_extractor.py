@@ -18,8 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 from PIL import Image
 
+from data.s3.s3_utils import S3Manager, default_s3_manager
 from data.scraping.video_cleaner import CropRegion, PokemonVideoCleaner
-from s3.s3_utils import S3Manager, default_s3_manager
 
 # Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))

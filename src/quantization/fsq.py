@@ -64,7 +64,7 @@ class FiniteScalarQuantizer(nn.Module):
         )
         z = self.project_in(z)
         quantized = round_ste(self.bound(z))
-        half_width = self._levels_np.to(z.device) // 2
+        half_width = self._levels_np.to(z.device) // 2  # type: ignore[operator]
         # Renormalize to [-1, 1]. return quantized / half_width
         logger.info(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
         return quantized / half_width

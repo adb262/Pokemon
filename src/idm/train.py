@@ -21,7 +21,7 @@ from training_args import TrainingConfig
 from vqvae import VQVAE
 
 import wandb
-from s3.s3_utils import S3Manager, default_s3_manager
+from data.s3.s3_utils import S3Manager, default_s3_manager
 from src.loss.loss_fns import next_frame_reconstruction_residual_loss
 
 logging.basicConfig(

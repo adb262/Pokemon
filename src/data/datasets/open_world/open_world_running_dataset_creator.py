@@ -15,9 +15,9 @@ from data.datasets.data_types.open_world_types import (
     OpenWorldVideoLog,
     OpenWorldVideoLogSingleton,
 )
+from data.s3.gather_frames_in_dirs import S3Frame, list_frames_in_s3
+from data.s3.s3_utils import S3Manager, default_s3_manager
 from data.scraping.frame_filterer import FrameWithPath, filter_frame_sequence
-from s3.gather_frames_in_dirs import S3Frame, list_frames_in_s3
-from s3.s3_utils import S3Manager, default_s3_manager
 
 random.seed(42)
 
