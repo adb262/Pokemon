@@ -14,10 +14,10 @@ from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import wandb
+from data.s3.s3_utils import S3Manager, default_s3_manager
 from latent_action_model.laqa import LatentActionQuantization
 from latent_action_model.training_args import VideoTrainingConfig
 from loss.loss_fns import next_frame_reconstruction_residual_loss
-from s3.s3_utils import S3Manager, default_s3_manager
 
 logging.basicConfig(
     level=logging.INFO,

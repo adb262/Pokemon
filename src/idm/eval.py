@@ -17,9 +17,9 @@ import torch.nn as nn
 from PIL import Image
 
 from data.data_loaders.pokemon_frame_loader import PokemonFrameLoader
+from data.s3.s3_utils import get_s3_manager_from_env, parse_s3_path
 from idm.multi_frame_vqvae import MultiFrameVQVAE
 from idm.training_args import TrainingConfig
-from s3.s3_utils import get_s3_manager_from_env, parse_s3_path
 
 TrainingConfig = TrainingConfig()
 

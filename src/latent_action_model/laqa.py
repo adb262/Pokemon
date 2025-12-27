@@ -1,16 +1,15 @@
-from pathlib import Path
+import logging
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from einops import rearrange, pack, repeat
+from einops import pack, rearrange, repeat
 from einops.layers.torch import Rearrange
+from torch import nn
 
-from idm.lapa.nsvq import NSVQ
 from idm.lapa.positional_bias import ContinuousPositionBias, Transformer
-
-import logging
+from quantization.nsvq import NSVQ
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +38,8 @@ class LatentActionQuantization(nn.Module):
         dim_head=64,
         heads=8,
         channels=3,
-        attn_dropout=0.,
-        ff_dropout=0.,
+        attn_dropout=0.0,
+        ff_dropout=0.0,
         code_seq_len=1,
     ):
         """
@@ -66,10 +65,14 @@ class LatentActionQuantization(nn.Module):
         assert (image_height % patch_height) == 0 and (image_width % patch_width) == 0
 
         self.to_patch_emb_first_frame = nn.Sequential(
-            Rearrange('b c t (h p1) (w p2) -> b t h w (c p1 p2)', p1=patch_height, p2=patch_width),
+            Rearrange(
+                "b c t (h p1) (w p2) -> b t h w (c p1 p2)",
+                p1=patch_height,
+                p2=patch_width,
+            ),
             nn.LayerNorm(channels * patch_width * patch_height),
             nn.Linear(channels * patch_width * patch_height, dim),
-            nn.LayerNorm(dim)
+            nn.LayerNorm(dim),
         )
 
         transformer_kwargs = dict(
@@ -94,23 +97,33 @@ class LatentActionQuantization(nn.Module):
             dim_context=dim,
         )
 
-        self.enc_spatial_transformer = Transformer(depth=spatial_depth, **transformer_kwargs)
-        self.enc_temporal_transformer = Transformer(depth=temporal_depth, **transformer_kwargs)
+        self.enc_spatial_transformer = Transformer(
+            depth=spatial_depth, **transformer_kwargs
+        )
+        self.enc_temporal_transformer = Transformer(
+            depth=temporal_depth, **transformer_kwargs
+        )
 
         self.vq = NSVQ(
             dim=dim,
             num_embeddings=codebook_size,
             embedding_dim=quant_dim,
-            device='mps',
+            device="mps",
             code_seq_len=code_seq_len,
             patch_size=patch_size,
-            image_size=image_size
+            image_size=image_size,
         )
 
-        self.dec_spatial_transformer = Transformer(depth=spatial_depth, **transformer_with_action_kwargs)
+        self.dec_spatial_transformer = Transformer(
+            depth=spatial_depth, **transformer_with_action_kwargs
+        )
         self.to_pixels_first_frame = nn.Sequential(
             nn.Linear(dim, channels * patch_width * patch_height),
-            Rearrange('b t h w (c p1 p2) -> b c t (h p1) (w p2)', p1=patch_height, p2=patch_width)
+            Rearrange(
+                "b t h w (c p1 p2) -> b c t (h p1) (w p2)",
+                p1=patch_height,
+                p2=patch_width,
+            ),
         )
 
     def state_dict(self, *args, **kwargs):
@@ -123,7 +136,9 @@ class LatentActionQuantization(nn.Module):
         path = Path(path)
         assert path.exists()
         pt = torch.load(str(path))
-        pt = {k.replace('module.', '') if 'module.' in k else k: v for k, v in pt.items()}
+        pt = {
+            k.replace("module.", "") if "module." in k else k: v for k, v in pt.items()
+        }
         self.load_state_dict(pt)
 
     def decode_from_codebook_indices(self, indices):
@@ -133,30 +148,31 @@ class LatentActionQuantization(nn.Module):
 
     @property
     def patch_height_width(self):
-        return self.image_size[0] // self.patch_size[0], self.image_size[1] // self.patch_size[1]
+        return self.image_size[0] // self.patch_size[0], self.image_size[
+            1
+        ] // self.patch_size[1]
 
-    def encode(
-        self,
-        tokens
-    ):
+    def encode(self, tokens):
         b = tokens.shape[0]
         h, w = self.patch_height_width
 
         video_shape = tuple(tokens.shape[:-1])
 
-        tokens = rearrange(tokens, 'b t h w d -> (b t) (h w) d')
+        tokens = rearrange(tokens, "b t h w d -> (b t) (h w) d")
 
         attn_bias = self.spatial_rel_pos_bias(h, w, device=tokens.device)
 
-        tokens = self.enc_spatial_transformer(tokens, attn_bias=attn_bias, video_shape=video_shape)
+        tokens = self.enc_spatial_transformer(
+            tokens, attn_bias=attn_bias, video_shape=video_shape
+        )
 
-        tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b=b, h=h, w=w)
+        tokens = rearrange(tokens, "(b t) (h w) d -> b t h w d", b=b, h=h, w=w)
 
-        tokens = rearrange(tokens, 'b t h w d -> (b h w) t d')
+        tokens = rearrange(tokens, "b t h w d -> (b h w) t d")
 
         tokens = self.enc_temporal_transformer(tokens, video_shape=video_shape)
 
-        tokens = rearrange(tokens, '(b h w) t d -> b t h w d', b=b, h=h, w=w)
+        tokens = rearrange(tokens, "(b h w) t d -> b t h w d", b=b, h=h, w=w)
 
         first_tokens = tokens[:, :1]
         last_tokens = tokens[:, 1:]
@@ -172,18 +188,20 @@ class LatentActionQuantization(nn.Module):
         h, w = self.patch_height_width
 
         if tokens.ndim == 3:
-            tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h=h, w=w)
+            tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=h, w=w)
 
         video_shape = tuple(tokens.shape[:-1])
 
-        tokens = rearrange(tokens, 'b t h w d -> (b t) (h w) d')
-        actions = rearrange(actions, 'b t h w d -> (b t) (h w) d')
+        tokens = rearrange(tokens, "b t h w d -> (b t) (h w) d")
+        actions = rearrange(actions, "b t h w d -> (b t) (h w) d")
 
         attn_bias = self.spatial_rel_pos_bias(h, w, device=tokens.device)
 
-        tokens = self.dec_spatial_transformer(tokens, attn_bias=attn_bias, video_shape=video_shape, context=actions)
+        tokens = self.dec_spatial_transformer(
+            tokens, attn_bias=attn_bias, video_shape=video_shape, context=actions
+        )
 
-        tokens = rearrange(tokens, '(b t) (h w) d -> b t h w d', b=b, h=h, w=w)
+        tokens = rearrange(tokens, "(b t) (h w) d -> b t h w d", b=b, h=h, w=w)
 
         rest_frames_tokens = tokens
 
@@ -204,7 +222,7 @@ class LatentActionQuantization(nn.Module):
         is_image = video.ndim == 4
 
         if is_image:
-            video = rearrange(video, 'b c h w -> b c 1 h w')
+            video = rearrange(video, "b c h w -> b c 1 h w")
             assert not exists(mask)
 
         b, c, f, *image_dims, device = *video.shape, video.device
@@ -231,8 +249,10 @@ class LatentActionQuantization(nn.Module):
 
         logger.info(f"first_tokens shape before pack: {first_tokens.shape}")
         logger.info(f"last_tokens shape before pack: {last_tokens.shape}")
-        first_tokens, first_packed_fhw_shape = pack([first_tokens], 'b * d')
-        last_tokens, last_packed_fhw_shape = pack([last_tokens[:, -1, :, :, :]], 'b * d')
+        first_tokens, first_packed_fhw_shape = pack([first_tokens], "b * d")
+        last_tokens, last_packed_fhw_shape = pack(
+            [last_tokens[:, -1, :, :, :]], "b * d"
+        )
 
         logger.info(f"first_tokens shape after pack: {first_tokens.shape}")
         logger.info(f"last_tokens shape after pack: {last_tokens.shape}")
@@ -244,20 +264,28 @@ class LatentActionQuantization(nn.Module):
 
         logger.info(f"first_tokens shape before vq: {first_tokens.shape}")
         logger.info(f"last_tokens shape before vq: {last_tokens.shape}")
-        tokens, perplexity, codebook_usage, indices = self.vq(first_tokens, last_tokens, codebook_training_only=False)
+        tokens, perplexity, codebook_usage, indices = self.vq(
+            first_tokens, last_tokens, codebook_training_only=False
+        )
 
         logger.info(f"tokens shape after vq: {tokens.shape}")
 
         num_unique_indices = indices.unique().size(0)
 
-        if ((step % 10 == 0 and step < 100) or (step % 100 == 0 and step < 1000) or (step % 500 == 0 and step < 5000)) and step != 0:
+        if (
+            (step % 10 == 0 and step < 100)
+            or (step % 100 == 0 and step < 1000)
+            or (step % 500 == 0 and step < 5000)
+        ) and step != 0:
             print(f"update codebook {step}")
             self.vq.replace_unused_codebooks(tokens.shape[0])
 
         if return_only_codebook_ids:
             return indices
 
-        if math.sqrt(self.code_seq_len) % 1 == 0:  # "code_seq_len should be square number"
+        if (
+            math.sqrt(self.code_seq_len) % 1 == 0
+        ):  # "code_seq_len should be square number"
             action_h = int(math.sqrt(self.code_seq_len))
             action_w = int(math.sqrt(self.code_seq_len))
         elif self.code_seq_len == 2:
@@ -268,11 +296,11 @@ class LatentActionQuantization(nn.Module):
             print("code_seq_len should be square number or defined as 2")
             return
 
-        tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h=action_h, w=action_w)
+        tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=action_h, w=action_w)
         concat_tokens = first_frame_tokens.detach()  # + tokens
         recon_video = self.decode(concat_tokens, tokens)
 
-        returned_recon = rearrange(recon_video, 'b c 1 h w -> b c h w')
+        returned_recon = rearrange(recon_video, "b c 1 h w -> b c h w")
         video = rest_frames
 
         if return_recons_only:
@@ -280,8 +308,8 @@ class LatentActionQuantization(nn.Module):
 
         if exists(mask):
             # variable lengthed video / images training
-            recon_loss = F.mse_loss(video, recon_video, reduction='none')
-            recon_loss = recon_loss[repeat(mask, 'b t -> b c t', c=c)]
+            recon_loss = F.mse_loss(video, recon_video, reduction="none")
+            recon_loss = recon_loss[repeat(mask, "b t -> b c t", c=c)]
             recon_loss = recon_loss.mean()
         else:
             recon_loss = F.mse_loss(video, recon_video)
@@ -294,15 +322,14 @@ class LatentActionQuantization(nn.Module):
         step=0,
         mask=None,
         return_only_codebook_ids=False,
-        user_action_token_num=None
+        user_action_token_num=None,
     ):
-
         assert video.ndim in {4, 5}
 
         is_image = video.ndim == 4
 
         if is_image:
-            video = rearrange(video, 'b c h w -> b c 1 h w')
+            video = rearrange(video, "b c h w -> b c 1 h w")
             assert not exists(mask)
 
         b, c, f, *image_dims, device = *video.shape, video.device
@@ -322,18 +349,22 @@ class LatentActionQuantization(nn.Module):
         first_tokens, last_tokens = self.encode(tokens)
 
         # quantize
-        first_tokens, first_packed_fhw_shape = pack([first_tokens], 'b * d')
-        last_tokens, last_packed_fhw_shape = pack([last_tokens], 'b * d')
+        first_tokens, first_packed_fhw_shape = pack([first_tokens], "b * d")
+        last_tokens, last_packed_fhw_shape = pack([last_tokens], "b * d")
 
         if user_action_token_num is not None:
-            tokens, indices = self.vq.inference(first_tokens, last_tokens, user_action_token_num=user_action_token_num)
+            tokens, indices = self.vq.inference(
+                first_tokens, last_tokens, user_action_token_num=user_action_token_num
+            )
         else:
             tokens, indices = self.vq.inference(first_tokens, last_tokens)
 
         if return_only_codebook_ids:
             return indices
 
-        if math.sqrt(self.code_seq_len) % 1 == 0:  # "code_seq_len should be square number"
+        if (
+            math.sqrt(self.code_seq_len) % 1 == 0
+        ):  # "code_seq_len should be square number"
             action_h = int(math.sqrt(self.code_seq_len))
             action_w = int(math.sqrt(self.code_seq_len))
         elif self.code_seq_len == 2:
@@ -343,10 +374,10 @@ class LatentActionQuantization(nn.Module):
             print("code_seq_len should be square number or defined as 2")
             return
 
-        tokens = rearrange(tokens, 'b (t h w) d -> b t h w d', h=action_h, w=action_w)
+        tokens = rearrange(tokens, "b (t h w) d -> b t h w d", h=action_h, w=action_w)
         concat_tokens = first_frame_tokens  # .detach() #+ tokens
         recon_video = self.decode(concat_tokens, actions=tokens)
-        returned_recon = rearrange(recon_video, 'b c 1 h w -> b c h w')
+        returned_recon = rearrange(recon_video, "b c 1 h w -> b c h w")
         video = rest_frames
 
         return returned_recon

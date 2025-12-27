@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 
 from latent_action_model.patch_embedding import PatchEmbedding
-from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransformer
-from video_tokenization.fsq import FiniteScalarQuantizer
+from quantization.fsq import FiniteScalarQuantizer
+from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -179,10 +179,17 @@ class VideoTokenizer(nn.Module):
             embedding_dim=embedding_dim,
         )
 
+        device = torch.device("cpu")
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+
         self.fsq = FiniteScalarQuantizer(
             levels=bins,
             embedding_dim=embedding_dim,
-            device=torch.device("mps"),
+            device=device,
         )
 
         self.decoder = VideoTokenizerDecoder(

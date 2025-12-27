@@ -17,9 +17,9 @@ from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
 from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
+from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import reconstruction_loss
 from monitoring.setup_wandb import setup_wandb
-from s3.s3_utils import default_s3_manager
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.eval import (
@@ -213,7 +213,7 @@ def main(config: VideoTokenizerTrainingConfig):
     )
 
     dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
+        dataset_dir="saved_datasets",
         num_frames_in_video=config.num_images_in_video,
         output_log_json_file_name="log_dir_100000.json",
         local_cache=local_cache,

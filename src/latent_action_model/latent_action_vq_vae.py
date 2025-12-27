@@ -3,30 +3,46 @@ import logging
 import torch
 import torch.nn as nn
 
-from idm.lapa.nsvq import NSVQ
 from latent_action_model.decoder import VideoDecoder
 from latent_action_model.patch_embedding import PatchEmbedding
-from latent_action_model.spatio_temporal_transformer import SpatioTemporalTransformer
+from quantization.nsvq import NSVQ
+from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
 
 
 class ActionCondenserNet(nn.Module):
-    def __init__(self, num_patches: int, d_model_input: int, d_model_output: int, d_model_intermediate_factor: int = 1):
+    def __init__(
+        self,
+        num_patches: int,
+        d_model_input: int,
+        d_model_output: int,
+        d_model_intermediate_factor: int = 1,
+    ):
         super().__init__()
         self.num_patches = num_patches
         self.d_model_input = d_model_input
         d_model_intermediate = d_model_input * d_model_intermediate_factor
 
-        self.conv_block = nn.Sequential(nn.Conv1d(
-            in_channels=d_model_input, out_channels=d_model_intermediate, kernel_size=3,
-            padding=1, stride=1),
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(
+                in_channels=d_model_input,
+                out_channels=d_model_intermediate,
+                kernel_size=3,
+                padding=1,
+                stride=1,
+            ),
             nn.GELU(),
             nn.Conv1d(
-            in_channels=d_model_intermediate, out_channels=d_model_intermediate,
-            kernel_size=3, padding=1, stride=1),
+                in_channels=d_model_intermediate,
+                out_channels=d_model_intermediate,
+                kernel_size=3,
+                padding=1,
+                stride=1,
+            ),
             nn.GELU(),
-            nn.AdaptiveAvgPool1d(1))
+            nn.AdaptiveAvgPool1d(1),
+        )
         self.fc = nn.Linear(d_model_intermediate, d_model_output)
         self.ln = nn.LayerNorm(d_model_output)
 
@@ -44,9 +60,22 @@ class ActionCondenserNet(nn.Module):
 
 class LatentActionVQVAE(nn.Module):
     def __init__(
-            self, *, num_images_in_video: int, image_height: int, image_width: int, channels: int, patch_height: int,
-            patch_width: int, d_model: int, num_heads: int, num_layers: int, use_spatial_transformer: bool,
-            use_temporal_transformer: bool, num_embeddings: int, embedding_dim: int):
+        self,
+        *,
+        num_images_in_video: int,
+        image_height: int,
+        image_width: int,
+        channels: int,
+        patch_height: int,
+        patch_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        use_spatial_transformer: bool,
+        use_temporal_transformer: bool,
+        num_embeddings: int,
+        embedding_dim: int,
+    ):
         super(LatentActionVQVAE, self).__init__()
         self.num_images_in_video = num_images_in_video
         self.image_height = image_height
@@ -72,7 +101,13 @@ class LatentActionVQVAE(nn.Module):
             use_temporal_transformer=use_temporal_transformer,
         )
 
-        self.conv_down = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1, stride=1)
+        self.conv_down = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=3,
+            padding=1,
+            stride=1,
+        )
 
         num_patches_h = image_height // patch_height
         num_patches_w = image_width // patch_width
@@ -81,7 +116,7 @@ class LatentActionVQVAE(nn.Module):
         self.action_condenser = ActionCondenserNet(
             num_patches=self.num_patches_per_image,
             d_model_input=d_model,
-            d_model_output=d_model
+            d_model_output=d_model,
         )
 
         # self.quantizer = VectorQuantize(
@@ -89,15 +124,22 @@ class LatentActionVQVAE(nn.Module):
         #     codebook_size=num_embeddings,
         #     decay=0.8,
         # )
+
+        device = torch.device("cpu")
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+
         self.quantizer = NSVQ(
             dim=d_model,
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             patch_size=patch_height,
             image_size=image_height,
-            device="mps",
+            device=device,
             discarding_threshold=0.1,
-            initialization='normal',
+            initialization="normal",
             code_seq_len=1,
         )
 
@@ -121,7 +163,9 @@ class LatentActionVQVAE(nn.Module):
         logger.debug(f"video shape: {video.shape}")
         # patched_video_from_embedder has shape (B, T*P, D) then reshaped to (B, T, P, D) by PatchEmbedding
         patched_video_from_embedder = self.embed_image_patches(video)
-        logger.debug(f"patched_video_from_embedder shape: {patched_video_from_embedder.shape}")
+        logger.debug(
+            f"patched_video_from_embedder shape: {patched_video_from_embedder.shape}"
+        )
 
         # x_encoded_full has shape (batch_size, num_frames, num_patches, d_model)
         x_encoded_full = self.encoder(patched_video_from_embedder)
@@ -156,6 +200,10 @@ class LatentActionVQVAE(nn.Module):
         patch_video_for_decoder = patched_video_from_embedder[:, :-1, :, :]
 
         # Now, we need to decode. The decoder aims to predict frame T-1 using frames 0 to T-2 and the quantized_action.
-        decoded = self.decoder(patch_video_for_decoder, quantized)  # quantized is (B, 2*h, D_model)
-        logger.debug(f"decoded shape: {decoded.shape}")  # Decoder outputs a single frame (B, C, H, W)
+        decoded = self.decoder(
+            patch_video_for_decoder, quantized
+        )  # quantized is (B, 2*h, D_model)
+        logger.debug(
+            f"decoded shape: {decoded.shape}"
+        )  # Decoder outputs a single frame (B, C, H, W)
         return decoded, commitment_loss

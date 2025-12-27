@@ -2,7 +2,7 @@ import re
 
 from pydantic import BaseModel
 
-from s3.s3_utils import S3Manager
+from data.s3.s3_utils import S3Manager
 
 
 class S3Frame(BaseModel):
