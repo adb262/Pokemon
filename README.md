@@ -14,6 +14,16 @@ Our end state is to have groups (starting with "pairs" i.e. group of 2) from whi
 
 ## Training
 
+Starting with the Finite State Quantization (FSQ) for our tokenizer, we want to understand the impact of the quantization bins. Ideally, we are able to overfit on a small set first. So, we run two experiments:
+- **Sending information through a straw**: We restrict our bins to be 2 2 2 2, meaning that we will lose a lot of information in our tokenization. Our vocab size is only 16 here.
+- **Light Quantization**: Use bins 16 12 12 12, allowing vocabulary size of 36,864.
+
+We expect to see an enormous delta, but it is much smaller than anticipated. So, let's try removing quantization entirely. Our encoder/decoder should just learn the identify function. 
+
+Ablation results (see below):
+
+![FSQ Ablation Results](public/fsq_ablation.png)
+
 
 ### TODOS:
 [] Flow Matching Transformer
@@ -21,5 +31,4 @@ Our end state is to have groups (starting with "pairs" i.e. group of 2) from whi
 
 Data
 [X] Process parallelism
-[] Loss is wrong
-    - You shouldn't be using future frames, it's the current
+[X] Loss is wrong

@@ -1,18 +1,19 @@
 import wandb
+from wandb.wandb_run import Run
 
 
 def setup_wandb(
     *,
     project: str,
     group: str,
-    entity: str,
+    entity: str | None,
     name: str,
     tags: list[str],
     notes: str,
     config: dict,
-):
+) -> Run:
     # Initialize wandb
-    wandb.init(
+    return wandb.init(
         project=project,
         group=group,
         entity=entity,
@@ -21,6 +22,3 @@ def setup_wandb(
         notes=notes,
         config=config,
     )
-
-    # Watch the model for gradients and parameters
-    return wandb

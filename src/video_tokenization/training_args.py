@@ -1,11 +1,14 @@
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import argparse
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,7 +40,7 @@ class VideoTokenizerTrainingConfig:
     # Wandb Configuration
     use_wandb: bool = True
     wandb_project: str = "pokemon-vqvae"
-    wandb_entity: Optional[str] = "latent-health"
+    wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None
     wandb_notes: Optional[str] = None
     # S3 Configuration
@@ -50,6 +53,8 @@ class VideoTokenizerTrainingConfig:
     local_cache_dir: Optional[str] = os.environ.get("BT_RW_CACHE_DIR", "cache")
     max_cache_size: int = 100000
     no_wandb: bool = False
+    bins: list[int] = field(default_factory=lambda: [8, 8, 6, 5])
+    save_dir: str = "tokenization_results"
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None
@@ -80,6 +85,13 @@ class VideoTokenizerTrainingConfig:
         )
         parser.add_argument(
             "--seed_cache", action="store_true", help="Seed cache with all frames"
+        )
+        parser.add_argument(
+            "--bins", type=str, nargs="*", help="Bins for the Finite Scalar Quantizer"
+        )
+        parser.add_argument("--save_dir", type=str, help="Directory to save results")
+        parser.add_argument(
+            "--checkpoint_dir", type=str, help="Directory to save checkpoints"
         )
 
         # Wandb arguments
@@ -127,6 +139,10 @@ class VideoTokenizerTrainingConfig:
         default_config = VideoTokenizerTrainingConfig()
         for key, value in vars(args).items():
             if value is not None:
-                setattr(default_config, key, value)
+                if key == "bins":
+                    logger.info(f"Bins: {value}")
+                    setattr(default_config, key, list(map(int, value)))
+                else:
+                    setattr(default_config, key, value)
 
         return default_config

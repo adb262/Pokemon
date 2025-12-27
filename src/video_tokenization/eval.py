@@ -13,11 +13,13 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
 from loss.loss_fns import next_frame_reconstruction_residual_loss
+from monitoring.frechet_distance import compute_frechet_distance
 from monitoring.setup_wandb import setup_wandb
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.tokenizer import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
+from wandb.wandb_run import Run
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -169,19 +171,30 @@ def eval_model(
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     epoch: int,
-    wandb_logger=None,
+    wandb_logger: Run,
+    save_dir: str = "tokenization_results",
 ):
     model.eval()
     total_loss = 0.0
     total_samples = 0
     selected_indices = [0, 10, 20, 30]
-    os.makedirs(f"eval_results/epoch_{epoch}", exist_ok=True)
+
+    # Collect real and predicted next frames across the eval set
+    real_next_frames_batches: list[torch.Tensor] = []
+    pred_next_frames_batches: list[torch.Tensor] = []
+
+    os.makedirs(f"{save_dir}/eval/epoch_{epoch}", exist_ok=True)
     with torch.no_grad():
         for batch_idx, video_batch in enumerate(dataloader):
             video_batch = video_batch.to(device)
 
             decoded: torch.Tensor = model(video_batch)
             loss = criterion(video_batch, decoded)
+
+            # Predicting full frames. Video VQVAE is not looking ahead.
+            if decoded.dim() == 5 and video_batch.dim() == 5:
+                real_next_frames_batches.append(video_batch.detach().cpu())
+                pred_next_frames_batches.append(decoded.detach().cpu())
 
             if batch_idx in selected_indices:
                 # Save the image locally
@@ -190,7 +203,7 @@ def eval_model(
                 predicted_videos = convert_video_to_images(decoded)
                 expected_videos = convert_video_to_images(video_batch)
                 save_comparison_images(
-                    predicted_videos, expected_videos, f"eval_results/epoch_{epoch}"
+                    predicted_videos, expected_videos, f"{save_dir}/epoch_{epoch}"
                 )
 
             total_loss += loss.item() * video_batch.size(0)
@@ -198,8 +211,18 @@ def eval_model(
 
     avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
 
+    if real_next_frames_batches and pred_next_frames_batches:
+        real_all = torch.cat(real_next_frames_batches, dim=0)
+        pred_all = torch.cat(pred_next_frames_batches, dim=0)
+        frechet_distance = compute_frechet_distance(real_all, pred_all)
+    else:
+        frechet_distance = float("inf")
+
     if wandb_logger:
-        wandb_logger.log({"eval/loss": avg_loss}, step=epoch)
+        wandb_logger.log(
+            {"eval/loss": avg_loss, "eval/frechet_distance": frechet_distance},
+            step=epoch,
+        )
 
     return avg_loss
 

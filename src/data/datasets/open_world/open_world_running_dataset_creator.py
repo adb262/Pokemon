@@ -246,7 +246,7 @@ class OpenWorldRunningDatasetCreator:
             directory.frame_list.sort(key=lambda x: x.frame_num)
             directory.frame_list = directory.frame_list
 
-            # Work over chunks of at most 500 frames at once
+            # Work over chunks of at most self.frame_chunk_size frames at once
             chunks = [
                 directory.frame_list[i : i + self.frame_chunk_size]
                 for i in range(0, len(directory.frame_list), self.frame_chunk_size)
