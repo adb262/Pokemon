@@ -1,17 +1,31 @@
 # https://github.com/MHVali/Noise-Substitution-in-Vector-Quantization/blob/main/NSVQ.py
 # NSVQ: Noise Substitution in Vector Quantization for Machine Learning in IEEE Access journal, January 2022
 
+# add project_in, project_out layer
+# FYI vector_quantize_pytorch
+import logging
+
 import torch
 import torch.distributions.normal as normal_dist
 import torch.distributions.uniform as uniform_dist
 
-# add project_in, project_out layer
-# FYI vector_quantize_pytorch
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class NSVQ(torch.nn.Module):
-    def __init__(self, dim, num_embeddings, embedding_dim, device=torch.device('cpu'),
-                 discarding_threshold=0.1, initialization='normal', code_seq_len=1, patch_size=32, image_size=256):
+    def __init__(
+        self,
+        dim,
+        num_embeddings,
+        embedding_dim,
+        device=torch.device("cpu"),
+        discarding_threshold=0.1,
+        initialization="normal",
+        code_seq_len=1,
+        patch_size=32,
+        image_size=256,
+    ):
         super(NSVQ, self).__init__()
 
         """
@@ -39,18 +53,25 @@ class NSVQ(torch.nn.Module):
         self.dim = dim
         self.patch_size = patch_size
 
-        if initialization == 'normal':
-            codebooks = torch.randn(self.num_embeddings, self.embedding_dim, device=device)
-        elif initialization == 'uniform':
-            codebooks = uniform_dist.Uniform(-1 / self.num_embeddings,
-                                             1 / self.num_embeddings).sample([self.num_embeddings, self.embedding_dim])
+        if initialization == "normal":
+            codebooks = torch.randn(
+                self.num_embeddings, self.embedding_dim, device=device
+            )
+        elif initialization == "uniform":
+            codebooks = uniform_dist.Uniform(
+                -1 / self.num_embeddings, 1 / self.num_embeddings
+            ).sample([self.num_embeddings, self.embedding_dim])
         else:
-            raise ValueError("initialization should be one of the 'normal' and 'uniform' strings")
+            raise ValueError(
+                "initialization should be one of the 'normal' and 'uniform' strings"
+            )
 
         self.codebooks = torch.nn.Parameter(codebooks, requires_grad=True)
 
         # Counter variable which contains the number of times each codebook is used
-        self.codebooks_used = torch.zeros(self.num_embeddings, dtype=torch.int32, device=device)
+        self.codebooks_used = torch.zeros(
+            self.num_embeddings, dtype=torch.int32, device=device
+        )
 
         self.project_in = torch.nn.Linear(dim, embedding_dim)
         self.project_out = torch.nn.Linear(embedding_dim, dim)
@@ -58,68 +79,133 @@ class NSVQ(torch.nn.Module):
         # 8 * 8  => 4 * 4 => 2 * 2
         # assert patch_size == 32
         if code_seq_len == 1:
-            self.cnn_encoder = torch.nn.Sequential(torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=3, stride=2, padding=1),
+            self.cnn_encoder = torch.nn.Sequential(
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),
                 torch.nn.ReLU(),
                 torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=13, stride=1, padding=0),)
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=13,
+                    stride=1,
+                    padding=0,
+                ),
+            )
         elif code_seq_len == 2:
-            self.cnn_encoder = torch.nn.Sequential(torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=3, stride=2, padding=1),
+            self.cnn_encoder = torch.nn.Sequential(
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),
                 torch.nn.ReLU(),
                 torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=(3, 4),
-                stride=1, padding=0),)
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=(3, 4),
+                    stride=1,
+                    padding=0,
+                ),
+            )
 
         elif code_seq_len == 4:
-            self.cnn_encoder = torch.nn.Sequential(torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=3, stride=2, padding=1),
+            self.cnn_encoder = torch.nn.Sequential(
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),
                 torch.nn.ReLU(),
                 torch.nn.Conv2d(
-                in_channels=embedding_dim, out_channels=embedding_dim,
-                kernel_size=3, stride=1, padding=0),)
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=1,
+                    padding=0,
+                ),
+            )
         elif code_seq_len == 16:
             self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim,
-                                kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),  # 16x16 -> 8x8
                 torch.nn.ReLU(),
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim,
-                                kernel_size=3, stride=2, padding=1),  # 8x8 -> 4x4
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),  # 8x8 -> 4x4
             )
         elif code_seq_len == 64:
             self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim,
-                                kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),  # 16x16 -> 8x8
             )
         elif code_seq_len == 256:
             self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim,
-                                kernel_size=3, stride=2, padding=1),  # 32x32 -> 16x16
+                torch.nn.Conv2d(
+                    in_channels=embedding_dim,
+                    out_channels=embedding_dim,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),  # 32x32 -> 16x16
             )
         else:
-            raise ValueError("Not Implement: code_seq_len should be one of the 1 and 4 integers")
+            raise ValueError(
+                "Not Implement: code_seq_len should be one of the 1 and 4 integers"
+            )
 
     def encode(self, input_data, batch_size):
         # compute the distances between input and codebooks vectors
+        logger.debug(f"input_data shape before project_in: {input_data.shape}")
         input_data = self.project_in(input_data)  # b * 64 * 32
+        logger.debug(f"input_data shape after project_in: {input_data.shape}")
         # change the order of the input_data to b * 32 * 64
         input_data = input_data.permute(0, 2, 1).contiguous()
+        logger.debug(f"input_data shape after permute: {input_data.shape}")
         # reshape input_data to 4D b*h*w*d
-        input_data = input_data.reshape(batch_size, self.embedding_dim, int(
-            self.image_size/self.patch_size), int(self.image_size/self.patch_size))
+        input_data = input_data.reshape(
+            batch_size,
+            self.embedding_dim,
+            int(self.image_size / self.patch_size),
+            int(self.image_size / self.patch_size),
+        )
+        logger.debug(f"input_data shape after reshape: {input_data.shape}")
         input_data = self.cnn_encoder(input_data)  # 1*1 tensor
-        input_data = input_data.reshape(batch_size, self.embedding_dim, -1)  # b * 32 * d^2
+        logger.debug(f"input_data shape after cnn_encoder: {input_data.shape}")
+        input_data = input_data.reshape(
+            batch_size, self.embedding_dim, -1
+        )  # b * 32 * d^2
         input_data = input_data.permute(0, 2, 1).contiguous()  # b * 1 * 32
+        logger.debug(f"input_data shape after permute: {input_data.shape}")
         input_data = input_data.reshape(-1, self.embedding_dim)
         return input_data
 
     def decode(self, quantized_input, batch_size):
-        quantized_input = quantized_input.reshape(batch_size, self.embedding_dim, -1)  # b * 32 * d^2
+        quantized_input = quantized_input.reshape(
+            batch_size, self.embedding_dim, -1
+        )  # b * 32 * d^2
         quantized_input = quantized_input.permute(0, 2, 1).contiguous()  # b * 64 * 32
 
         quantized_input = self.project_out(quantized_input)
@@ -149,21 +235,29 @@ class NSVQ(torch.nn.Module):
 
         input_data = input_data_last - input_data_first
 
-        distances = (torch.sum(input_data ** 2, dim=1, keepdim=True)
-                     - 2 * (torch.matmul(input_data, self.codebooks.t()))
-                     + torch.sum(self.codebooks.t() ** 2, dim=0, keepdim=True))
+        distances = (
+            torch.sum(input_data**2, dim=1, keepdim=True)
+            - 2 * (torch.matmul(input_data, self.codebooks.t()))
+            + torch.sum(self.codebooks.t() ** 2, dim=0, keepdim=True)
+        )
 
         min_indices = torch.argmin(distances, dim=1)
 
         hard_quantized_input = self.codebooks[min_indices]
 
-        random_vector = normal_dist.Normal(0, 1).sample(input_data.shape).to(self.device)
+        random_vector = (
+            normal_dist.Normal(0, 1).sample(input_data.shape).to(self.device)
+        )
 
-        norm_quantization_residual = (input_data - hard_quantized_input).square().sum(dim=1, keepdim=True).sqrt()
+        norm_quantization_residual = (
+            (input_data - hard_quantized_input).square().sum(dim=1, keepdim=True).sqrt()
+        )
         norm_random_vector = random_vector.square().sum(dim=1, keepdim=True).sqrt()
 
         # defining vector quantization error
-        vq_error = (norm_quantization_residual / norm_random_vector + self.eps) * random_vector
+        vq_error = (
+            norm_quantization_residual / norm_random_vector + self.eps
+        ) * random_vector
 
         if codebook_training_only:
             print(f"codebook error: {norm_quantization_residual.norm()}")
@@ -172,7 +266,9 @@ class NSVQ(torch.nn.Module):
             quantized_input = input_data + vq_error
 
         # claculating the perplexity (average usage of codebook entries)
-        encodings = torch.zeros(input_data.shape[0], self.num_embeddings, device=input_data.device)
+        encodings = torch.zeros(
+            input_data.shape[0], self.num_embeddings, device=input_data.device
+        )
         encodings.scatter_(1, min_indices.reshape([-1, 1]), 1)
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
@@ -187,7 +283,12 @@ class NSVQ(torch.nn.Module):
         # Just return the tensor of "quantized_input" as vector quantized version of the input data.
 
         quantized_input = self.decode(quantized_input, batch_size)
-        return quantized_input, perplexity, self.codebooks_used.cpu().numpy(), min_indices.reshape(batch_size, -1)
+        return (
+            quantized_input,
+            perplexity,
+            self.codebooks_used.cpu().numpy(),
+            min_indices.reshape(batch_size, -1),
+        )
 
     def replace_unused_codebooks(self, num_batches):
         """
@@ -217,29 +318,50 @@ class NSVQ(torch.nn.Module):
         """
 
         with torch.no_grad():
-
-            unused_indices = torch.where((self.codebooks_used.cpu() / num_batches) < self.discarding_threshold)[0]
-            used_indices = torch.where((self.codebooks_used.cpu() / num_batches) >= self.discarding_threshold)[0]
+            unused_indices = torch.where(
+                (self.codebooks_used.cpu() / num_batches) < self.discarding_threshold
+            )[0]
+            used_indices = torch.where(
+                (self.codebooks_used.cpu() / num_batches) >= self.discarding_threshold
+            )[0]
 
             unused_count = unused_indices.shape[0]
             used_count = used_indices.shape[0]
 
             if used_count == 0:
-                print(f'####### used_indices equals zero / shuffling whole codebooks ######')
-                self.codebooks += self.eps * torch.randn(self.codebooks.size(), device=self.device).clone()
+                print(
+                    "####### used_indices equals zero / shuffling whole codebooks ######"
+                )
+                self.codebooks += (
+                    self.eps
+                    * torch.randn(self.codebooks.size(), device=self.device).clone()
+                )
             else:
                 used = self.codebooks[used_indices].clone()
                 if used_count < unused_count:
-                    used_codebooks = used.repeat(int((unused_count / (used_count + self.eps)) + 1), 1)
-                    used_codebooks = used_codebooks[torch.randperm(used_codebooks.shape[0])]
+                    used_codebooks = used.repeat(
+                        int((unused_count / (used_count + self.eps)) + 1), 1
+                    )
+                    used_codebooks = used_codebooks[
+                        torch.randperm(used_codebooks.shape[0])
+                    ]
                 else:
                     used_codebooks = used
 
                 self.codebooks[unused_indices] *= 0
-                self.codebooks[unused_indices] += used_codebooks[range(unused_count)] + self.eps * torch.randn(
-                    (unused_count, self.embedding_dim), device=self.device).clone()
+                self.codebooks[unused_indices] += (
+                    used_codebooks[range(unused_count)]
+                    + self.eps
+                    * torch.randn(
+                        (unused_count, self.embedding_dim), device=self.device
+                    ).clone()
+                )
 
-            print(f'************* Replaced ' + str(unused_count) + f' codebooks *************')
+            print(
+                "************* Replaced "
+                + str(unused_count)
+                + " codebooks *************"
+            )
             self.codebooks_used[:] = 0.0
 
     def inference(self, input_data_first, input_data_last, user_action_token_num=None):
@@ -272,9 +394,11 @@ class NSVQ(torch.nn.Module):
 
         input_data = input_data.reshape(-1, self.embedding_dim)
 
-        distances = (torch.sum(input_data ** 2, dim=1, keepdim=True)
-                     - 2 * (torch.matmul(input_data, codebooks.t()))
-                     + torch.sum(codebooks.t() ** 2, dim=0, keepdim=True))
+        distances = (
+            torch.sum(input_data**2, dim=1, keepdim=True)
+            - 2 * (torch.matmul(input_data, codebooks.t()))
+            + torch.sum(codebooks.t() ** 2, dim=0, keepdim=True)
+        )
 
         min_indices = torch.argmin(distances, dim=1)
 
@@ -282,7 +406,9 @@ class NSVQ(torch.nn.Module):
             if type(user_action_token_num) == list:
                 min_indices = torch.tensor(user_action_token_num, device=self.device)
             else:
-                min_indices = torch.tensor([[user_action_token_num]], device=self.device).repeat(input_data.shape[0], 1)
+                min_indices = torch.tensor(
+                    [[user_action_token_num]], device=self.device
+                ).repeat(input_data.shape[0], 1)
         quantized_input = codebooks[min_indices]
 
         quantized_input = self.decode(quantized_input, batch_size)
@@ -293,5 +419,8 @@ class NSVQ(torch.nn.Module):
     def codebook_reinit(self):
         self.codebooks = torch.nn.Parameter(
             torch.randn(self.num_embeddings, self.embedding_dim, device=self.device),
-            requires_grad=True)
-        self.codebooks_used = torch.zeros(self.num_embeddings, dtype=torch.int32, device=self.device)
+            requires_grad=True,
+        )
+        self.codebooks_used = torch.zeros(
+            self.num_embeddings, dtype=torch.int32, device=self.device
+        )

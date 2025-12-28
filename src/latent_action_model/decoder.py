@@ -7,7 +7,7 @@ from einops.layers.torch import Rearrange
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class VideoDecoder(nn.Module):
@@ -84,23 +84,15 @@ class VideoDecoder(nn.Module):
         # However, st_transformer outputs (batch_size, num_frames, num_patches, d_model)
         # And latent action is (batch_size, num_frame, d_model)
         # So, we take the last frame from x as our "prediction" token
-        x = x[:, -1, :, :].squeeze(1)
+        # x = x[:, -1, :, :].squeeze(1)
         logger.debug(
             f"x shape after taking last patch: {x.shape} and latent_action shape: {latent_action.shape}"
         )
 
         # Then, we need to perform cross attention between x and latent_action
         # x is of shape (batch_size, num_patches, d_model)
-        # latent_action is of shape (batch_size, h, w, d_model)
+        # latent_action is of shape (batch_size, num_frames, patch_size**2)
         # resize x to be (batch_size, h, w, d_model)
-        batch_size, num_patches, d_model = x.shape
-        x = x.reshape(
-            batch_size,
-            self.image_height // self.patch_height,
-            self.image_width // self.patch_width,
-            d_model,
-        )
-        logger.debug(f"x shape after reshape: {x.shape}")
 
         # Now, we need to perform cross attention between x and latent_action
         # x is of shape (batch_size, h, w, d_model)
@@ -109,7 +101,8 @@ class VideoDecoder(nn.Module):
         logger.debug(
             f"latent_action shape after unsqueeze and expand: {latent_action.shape}"
         )
-        x, _ = self.attention(latent_action, x, x)
+        logger.debug(f"x shape: {x.shape}")
+        x, _ = self.attention(latent_action.unsqueeze(-1), x, x)
 
         if x.shape[0] > 1:
             logger.info(
@@ -120,5 +113,6 @@ class VideoDecoder(nn.Module):
             )
 
         logger.debug(f"x shape after attention: {x.shape}")
+
         # Now we need to decode the patches into images
         return self.out_projection(x)

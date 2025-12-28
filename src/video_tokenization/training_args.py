@@ -115,6 +115,9 @@ class VideoTokenizerTrainingConfig:
             "--wandb_tags", type=str, nargs="*", help="Wandb tags for the run"
         )
         parser.add_argument("--wandb_notes", type=str, help="Notes for the wandb run")
+        parser.add_argument(
+            "--save_interval", type=int, help="Interval to save results"
+        )
 
         args = parser.parse_args()
 

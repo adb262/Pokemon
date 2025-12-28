@@ -10,10 +10,10 @@ from typing import Callable, Optional
 
 import torch
 import torch.optim as optim
-from data_collection.pokemon_frame_loader import PokemonFrameLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import wandb
+from data.data_loaders.pokemon_frame_loader import PokemonFrameLoader
 from data.s3.s3_utils import S3Manager, default_s3_manager
 from latent_action_model.laqa import LatentActionQuantization
 from latent_action_model.training_args import VideoTrainingConfig

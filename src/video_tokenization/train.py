@@ -83,7 +83,6 @@ def train_epoch(
         decoded = model(video_batch)
 
         # Calculate loss (reconstruction loss)
-        # TODO: Consider patch level loss
         loss = criterion(video_batch, decoded)
 
         # Backward pass
@@ -137,17 +136,25 @@ def train_epoch(
             if is_best:
                 best_loss = loss.item()
 
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                batch_idx,
-                loss.item(),
-                config,
-                best_loss,
-                dataloader_state,
+            predicted_videos = convert_video_to_images(decoded)
+            expected_videos = convert_video_to_images(video_batch)
+            save_comparison_images(
+                predicted_videos,
+                expected_videos,
+                f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}",
             )
+
+            # save_checkpoint(
+            #     model,
+            #     optimizer,
+            #     scheduler,
+            #     epoch,
+            #     batch_idx,
+            #     loss.item(),
+            #     config,
+            #     best_loss,
+            #     dataloader_state,
+            # )
 
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -349,31 +356,31 @@ def main(config: VideoTokenizerTrainingConfig):
                 config.save_dir,
             )
 
-            eval_loss = eval_model(
-                model,
-                test_dataloader,
-                criterion,
-                device,
-                epoch,
-                wandb_logger=wandb_logger,
-                save_dir=config.save_dir,
-            )
-            logger.info(f"Test loss: {eval_loss:.6f}")
+            # eval_loss = eval_model(
+            #     model,
+            #     test_dataloader,
+            #     criterion,
+            #     device,
+            #     epoch,
+            #     wandb_logger=wandb_logger,
+            #     save_dir=config.save_dir,
+            # )
+            # logger.info(f"Test loss: {eval_loss:.6f}")
 
-            if eval_loss < best_loss:
-                best_loss = eval_loss
+            # if eval_loss < best_loss:
+            #     best_loss = eval_loss
 
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    len(train_dataloader),
-                    avg_loss,
-                    config,
-                    best_loss,
-                    train_dataloader.get_state(),
-                )
+            #     save_checkpoint(
+            #         model,
+            #         optimizer,
+            #         scheduler,
+            #         epoch,
+            #         len(train_dataloader),
+            #         avg_loss,
+            #         config,
+            #         best_loss,
+            #         train_dataloader.get_state(),
+            #     )
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")

@@ -360,7 +360,7 @@ class PokemonFrameDataset(Dataset):
         video_tensors = [self._preprocess_image(video) for video in video]
 
         out = torch.stack(video_tensors)
-        logger.warning(f"Out shape: {out.shape}")
+        logger.warning(f"Out shape [frame dataset]: {out.shape}")
         return out
 
     def get_state(self) -> Dict[str, Any]:

@@ -48,6 +48,10 @@ class FiniteScalarQuantizer(nn.Module):
         # levels_tensor is 1D LongTensor, so len(levels) is a plain int
         self.project_in = nn.Linear(embedding_dim, len(self._levels))
 
+        nn.init.xavier_uniform_(self.project_in.weight)
+        if self.project_in.bias is not None:
+            nn.init.zeros_(self.project_in.bias)
+
     def bound(self, z):
         """Bound ‘z‘, an array of shape (..., d)."""
         eps = 1e-3
@@ -62,7 +66,9 @@ class FiniteScalarQuantizer(nn.Module):
         logger.info(
             f"Devices: {z.device}, {self.project_in.weight.device}, {self._levels_np.device}"
         )
+        logger.info(f"z shape before project_in: {z.shape}")
         z = self.project_in(z)
+        logger.info(f"z shape after project_in: {z.shape}")
         quantized = round_ste(self.bound(z))
         half_width = self._levels_np.to(z.device) // 2  # type: ignore[operator]
         # Renormalize to [-1, 1]. return quantized / half_width

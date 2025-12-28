@@ -70,6 +70,6 @@ class OpenWorldRunningDataset(Dataset):
         video_tensors = [self._preprocess_image(x) for x in video if x is not None]
 
         out = torch.stack(video_tensors)
-        logger.warning(f"Out shape: {out.shape}")
+        logger.debug(f"Out shape: {out.shape}")
 
         return out

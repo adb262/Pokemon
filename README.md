@@ -33,3 +33,11 @@ Ablation results (see below):
 Data
 [X] Process parallelism
 [X] Loss is wrong
+
+
+## TODO
+X Use additive embeddings
+X Move to single action per frame
+- When char is moving, everything should be moving. Filter to frames where the redisual is every frame or nothing
+- Use EMA codebook updates
+- Just look at center of the frames to determine action

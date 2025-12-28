@@ -9,7 +9,7 @@ from video_tokenization.tokenizer import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 def save_checkpoint(

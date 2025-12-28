@@ -1,7 +1,12 @@
+import logging
+
 import torch
 import torch.nn.functional as F
 
-action_weight = 5
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+action_weight = 50
 
 
 def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
@@ -29,6 +34,8 @@ def next_frame_reconstruction_residual_loss(
     target_residuals = video[:, 1:, :, :, :] - video[:, :-1, :, :, :]
 
     # Calculate element-wise MSE loss between predicted and target residuals
+    logger.debug(f"decoded shape: {decoded.shape}")
+    logger.debug(f"target_residuals shape: {target_residuals.shape}")
     mse_loss = F.mse_loss(
         decoded, target_residuals, reduction="none"
     )  # [B, num_images_in_video - 1, C, H, W]
