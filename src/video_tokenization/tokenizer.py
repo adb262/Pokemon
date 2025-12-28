@@ -78,10 +78,13 @@ class PixelShuffleFrameHead(nn.Module):
         from einops import rearrange
 
         B, T, P, E = tokens.shape
+        logger.debug(f"tokens shape: {tokens.shape}")
         x = rearrange(
             tokens, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
         )  # [(B*T), E, Hp, Wp]
+        logger.debug(f"x shape after rearrange: {x.shape}")
         x = self.to_pixels(x)  # [(B*T), C*p^2, Hp, Wp]
+        logger.debug(f"x shape after to_pixels: {x.shape}")
         x = rearrange(
             x,
             "(b t) (c p1 p2) hp wp -> b t c (hp p1) (wp p2)",
@@ -90,6 +93,7 @@ class PixelShuffleFrameHead(nn.Module):
             b=B,
             t=T,
         )  # [B, T, C, H, W]
+        logger.debug(f"x shape after final rearrange: {x.shape}")
         return x
 
 

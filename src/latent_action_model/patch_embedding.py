@@ -44,3 +44,44 @@ class PatchEmbedding(nn.Module):
         x = self._embed_image_patches(x)
         logger.debug(f"x shape after embed_image_patches: {x.shape}")
         return x
+
+
+class PatchEmbeddingConv(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        patch_size: int,
+        d_model: int,
+    ):
+        super().__init__()
+        self.proj = nn.Conv2d(
+            in_channels=channels,
+            out_channels=d_model,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (batch_size, num_frames, c, h, w)
+        b, t, c, h, w = x.shape
+
+        # 1. Merge Batch and Time so Conv2d can process all frames at once
+        x = x.view(b * t, c, h, w)
+
+        # 2. Apply Strided Convolution (The "Patch Embedding")
+        # Output: (b*t, d_model, h/patch, w/patch)
+        x = self.proj(x)
+
+        # 3. Flatten spatial dimensions to get tokens
+        # Output: (b*t, d_model, num_patches)
+        x = x.flatten(2)
+
+        # 4. Swap dimensions for Transformer (usually expects: Batch, Time, Sequence, Dim)
+        # Output: (b*t, num_patches, d_model)
+        x = x.transpose(1, 2)
+
+        # 5. Restore Batch and Time dimensions
+        # Output: (b, t, num_patches, d_model)
+        x = x.view(b, t, -1, x.shape[-1])
+
+        return x

@@ -2,15 +2,13 @@ import logging
 
 import torch
 import torch.nn as nn
-
-# Rotary position embedding utilities from x_transformers
 from x_transformers.x_transformers import (
-    RotaryEmbedding,  # type: ignore
-    apply_rotary_pos_emb,  # type: ignore
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
 )
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
+# logger.setLevel(logging.INFO)
 
 
 class SpatioTemporalEncoderBlock(nn.Module):
@@ -92,8 +90,8 @@ class SpatioTemporalEncoderBlock(nn.Module):
 
             if self.spatial_rotary_emb is not None:
                 freqs, scale = self.spatial_rotary_emb.forward_from_seq_len(num_patches)
-                q = apply_rotary_pos_emb(q, freqs, scale)
-                k = apply_rotary_pos_emb(k, freqs, scale)
+                q = apply_rotary_pos_emb(q, freqs, int(scale))
+                k = apply_rotary_pos_emb(k, freqs, int(scale))
 
             x_spatial_out, _ = self.spatial_transformer_attention(q, k, v)
             logger.debug(f"x_spatial_out shape: {x_spatial_out.shape}")
@@ -114,8 +112,8 @@ class SpatioTemporalEncoderBlock(nn.Module):
 
             if self.time_rotary_emb is not None:
                 freqs, scale = self.time_rotary_emb.forward_from_seq_len(num_frames)
-                q = apply_rotary_pos_emb(q, freqs, scale)
-                k = apply_rotary_pos_emb(k, freqs, scale)
+                q = apply_rotary_pos_emb(q, freqs, int(scale))
+                k = apply_rotary_pos_emb(k, freqs, int(scale))
 
             causal_mask = torch.triu(
                 torch.ones(num_frames, num_frames, dtype=torch.bool, device=x.device),

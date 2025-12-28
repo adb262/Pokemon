@@ -35,8 +35,8 @@ class VideoTrainingConfig:
     seed_cache: bool = False
     # Wandb Configuration
     use_wandb: bool = True
-    wandb_project: str = "pokemon-vqvae"
-    wandb_entity: Optional[str] = "latent-health"
+    wandb_project: str = "pokemon-action-vqvae"
+    wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None
     wandb_notes: Optional[str] = None
     # S3 Configuration
@@ -49,6 +49,7 @@ class VideoTrainingConfig:
     local_cache_dir: Optional[str] = os.environ.get("BT_RW_CACHE_DIR", "cache")
     max_cache_size: int = 100000
     no_wandb: bool = False
+    save_dir: str = "latent_action_results"
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None
@@ -80,6 +81,9 @@ class VideoTrainingConfig:
         parser.add_argument(
             "--seed_cache", action="store_true", help="Seed cache with all frames"
         )
+        parser.add_argument(
+            "--save_dir", type=str, help="Directory to save visualizations and grids"
+        )
 
         # Wandb arguments
         parser.add_argument(
@@ -94,7 +98,6 @@ class VideoTrainingConfig:
         parser.add_argument(
             "--wandb_project",
             type=str,
-            default="pokemon-vqvae",
             help="Wandb project name",
         )
         parser.add_argument("--wandb_entity", type=str, help="Wandb entity/team name")
@@ -102,6 +105,9 @@ class VideoTrainingConfig:
             "--wandb_tags", type=str, nargs="*", help="Wandb tags for the run"
         )
         parser.add_argument("--wandb_notes", type=str, help="Notes for the wandb run")
+        parser.add_argument(
+            "--save_interval", type=int, help="Interval to save results"
+        )
 
         args = parser.parse_args()
 

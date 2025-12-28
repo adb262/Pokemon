@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Callable
 
@@ -12,7 +13,7 @@ from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
 from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
-from loss.loss_fns import next_frame_reconstruction_residual_loss
+from loss.loss_fns import next_frame_reconstruction_loss
 from monitoring.frechet_distance import compute_frechet_distance
 from monitoring.setup_wandb import setup_wandb
 from video_tokenization.checkpoints import load_checkpoint
@@ -22,7 +23,7 @@ from video_tokenization.training_args import VideoTokenizerTrainingConfig
 from wandb.wandb_run import Run
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]]:
@@ -86,38 +87,70 @@ def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]
 
 def save_comparison_images_next_frame(
     predicted_videos: list[list[Image.Image]],
+    predicted_actions: list[list[float]],
     expected_videos: list[list[Image.Image]],
     file_prefix: str,
 ):
-    # Save a single plot showing: original frame, expected next frame, predicted next frame
+    # For each video in the batch, save a single plot showing:
+    # row 0: original frame
+    # row 1: expected next frame
+    # row 2: predicted next frame
+    # with columns corresponding to time steps (from frame 1 onward).
     import matplotlib.pyplot as plt
+
+    os.makedirs(file_prefix, exist_ok=True)
 
     for i, predicted_video in enumerate(predicted_videos):
         num_frames = len(predicted_video)
-        for j in range(1, num_frames):
+
+        fig, axs = plt.subplots(
+            3,
+            num_frames,
+            figsize=(max(4, num_frames * 2.5), 3 * 2.5),
+        )
+
+        # If there's only one column, axs will be 1D; make it 2D for uniform indexing
+        if num_frames - 1 == 1:
+            import numpy as np
+
+            axs = np.expand_dims(axs, axis=1)
+
+        if len(expected_videos[i]) - num_frames != 1:
+            raise ValueError(
+                f"Expected {len(expected_videos[i])} frames, got {num_frames}"
+            )
+
+        for col in range(num_frames):
             # The 'original frame' is frame j-1
-            original_image = expected_videos[i][j - 1]
+            original_image = expected_videos[i][col]
             # The 'expected next frame' is frame j
-            expected_image = expected_videos[i][j]
+            expected_image = expected_videos[i][col + 1]
             # The 'predicted next frame' is also frame j (in predicted_videos)
-            predicted_image = predicted_video[j]
+            predicted_image = predicted_video[col]
 
-            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-            axs[0].imshow(original_image)
-            axs[0].set_title("Original Frame")
-            axs[0].axis("off")
+            # Row 0: original, Row 1: expected, Row 2: predicted
+            axs[0, col].imshow(original_image)
+            axs[0, col].axis("off")
+            if col == 0:
+                axs[0, col].set_ylabel("Original", fontsize=10)
 
-            axs[1].imshow(expected_image)
-            axs[1].set_title("Expected Next Frame")
-            axs[1].axis("off")
+            axs[1, col].imshow(expected_image)
+            axs[1, col].axis("off")
+            if col == 0:
+                axs[1, col].set_ylabel("Expected Next", fontsize=10)
 
-            axs[2].imshow(predicted_image)
-            axs[2].set_title("Predicted Next Frame")
-            axs[2].axis("off")
+            axs[2, col].imshow(predicted_image)
+            axs[2, col].axis("off")
+            if col == 0:
+                axs[2, col].set_ylabel("Predicted Next", fontsize=10)
 
-            plt.tight_layout()
-            plt.savefig(f"{file_prefix}/sample_{i}_frame_{j}_comparison.png")
-            plt.close(fig)
+            axs[0, col].set_title(
+                f"t={col} action={predicted_actions[i][col]}", fontsize=9
+            )
+
+        plt.tight_layout()
+        plt.savefig(f"{file_prefix}/sample_{i}_next_frame_comparison.png")
+        plt.close(fig)
 
 
 def save_comparison_images(
@@ -214,7 +247,12 @@ def eval_model(
     if real_next_frames_batches and pred_next_frames_batches:
         real_all = torch.cat(real_next_frames_batches, dim=0)
         pred_all = torch.cat(pred_next_frames_batches, dim=0)
+        logger.info(
+            f"Computing Frechet distance between {real_all.shape} and {pred_all.shape}"
+        )
+        t = time.time()
         frechet_distance = compute_frechet_distance(real_all, pred_all)
+        logger.info(f"Frechet distance computed in {time.time() - t} seconds")
     else:
         frechet_distance = float("inf")
 
@@ -348,7 +386,7 @@ def main(config: VideoTokenizerTrainingConfig):
         "checkpoints/checkpoint_epoch4_batch405.pt", model, optimizer, scheduler, device
     )
     model.to(device)
-    criterion = next_frame_reconstruction_residual_loss
+    criterion = next_frame_reconstruction_loss
 
     # first, evaluate on test dataset
     test_loss = eval_model(
