@@ -98,7 +98,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "loss": loss,
-        "config": config.to_dict(),
+        "config": config.__dict__,
         "dataloader_state": dataloader_state,
         "timestamp": datetime.now().isoformat(),
         "total_batches_processed": epoch
@@ -791,6 +791,6 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     config = TrainingConfig.from_cli()
 
-    logger.info(f"Starting training... config: {config.to_dict()}")
+    logger.info(f"Starting training... config: {config.__dict__}")
     main(config)
     logger.info("Training completed!")

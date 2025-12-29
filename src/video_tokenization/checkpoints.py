@@ -30,7 +30,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "loss": loss,
         "best_loss": best_loss,
-        "config": config.to_dict(),
+        "config": config.__dict__,
         "dataloader_state": dataloader_state,
     }
     checkpoint_path = os.path.join(

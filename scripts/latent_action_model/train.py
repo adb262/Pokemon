@@ -11,6 +11,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.optim as optim
+import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import wandb
@@ -103,7 +104,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "loss": loss,
-        "config": config.to_dict(),
+        "config": config.__dict__,
         "dataloader_state": dataloader_state,
         "timestamp": datetime.now().isoformat(),
         "total_batches_processed": epoch
@@ -581,7 +582,7 @@ def setup_wandb(config: VideoTrainingConfig):
         name=config.experiment_name,
         tags=config.wandb_tags,
         notes=config.wandb_notes,
-        config=config.to_dict(),
+        config=config.__dict__,
     )
 
     # Watch the model for gradients and parameters
@@ -829,8 +830,8 @@ def main(config: VideoTrainingConfig):
 
 
 if __name__ == "__main__":
-    config = VideoTrainingConfig.from_cli()
+    config = tyro.cli(VideoTrainingConfig)
 
-    logger.info(f"Starting training... config: {config.to_dict()}")
+    logger.info(f"Starting training... config: {config.__dict__}")
     main(config)
     logger.info("Training completed!")
