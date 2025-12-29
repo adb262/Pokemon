@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Callable
 
 import torch
+import tyro
 
 from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
 from data.datasets.cache import Cache
@@ -109,7 +110,7 @@ def main(config: VideoTokenizerTrainingConfig):
         name=config.experiment_name,
         tags=config.wandb_tags or [],
         notes=config.wandb_notes or "",
-        config=config.to_dict(),
+        config=config.__dict__,
     )
 
     logger.info(
@@ -249,8 +250,8 @@ def main(config: VideoTokenizerTrainingConfig):
 
 
 if __name__ == "__main__":
-    config = VideoTokenizerTrainingConfig.from_cli()
+    config = tyro.cli(VideoTokenizerTrainingConfig)
 
-    logger.info(f"Starting training... config: {config.to_dict()}")
+    logger.info(f"Starting training... config: {config.__dict__}")
     main(config)
     logger.info("Training completed!")
