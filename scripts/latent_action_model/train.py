@@ -1,3 +1,4 @@
+# python -m scripts.latent_action_model.train --frames_dir pokemon --num_images_in_video 5 --batch_size 2 --save_interval 100 --num_epochs 15
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import logging
@@ -13,11 +14,20 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import wandb
-from data.data_loaders.pokemon_frame_loader import PokemonFrameLoader
+from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.datasets.cache import Cache
+from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
+from data.datasets.open_world.open_world_running_dataset_creator import (
+    OpenWorldRunningDatasetCreator,
+)
 from data.s3.s3_utils import S3Manager, default_s3_manager
-from latent_action_model.laqa import LatentActionQuantization
+from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
-from loss.loss_fns import next_frame_reconstruction_residual_loss
+from loss.loss_fns import next_frame_reconstruction_loss
+from monitoring.visualize_videos import (
+    convert_video_to_images,
+    save_comparison_images_next_frame,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +43,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 
 # beartype_all(conf=BeartypeConf(violation_type=UserWarning))
-# AI BS generation here... use a real config class for god sake
 
 
 def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
@@ -53,22 +62,27 @@ def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
 
 def create_model(config: VideoTrainingConfig):
     """Create and initialize the VQVAE model"""
-    model = LatentActionQuantization(
-        dim=config.d_model,
-        quant_dim=config.latent_dim,
-        codebook_size=config.num_embeddings,
-        image_size=config.image_size,
-        patch_size=config.patch_size,
-        spatial_depth=config.num_transformer_layers,
-        temporal_depth=config.num_transformer_layers,
+    model = LatentActionVQVAE(
         channels=3,
+        image_height=config.image_size,
+        image_width=config.image_size,
+        patch_height=config.patch_size,
+        patch_width=config.patch_size,
+        num_images_in_video=config.num_images_in_video,
+        d_model=config.d_model,
+        num_heads=config.num_heads,
+        num_layers=config.num_transformer_layers,
+        num_embeddings=config.num_embeddings,
+        embedding_dim=config.latent_dim,
+        use_temporal_transformer=True,
+        use_spatial_transformer=True,
     )
 
     return model
 
 
 def save_checkpoint(
-    model: LatentActionQuantization,
+    model: LatentActionVQVAE,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.CosineAnnealingLR,
     epoch: int,
@@ -199,13 +213,13 @@ def load_checkpoint(
 
 
 def evaluate_model(
-    model: LatentActionQuantization,
-    dataloader: PokemonFrameLoader,
-    criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    model: LatentActionVQVAE,
+    dataloader: PokemonOpenWorldLoader,
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
+    step: int,
     num_batches: int = 10,
     wandb_logger=None,
-    step=None,
 ):
     """Evaluate model on a subset of data"""
     model.eval()
@@ -213,19 +227,18 @@ def evaluate_model(
     total_samples = 0
 
     with torch.no_grad():
-        for batch_idx, (image1_batch, image2_batch) in enumerate(dataloader):
+        for batch_idx, video_batch in enumerate(dataloader):
             if batch_idx >= num_batches:
                 break
 
-            image1_batch = image1_batch.to(device)
-            image2_batch = image2_batch.to(device)
-
             try:
-                decoded = model(image1_batch, image2_batch)
-                loss = criterion(image1_batch, image2_batch, decoded)
+                video_batch = video_batch.to(device)
+                decoded = model(video_batch)
+                mse_loss = criterion(video_batch, decoded)
+                loss = mse_loss
 
-                total_loss += loss.item() * image1_batch.size(0)
-                total_samples += image1_batch.size(0)
+                total_loss += loss.item() * video_batch.size(0)
+                total_samples += video_batch.size(0)
 
             except Exception as e:
                 logging.warning(f"Error in evaluation batch {batch_idx}: {e}")
@@ -241,12 +254,141 @@ def evaluate_model(
     return avg_loss
 
 
+def _reconstruct_predicted_frames(
+    video_batch: torch.Tensor, decoded_residuals: torch.Tensor
+) -> torch.Tensor:
+    """
+    Given an input video and predicted residuals between consecutive frames,
+    reconstruct the predicted next frames by adding residuals to the original frames.
+
+    video_batch: [B, T, C, H, W]
+    decoded_residuals: [B, T-1, C, H, W]
+    """
+    # Clone to avoid in-place modification of original batch
+    predicted = video_batch.clone()
+    # For t >= 1, predicted frame t = original frame t-1 + residual_{t-1}
+    predicted[:, 1:, :, :, :] = torch.clamp(
+        video_batch[:, :-1, :, :, :] + decoded_residuals, 0.0, 1.0
+    )
+    return predicted
+
+
+def _save_residual_grid(
+    predicted_residual_videos,  # list[list[PIL.Image.Image]]
+    target_residual_videos,  # list[list[PIL.Image.Image]]
+    file_prefix: str,
+) -> None:
+    """Save a grid visualization of residuals to show predicted vs target movement."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    num_samples = len(predicted_residual_videos)
+    if num_samples == 0:
+        return
+
+    num_frames = len(predicted_residual_videos[0])
+
+    # We create 2 rows per sample: one for predicted residuals, one for target residuals.
+    # Shape: [2 * num_samples, num_frames]
+    num_rows = num_samples * 2 if target_residual_videos is not None else num_samples
+
+    fig, axs = plt.subplots(
+        num_rows,
+        num_frames,
+        figsize=(num_frames * 2.5, num_rows * 2.0),
+    )
+
+    # Normalize axes array for single row/column cases
+    if num_rows == 1:
+        axs = np.expand_dims(axs, 0)
+    if num_frames == 1:
+        axs = np.expand_dims(axs, 1)
+
+    for i in range(num_samples):
+        pred_video = predicted_residual_videos[i]
+        tgt_video = (
+            target_residual_videos[i] if target_residual_videos is not None else None
+        )
+
+        # Base row index for this sample
+        base_row = i * 2 if tgt_video is not None else i
+
+        for j, frame in enumerate(pred_video):
+            # Predicted residuals
+            axs[base_row, j].imshow(frame)
+            axs[base_row, j].set_title(f"Pred S{i}F{j}")
+            axs[base_row, j].axis("off")
+
+            # Target residuals (if provided)
+            if tgt_video is not None and j < len(tgt_video):
+                axs[base_row + 1, j].imshow(tgt_video[j])
+                axs[base_row + 1, j].set_title(f"Target S{i}F{j}")
+                axs[base_row + 1, j].axis("off")
+
+    plt.tight_layout()
+    os.makedirs(file_prefix, exist_ok=True)
+    plt.savefig(os.path.join(file_prefix, "residual_grid.png"))
+    plt.close(fig)
+
+
+def save_visualizations(
+    video_batch: torch.Tensor,
+    predicted_actions: torch.Tensor,
+    decoded_residuals: torch.Tensor,
+    config: VideoTrainingConfig,
+    prefix: str,
+) -> None:
+    """
+    Save:
+      1) Comparison grids of original vs expected next vs predicted next frames
+      2) Grids of residual magnitudes to visualize predicted movement.
+    """
+    save_root = getattr(config, "save_dir", "latent_action_results")
+
+    # Limit number of samples for visualization
+    max_samples = 4
+    video_batch_vis = video_batch[:max_samples]
+    decoded_residuals_vis = decoded_residuals[:max_samples]
+
+    # 1) Next-frame comparisons (original, expected, predicted)
+    predicted_full = _reconstruct_predicted_frames(
+        video_batch_vis, decoded_residuals_vis
+    )
+    predicted_videos = convert_video_to_images(predicted_full)
+    expected_videos = convert_video_to_images(video_batch_vis)
+
+    comparison_dir = os.path.join(save_root, prefix, "next_frame")
+    os.makedirs(comparison_dir, exist_ok=True)
+    save_comparison_images_next_frame(
+        predicted_videos,
+        predicted_actions.squeeze(-1).detach().cpu().numpy().tolist(),
+        expected_videos,
+        comparison_dir,
+    )
+
+    # 2) Residuals-only visualization (movement magnitude)
+    # Predicted residuals: use absolute value and scale for visibility, then clamp to [0, 1]
+    residual_vis = torch.clamp(decoded_residuals_vis.abs() * 5.0, 0.0, 1.0)
+    predicted_residual_videos = convert_video_to_images(residual_vis)
+
+    # Target residuals: ground truth frame-to-frame differences, visualized similarly
+    target_residuals = (
+        video_batch_vis[:, 1:, :, :, :] - video_batch_vis[:, :-1, :, :, :]
+    )
+    target_residual_vis = torch.clamp(target_residuals.abs() * 5.0, 0.0, 1.0)
+    target_residual_videos = convert_video_to_images(target_residual_vis)
+
+    residual_dir = os.path.join(save_root, prefix, "residuals")
+    _save_residual_grid(predicted_residual_videos, target_residual_videos, residual_dir)
+
+
 def train_epoch(
-    model: LatentActionQuantization,
-    dataloader: PokemonFrameLoader,
+    model: LatentActionVQVAE,
+    train_dataloader: PokemonOpenWorldLoader,
+    eval_dataloader: Optional[PokemonOpenWorldLoader],
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    criterion: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     epoch: int,
     config: VideoTrainingConfig,
@@ -256,19 +398,25 @@ def train_epoch(
 ):
     """Train for one epoch with comprehensive logging"""
     total_loss = 0.0
-    num_batches = len(dataloader)
+    num_batches = len(train_dataloader)
     best_loss = float("inf")
 
     # Set up resumable dataloader
     if start_batch > 0:
-        dataloader.resumable_loader.set_epoch(epoch)
-        dataloader.resumable_loader.current_batch = start_batch
+        train_dataloader.resumable_loader.set_epoch(epoch)
+        train_dataloader.resumable_loader.current_batch = start_batch
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
     commit_beta = 0.2
 
-    for batch_idx, video_batch in enumerate(dataloader):
+    # How often to run NSVQ codebook replacement, in number of batches.
+    # If not explicitly configured, default to the visualization save interval.
+    codebook_replace_interval = 50
+    if codebook_replace_interval is None:
+        codebook_replace_interval = config.save_interval
+
+    for batch_idx, video_batch in enumerate(train_dataloader):
         # Skip batches if resuming
         if batch_idx < start_batch:
             continue
@@ -282,11 +430,11 @@ def train_epoch(
         video_batch = video_batch.to(device)
 
         # Forward pass
-        loss, num_unique_indices = model(video_batch.permute(0, 2, 1, 3, 4))
+        decoded, predicted_actions = model(video_batch)
 
         # Calculate loss (reconstruction loss)
-        # mse_loss = criterion(video_batch, recon_loss) /
-        # loss = mse_loss
+        mse_loss = criterion(video_batch, decoded)
+        loss = mse_loss
 
         # Backward pass
         loss.backward()
@@ -297,20 +445,48 @@ def train_epoch(
         optimizer.step()
         scheduler.step()  # Step scheduler every batch for cosine annealing
 
+        # Calculate global step (used for logging & scheduling)
+        global_step = epoch * num_batches + batch_idx
+
+        # Periodically save visualizations (comparison grids and residuals)
+        if batch_idx % config.save_interval == 0:
+            # save_visualizations(
+            #     video_batch.detach(),
+            #     decoded.detach(),
+            #     config,
+            #     prefix=f"train/epoch_{epoch}_batch_{batch_idx}",
+            # )
+            predicted_videos = convert_video_to_images(decoded)
+            expected_videos = convert_video_to_images(video_batch)
+            save_comparison_images_next_frame(
+                predicted_videos,
+                predicted_actions.squeeze(-1).detach().cpu().numpy().tolist(),
+                expected_videos,
+                f"{config.save_dir}/train/epoch_{epoch}_batch_{batch_idx}",
+            )
+
+        # Periodically replace unused NSVQ codebooks.
+        # NSVQ expects `num_batches` to be the *window size* over which `codebooks_used`
+        # was accumulated, so we pass the fixed interval and only call after that many
+        # batches have elapsed.
+        # if (global_step + 1) % codebook_replace_interval == 0 and (
+        #     global_step + 1
+        # ) >= codebook_replace_interval:
+        #     logger.info(f"Replacing unused NSVQ codebooks at step {global_step}")
+        #     model.quantizer.replace_unused_codebooks(codebook_replace_interval)
+
         total_loss += loss.item()
         batch_time = time.time() - batch_start_time
 
-        # Calculate global step
-        global_step = epoch * num_batches + batch_idx
-
         # Log to wandb with system metrics
-        if wandb_logger:
+        if wandb_logger is not None:
             wandb_metrics = {
                 "train/loss": loss.item(),
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/batch_time": batch_time,
                 "train/epoch": epoch,
                 "train/batch": batch_idx,
+                "train/mse_loss": mse_loss.item(),
             }
 
             wandb_logger.log(wandb_metrics, step=global_step)
@@ -325,35 +501,41 @@ def train_epoch(
             )
 
         # Save checkpoint periodically
-        if batch_idx > 0 and batch_idx % config.save_interval == 0:
-            dataloader_state = dataloader.get_state()
-            is_best = loss.item() < best_loss
-            if is_best:
-                best_loss = loss.item()
+        # if batch_idx > 0 and batch_idx % config.save_interval == 0:
+        #     dataloader_state = train_dataloader.get_state()
+        #     is_best = loss.item() < best_loss
+        #     if is_best:
+        #         best_loss = loss.item()
 
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                batch_idx,
-                loss.item(),
-                config,
-                dataloader_state,
-                config.checkpoint_dir,
-                s3_manager,
-                is_best,
-            )
-
-        batch_end_time = time.time()
+        #     save_checkpoint(
+        #         model,
+        #         optimizer,
+        #         scheduler,
+        #         epoch,
+        #         batch_idx,
+        #         loss.item(),
+        #         config,
+        #         dataloader_state,
+        #         config.checkpoint_dir,
+        #         s3_manager,
+        #         is_best,
+        #     )
 
         # Evaluate periodically
-        # if batch_idx > 0 and batch_idx % config.eval_interval == 0:
+        # if (
+        #     eval_dataloader is not None
+        #     and batch_idx > 0
+        #     and batch_idx % config.eval_interval == 0
+        # ):
         #     eval_loss = evaluate_model(
-        #         model, dataloader, criterion, device,
-        #         wandb_logger=wandb_logger, step=global_step
+        #         model,
+        #         eval_dataloader,
+        #         criterion,
+        #         device,
+        #         wandb_logger=wandb_logger,
+        #         step=global_step,
         #     )
-        #     logger.info(f'Evaluation loss at batch {batch_idx}: {eval_loss:.6f}')
+        #     logger.info(f"Evaluation loss at batch {batch_idx}: {eval_loss:.6f}")
 
         # Upload logs to S3 periodically
         if (
@@ -364,12 +546,14 @@ def train_epoch(
         ):
             upload_logs_to_s3(config, s3_manager)
 
+    # model.quantizer.replace_unused_codebooks(num_batches)
+
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch metrics
     # Log epoch summary to wandb
-    if wandb_logger:
+    if wandb_logger is not None:
         epoch_metrics = {
             "train/epoch_loss": avg_loss,
             "train/epoch_time": epoch_time,
@@ -431,10 +615,43 @@ def main(config: VideoTrainingConfig):
 
     # Create data loader
     logger.info("Creating data loader...")
-    dataloader = PokemonFrameLoader(
-        frames_dir=config.frames_dir,
-        batch_size=config.batch_size,
+    if config.local_cache_dir is None:
+        raise ValueError("local_cache_dir is required")
+
+    local_cache = Cache(
+        max_size=config.max_cache_size,
+        cache_dir=config.local_cache_dir,
+    )
+
+    dataset_creator = OpenWorldRunningDatasetCreator(
+        dataset_dir=config.frames_dir,
         num_frames_in_video=config.num_images_in_video,
+        output_log_json_file_name="log_dir_100000.json",
+        local_cache=local_cache,
+        limit=10000,
+        image_size=config.image_size,
+    )
+
+    logger.info("Setting up dataset...")
+    train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+
+    train_dataset = OpenWorldRunningDataset(
+        dataset=train_dataset,
+        local_cache=local_cache,
+        image_size=config.image_size,
+    )
+
+    test_dataset = OpenWorldRunningDataset(
+        dataset=test_dataset,
+        local_cache=local_cache,
+        image_size=config.image_size,
+    )
+
+    logger.info("Creating data loaders...")
+    train_dataloader = PokemonOpenWorldLoader(
+        frames_dir=config.frames_dir,
+        dataset=train_dataset,
+        batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
@@ -442,20 +659,37 @@ def main(config: VideoTrainingConfig):
         use_s3=config.use_s3,
         cache_dir=config.local_cache_dir,
         max_cache_size=config.max_cache_size,
-        stage="train",
-        seed_cache=config.seed_cache,
-        limit=10000,
+    )
+    eval_dataloader = PokemonOpenWorldLoader(
+        frames_dir=config.frames_dir,
+        dataset=test_dataset,
+        batch_size=config.batch_size,
+        image_size=config.image_size,
+        shuffle=True,
+        num_workers=8,
+        seed=config.seed,
+        use_s3=config.use_s3,
+        cache_dir=config.local_cache_dir,
+        max_cache_size=config.max_cache_size,
     )
 
     # Print dataset info
-    info = dataloader.get_dataset_info()
-    logger.info("Dataset Info:")
-    for key, value in info.items():
+    train_info = train_dataloader.get_dataset_info()
+    eval_info = eval_dataloader.get_dataset_info()
+    logger.info("Dataset Info (train):")
+    for key, value in train_info.items():
+        logger.info(f"  {key}: {value}")
+
+    logger.info("Dataset Info (eval):")
+    for key, value in eval_info.items():
         logger.info(f"  {key}: {value}")
 
     # Log dataset info to wandb
     if wandb_logger:
-        wandb_logger.log({f"dataset/{key}": value for key, value in info.items()})
+        wandb_logger.log({f"dataset/{key}": value for key, value in train_info.items()})
+        wandb_logger.log(
+            {f"eval_dataset/{key}": value for key, value in eval_info.items()}
+        )
 
     # Create model
     logger.info(f"Creating model on device {device}...")
@@ -473,13 +707,13 @@ def main(config: VideoTrainingConfig):
     logger.info(f"Optimizer created with learning rate: {config.learning_rate}")
 
     # Cosine annealing scheduler
-    total_steps = config.num_epochs * len(dataloader)
+    total_steps = config.num_epochs * len(train_dataloader)
     scheduler = CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=config.min_learning_rate
     )
 
     # Loss function
-    criterion = next_frame_reconstruction_residual_loss
+    criterion = next_frame_reconstruction_loss
     s3_manager = default_s3_manager
 
     # Resume from checkpoint if specified
@@ -497,8 +731,8 @@ def main(config: VideoTrainingConfig):
             # Restore dataloader state
             if "dataloader_state" in checkpoint_info:
                 dataloader_state = checkpoint_info["dataloader_state"]
-                dataloader.resumable_loader = dataloader.create_resumable_loader(
-                    start_epoch, start_batch
+                train_dataloader.resumable_loader = (
+                    train_dataloader.create_resumable_loader(start_epoch, start_batch)
                 )
 
     # Training loop
@@ -512,7 +746,8 @@ def main(config: VideoTrainingConfig):
 
             avg_loss = train_epoch(
                 model,
-                dataloader,
+                train_dataloader,
+                eval_dataloader,
                 optimizer,
                 scheduler,
                 criterion,
@@ -524,45 +759,41 @@ def main(config: VideoTrainingConfig):
                 wandb_logger,
             )
 
-            # Save end-of-epoch checkpoint
-            # dataloader_state = dataloader.get_state()
+            # # Save end-of-epoch checkpoint
             # is_best = avg_loss < best_loss
             # if is_best:
             #     best_loss = avg_loss
 
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                len(dataloader),
-                avg_loss,
-                config,
-                dataloader.get_state(),
-                config.checkpoint_dir,
-                s3_manager,
-                False,
-            )
-
-            # # Reset start_batch for subsequent epochs
-            # start_batch = 0
+            #     save_checkpoint(
+            #         model,
+            #         optimizer,
+            #         scheduler,
+            #         epoch,
+            #         len(train_dataloader),
+            #         avg_loss,
+            #         config,
+            #         train_dataloader.get_state(),
+            #         config.checkpoint_dir,
+            #         s3_manager,
+            #         False,
+            #     )
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         # Save checkpoint on interruption
-        dataloader_state = dataloader.get_state()
-        save_checkpoint(
-            model,
-            optimizer,
-            scheduler,
-            epoch,
-            dataloader.resumable_loader.current_batch,
-            avg_loss,
-            config,
-            dataloader_state,
-            config.checkpoint_dir,
-            s3_manager,
-        )
+        dataloader_state = train_dataloader.get_state()
+        # save_checkpoint(
+        #     model,
+        #     optimizer,
+        #     scheduler,
+        #     epoch,
+        #     train_dataloader.resumable_loader.current_batch,
+        #     avg_loss,
+        #     config,
+        #     dataloader_state,
+        #     config.checkpoint_dir,
+        #     s3_manager,
+        # )
     except Exception as e:
         logging.error(f"Training error: {e}")
         raise

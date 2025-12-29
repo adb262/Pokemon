@@ -10,8 +10,8 @@ import torch
 
 @dataclass
 class VideoTrainingConfig:
-    image_size: int = 256
-    patch_size: int = 8
+    image_size: int = 128
+    patch_size: int = 4
     batch_size: int = 1
     learning_rate: float = 1e-4
     min_learning_rate: float = 1e-6

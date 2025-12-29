@@ -73,8 +73,9 @@ class PokemonOpenWorldLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False if torch.backends.mps.is_available() else True,
             drop_last=True,
+            persistent_workers=True,
         )
 
         # Create resumable wrapper
