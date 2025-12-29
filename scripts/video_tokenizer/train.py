@@ -20,13 +20,10 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
 from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import reconstruction_loss
 from monitoring.setup_wandb import setup_wandb
+from monitoring.visualize_videos import convert_video_to_images, save_comparison_images
+from scripts.video_tokenizer.eval import eval_model
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
-from video_tokenization.eval import (
-    convert_video_to_images,
-    eval_model,
-    save_comparison_images,
-)
 from video_tokenization.tokenizer import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 from wandb.wandb_run import Run

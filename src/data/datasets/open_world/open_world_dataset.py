@@ -62,6 +62,7 @@ class OpenWorldRunningDataset(Dataset):
             raise ValueError("Dataset not loaded")
 
         video_paths = self.dataset.video_logs[idx].video_log_paths
+
         # At this point, all images are loaded
         video = [self._load_image_locally(frame_path) for frame_path in video_paths]
         if any(video is None for video in video):

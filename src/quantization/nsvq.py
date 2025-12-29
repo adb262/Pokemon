@@ -9,11 +9,13 @@ import torch
 import torch.distributions.normal as normal_dist
 import torch.distributions.uniform as uniform_dist
 
+from quantization.base import BaseQuantizer
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
-class NSVQ(torch.nn.Module):
+class NSVQ(BaseQuantizer):
     def __init__(
         self,
         dim,
@@ -182,24 +184,26 @@ class NSVQ(torch.nn.Module):
         input_data = self.project_in(input_data)  # b * 64 * 32
         logger.debug(f"input_data shape after project_in: {input_data.shape}")
         # change the order of the input_data to b * 32 * 64
-        input_data = input_data.permute(0, 2, 1).contiguous()
-        logger.debug(f"input_data shape after permute: {input_data.shape}")
+        # input_data = input_data.permute(0, 2, 1).contiguous()
+        # logger.debug(f"input_data shape after permute: {input_data.shape}")
         # reshape input_data to 4D b*h*w*d
-        input_data = input_data.reshape(
-            batch_size,
-            self.embedding_dim,
-            int(self.image_size / self.patch_size),
-            int(self.image_size / self.patch_size),
-        )
-        logger.debug(f"input_data shape after reshape: {input_data.shape}")
-        input_data = self.cnn_encoder(input_data)  # 1*1 tensor
-        logger.debug(f"input_data shape after cnn_encoder: {input_data.shape}")
-        input_data = input_data.reshape(
-            batch_size, self.embedding_dim, -1
-        )  # b * 32 * d^2
-        input_data = input_data.permute(0, 2, 1).contiguous()  # b * 1 * 32
-        logger.debug(f"input_data shape after permute: {input_data.shape}")
-        input_data = input_data.reshape(-1, self.embedding_dim)
+        # input_data = input_data.reshape(
+        #     batch_size,
+        #     self.embedding_dim,
+        #     int(self.image_size / self.patch_size),
+        #     int(self.image_size / self.patch_size),
+        # )
+        # logger.debug(f"input_data shape after reshape: {input_data.shape}")
+        # input_data = self.cnn_encoder(input_data)  # 1*1 tensor
+        input_data = input_data.mean(1)
+        # input_data is now (B, D)
+        logger.debug(f"input_data shape after mean pool: {input_data.shape}")
+        # input_data = input_data.reshape(
+        #     batch_size, self.embedding_dim, -1
+        # )  # b * 32 * d^2
+        # input_data = input_data.permute(0, 2, 1).contiguous()  # b * 1 * 32
+        # logger.debug(f"input_data shape after permute: {input_data.shape}")
+        # input_data = input_data.reshape(-1, self.embedding_dim)
         return input_data
 
     def decode(self, quantized_input, batch_size):
@@ -283,6 +287,7 @@ class NSVQ(torch.nn.Module):
         # Just return the tensor of "quantized_input" as vector quantized version of the input data.
 
         quantized_input = self.decode(quantized_input, batch_size)
+        logger.debug(f"Used codebooks: {self.codebooks_used.cpu().numpy()}")
         return (
             quantized_input,
             perplexity,

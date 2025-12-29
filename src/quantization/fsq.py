@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from quantization.base import BaseQuantizer
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,7 +18,7 @@ def round_ste(z):
     return z + (zhat - z).detach()
 
 
-class FiniteScalarQuantizer(nn.Module):
+class FiniteScalarQuantizer(BaseQuantizer):
     def __init__(self, levels: list[int], embedding_dim: int, device: torch.device):
         super().__init__()
         # Keep a simple Python list for length/type checks
@@ -105,3 +107,6 @@ class FiniteScalarQuantizer(nn.Module):
     def forward(self, z):
         # z: [B, T, P, L]
         return self.quantize(z)
+
+    def replace_unused_codebooks(self, num_batches: int):
+        pass

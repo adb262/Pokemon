@@ -41,3 +41,5 @@ X Move to single action per frame
 - When char is moving, everything should be moving. Filter to frames where the redisual is every frame or nothing
 - Use EMA codebook updates
 - Just look at center of the frames to determine action
+- Dealing with codebook collapse now. Tried resetting but just collapses elsewhere. Might want to just focus on the center frame (only care about the char)
+- More homogeneous data
