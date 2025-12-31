@@ -14,7 +14,7 @@ from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 from video_tokenization.tokenizer import PixelShuffleFrameHead
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class ActionCondenserNet(nn.Module):

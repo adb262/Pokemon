@@ -6,7 +6,7 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-action_weight = 1
+action_weight = 50
 
 
 def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:

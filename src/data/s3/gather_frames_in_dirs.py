@@ -8,6 +8,7 @@ from data.s3.s3_utils import S3Manager
 class S3Frame(BaseModel):
     frame_num: int
     obj_key: str
+    metadata_obj_key: str
 
 
 class S3FrameList(BaseModel):
@@ -34,7 +35,11 @@ def list_frames_in_s3(s3_manager: S3Manager, source_dir: str) -> list[S3FrameLis
             if match:
                 frame_num = int(match.group(1))
                 directory_mapping[dir_path].append(
-                    S3Frame(frame_num=frame_num, obj_key=obj_key)
+                    S3Frame(
+                        frame_num=frame_num,
+                        obj_key=obj_key,
+                        metadata_obj_key=obj_key.replace(".png", ".json"),
+                    )
                 )
 
     for dir_path, frame_list in directory_mapping.items():

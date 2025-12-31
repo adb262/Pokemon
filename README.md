@@ -33,6 +33,10 @@ Ablation results (see below):
 Data
 [X] Process parallelism
 [X] Loss is wrong
+[] Koga gym is known poisonous bc of teleportation
+[] Horrible Heart Gold/Soul Silver
+[] When we enter into trainer battle
+[] We cannot tell when the frame is exactly the same
 
 
 ## TODO
@@ -43,3 +47,13 @@ X Move to single action per frame
 - Just look at center of the frames to determine action
 - Dealing with codebook collapse now. Tried resetting but just collapses elsewhere. Might want to just focus on the center frame (only care about the char)
 - More homogeneous data
+- Emergence of no-action quantization. Successfully classifying when there is no action
+
+
+Create streamlit for labeling images as valid or invalid. Highlight spans over a low calibre preview of an entire video
+
+This streamlit should load in a .mp4. It should show the video preview in a sort of spread out "timeline". This timeline should be very low resolution so to allow us to view large chunks of the video at once. The video should not play, but rather it should just show the expanded frames. We should show 5 frames/second. 
+The user interacts with this by dragging intervals over the spans of frames that we want to label as "valid". When we save the annotation, the frame indices for the valid frames are written to a .json in the directory (create if doesn't exist) f"labeled_frames/{video_name_without.mp4}.json". The structure of the json is a list of lists, where each list represents a chunk of viable frames.
+
+Some thoughts:
+- Because the videos can be very long, we likely want to stream chunks of it in. We will not be able to show every single frame at once, and should just show windows. We need to be able to label large chunks of the video at once so that it is simple to go through many very large videos.

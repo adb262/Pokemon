@@ -12,7 +12,7 @@ import torch.distributions.uniform as uniform_dist
 from quantization.base import BaseQuantizer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class NSVQ(BaseQuantizer):

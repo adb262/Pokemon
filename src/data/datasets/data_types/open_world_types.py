@@ -15,3 +15,6 @@ class OpenWorldVideoLog(BaseModel):
 
     def __hash__(self):
         return sum(hash(video) for video in self.video_logs)
+
+    def __len__(self):
+        return len(self.video_logs)
