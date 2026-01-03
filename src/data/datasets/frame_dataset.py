@@ -4,8 +4,6 @@ import os
 import random
 import re
 import shutil
-
-# Add the parent directory to the path so we can import from idm
 import sys
 import tempfile
 from pathlib import Path
