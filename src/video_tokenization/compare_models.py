@@ -12,7 +12,7 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
 from monitoring.frechet_distance import compute_frechet_distance
-from monitoring.visualize_videos import convert_video_to_images
+from monitoring.videos import convert_video_to_images
 from video_tokenization.checkpoints import load_model_from_checkpoint
 from video_tokenization.tokenizer import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig

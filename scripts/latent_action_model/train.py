@@ -25,7 +25,7 @@ from data.s3.s3_utils import S3Manager, default_s3_manager
 from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
 from loss.loss_fns import next_frame_reconstruction_loss
-from monitoring.visualize_videos import (
+from monitoring.videos import (
     convert_video_to_images,
     save_comparison_images_next_frame,
 )
@@ -409,7 +409,6 @@ def train_epoch(
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
-    commit_beta = 0.2
 
     # How often to run NSVQ codebook replacement, in number of batches.
     # If not explicitly configured, default to the visualization save interval.
@@ -451,12 +450,6 @@ def train_epoch(
 
         # Periodically save visualizations (comparison grids and residuals)
         if batch_idx % config.save_interval == 0:
-            # save_visualizations(
-            #     video_batch.detach(),
-            #     decoded.detach(),
-            #     config,
-            #     prefix=f"train/epoch_{epoch}_batch_{batch_idx}",
-            # )
             predicted_videos = convert_video_to_images(decoded)
             expected_videos = convert_video_to_images(video_batch)
             save_comparison_images_next_frame(
@@ -631,6 +624,7 @@ def main(config: VideoTrainingConfig):
         local_cache=local_cache,
         limit=1000000,
         image_size=config.image_size,
+        use_s3=config.use_s3,
     )
 
     logger.info("Setting up dataset...")

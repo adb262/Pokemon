@@ -83,7 +83,7 @@ class FrameWithPath:
 def filter_frame_sequence(
     frame_sequence: list[FrameWithPath], num_frames_in_video: int
 ) -> list[list[str]]:
-    if len(frame_sequence) < 2:
+    if len(frame_sequence) < num_frames_in_video:
         return []
 
     valid_frame_paths: list[list[str]] = []
@@ -98,7 +98,7 @@ def filter_frame_sequence(
             continue
 
         similarity = get_frame_similarity(curr_frame.frame, next_frame.frame)
-        if similarity >= 0.01 and similarity <= 0.8:
+        if similarity <= 0.8:
             valid_frame_buffer.append(next_frame)
 
     if len(valid_frame_buffer) > 0:

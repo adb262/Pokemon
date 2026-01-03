@@ -12,6 +12,7 @@ import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+import wandb
 from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
 from data.datasets.cache import Cache
 from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
@@ -21,7 +22,7 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
 from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import reconstruction_loss
 from monitoring.setup_wandb import setup_wandb
-from monitoring.visualize_videos import convert_video_to_images, save_comparison_images
+from monitoring.videos import convert_video_to_images, save_comparison_images
 from scripts.video_tokenizer.eval import eval_model
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
@@ -60,6 +61,8 @@ def train_epoch(
         dataloader.resumable_loader.set_epoch(epoch)
         dataloader.resumable_loader.current_batch = start_batch
 
+    os.makedirs(f"{save_dir}/train/epoch_{epoch}", exist_ok=True)
+
     epoch_start_time = time.time()
     batch_start_time = time.time()
 
@@ -88,15 +91,6 @@ def train_epoch(
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        if batch_idx % config.save_interval == 0:
-            images = convert_video_to_images(video_batch)
-            decoded_images = convert_video_to_images(decoded)
-            save_comparison_images(
-                decoded_images,
-                images,
-                f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}",
-            )
 
         optimizer.step()
         scheduler.step()  # Step scheduler every batch for cosine annealing
@@ -136,23 +130,28 @@ def train_epoch(
 
             predicted_videos = convert_video_to_images(decoded)
             expected_videos = convert_video_to_images(video_batch)
-            save_comparison_images(
-                predicted_videos,
-                expected_videos,
-                f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}",
+            comparison_path = (
+                f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
+            )
+            save_comparison_images(predicted_videos, expected_videos, comparison_path)
+
+            # Log comparison image to wandb
+            wandb_logger.log(
+                {"train/comparison": wandb.Image(comparison_path)},
+                step=global_step,
             )
 
-            # save_checkpoint(
-            #     model,
-            #     optimizer,
-            #     scheduler,
-            #     epoch,
-            #     batch_idx,
-            #     loss.item(),
-            #     config,
-            #     best_loss,
-            #     dataloader_state,
-            # )
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                batch_idx,
+                loss.item(),
+                config,
+                best_loss,
+                dataloader_state,
+            )
 
     avg_loss = total_loss / num_batches
     epoch_time = time.time() - epoch_start_time
@@ -218,19 +217,17 @@ def main(config: VideoTokenizerTrainingConfig):
     )
 
     dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir="saved_datasets",
+        dataset_dir=config.frames_dir,
         num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_100000.json",
+        output_log_json_file_name="log_dir_50000.json",
         local_cache=local_cache,
-        limit=100000,
+        limit=50000,
         image_size=config.image_size,
+        use_s3=config.use_s3,
     )
 
     logger.info("Setting up dataset...")
     train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
-
-    # Lets overfit
-    # test_dataset = train_dataset
 
     train_dataset = OpenWorldRunningDataset(
         dataset=train_dataset,
@@ -242,6 +239,7 @@ def main(config: VideoTokenizerTrainingConfig):
         dataset=test_dataset,
         local_cache=local_cache,
         image_size=config.image_size,
+        limit=100,
     )
 
     logger.info(f"Creating data loader with {len(train_dataset)} videos...")
@@ -280,11 +278,15 @@ def main(config: VideoTokenizerTrainingConfig):
     for key, value in test_info.items():
         logger.info(f"  {key}: {value}")
 
-    # Log dataset info to wandb
+    # Log dataset info to wandb (use commit=False to not advance step counter)
     if wandb_logger:
-        wandb_logger.log({f"dataset/{key}": value for key, value in train_info.items()})
         wandb_logger.log(
-            {f"test_dataset/{key}": value for key, value in test_info.items()}
+            {f"dataset/{key}": value for key, value in train_info.items()},
+            commit=False,
+        )
+        wandb_logger.log(
+            {f"test_dataset/{key}": value for key, value in test_info.items()},
+            commit=False,
         )
 
     # Create model
@@ -324,6 +326,7 @@ def main(config: VideoTokenizerTrainingConfig):
     best_loss = float("inf")
 
     # first, evaluate on test dataset
+    num_batches = len(train_dataloader)
     test_loss = eval_model(
         model,
         test_dataloader,
@@ -332,6 +335,7 @@ def main(config: VideoTokenizerTrainingConfig):
         epoch=0,
         wandb_logger=wandb_logger,
         save_dir=config.save_dir,
+        global_step=0,
     )
     logger.info(f"Test loss: {test_loss:.6f}")
 
@@ -354,31 +358,32 @@ def main(config: VideoTokenizerTrainingConfig):
                 config.save_dir,
             )
 
-            # eval_loss = eval_model(
-            #     model,
-            #     test_dataloader,
-            #     criterion,
-            #     device,
-            #     epoch,
-            #     wandb_logger=wandb_logger,
-            #     save_dir=config.save_dir,
-            # )
-            # logger.info(f"Test loss: {eval_loss:.6f}")
+            eval_loss = eval_model(
+                model,
+                test_dataloader,
+                criterion,
+                device,
+                epoch,
+                wandb_logger=wandb_logger,
+                save_dir=config.save_dir,
+                global_step=(epoch + 1) * num_batches,
+            )
+            logger.info(f"Test loss: {eval_loss:.6f}")
 
-            # if eval_loss < best_loss:
-            #     best_loss = eval_loss
+            if eval_loss < best_loss:
+                best_loss = eval_loss
 
-            #     save_checkpoint(
-            #         model,
-            #         optimizer,
-            #         scheduler,
-            #         epoch,
-            #         len(train_dataloader),
-            #         avg_loss,
-            #         config,
-            #         best_loss,
-            #         train_dataloader.get_state(),
-            #     )
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    len(train_dataloader),
+                    avg_loss,
+                    config,
+                    best_loss,
+                    train_dataloader.get_state(),
+                )
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")

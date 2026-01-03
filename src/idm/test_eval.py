@@ -67,7 +67,7 @@ def load_checkpoint(model, checkpoint_path, device):
     config = checkpoint.get('config', {})
     timestamp = checkpoint.get('timestamp', 'unknown')
 
-    logger.info(f"Checkpoint loaded successfully:")
+    logger.info("Checkpoint loaded successfully:")
     logger.info(f"  Epoch: {epoch}, Batch: {batch_idx}")
     logger.info(f"  Loss: {loss:.6f}")
     logger.info(f"  Timestamp: {timestamp}")
