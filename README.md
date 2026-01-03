@@ -68,3 +68,8 @@ Some thoughts:
 - Because the videos can be very long, we likely want to stream chunks of it in. We will not be able to show every single frame at once, and should just show windows. We need to be able to label large chunks of the video at once so that it is simple to go through many very large videos.
 
 
+## Data Scripts
+
+```
+python -m scripts.data.sync_dataset_to_s3 --source pokemon_frames/pokemon_emerald_train_0_9_5_frames.json --bucket [bucket_name] --verbose
+```
