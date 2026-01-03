@@ -17,6 +17,7 @@ from data.datasets.data_types.open_world_types import (
 )
 from data.s3.gather_frames_in_dirs import S3Frame, list_frames_in_s3
 from data.s3.s3_utils import S3Manager, default_s3_manager
+from data.scraping.frame_extractor import FrameMetadata
 from data.scraping.frame_filterer import FrameWithPath, filter_frame_sequence
 
 random.seed(42)
@@ -143,24 +144,36 @@ class OpenWorldRunningDatasetCreator:
             return None
 
     @staticmethod
+    def _load_metadata_from_s3(
+        s3_manager: S3Manager, s3_key: str
+    ) -> FrameMetadata | None:
+        try:
+            metadata = s3_manager.download_json(s3_key)
+            if metadata is not None:
+                return FrameMetadata(**metadata)
+
+            return None
+        except Exception as e:
+            logger.error(f"Error loading metadata from S3: {e}")
+            return None
+
+    @staticmethod
     def _get_chunked_frames_with_paths(
-        loaded_images: list[Image.Image],
-        frame_paths: list[str],
-        batch_size: int,
-        overlap: int,
+        frames_with_paths: list[FrameWithPath],
     ) -> list[list[FrameWithPath]]:
         chunked_frames_with_paths: list[list[FrameWithPath]] = []
 
-        for j in range(0, len(loaded_images), batch_size):
-            chunked_frames_with_paths.append(
-                [
-                    FrameWithPath(path=path, frame=image)
-                    for image, path in zip(
-                        loaded_images[j : j + batch_size + overlap],
-                        frame_paths[j : j + batch_size + overlap],
-                    )
-                ]
-            )
+        current_chunk = [frames_with_paths[0]]
+        for frame in frames_with_paths[1:]:
+            if current_chunk[-1].path.split("/")[-1] != frame.metadata.prev_frame_key:
+                logger.info(
+                    f"Adding chunk of {len(current_chunk)} frames. index: {current_chunk[-1].path}. frame_idx: {frame.path}. "
+                )
+                chunked_frames_with_paths.append(current_chunk)
+                current_chunk = [frame]
+            else:
+                current_chunk.append(frame)
+        chunked_frames_with_paths.append(current_chunk)
 
         return chunked_frames_with_paths
 
@@ -191,22 +204,28 @@ class OpenWorldRunningDatasetCreator:
                 progress_bar.update(1)
                 return
 
-            frames = filter_frame_sequence(frame_list)
-            if len(frames) >= num_frames_in_video:
+            frames = filter_frame_sequence(frame_list, num_frames_in_video)
+            for frame_sequence in frames:
                 videos.append(
                     OpenWorldVideoLogSingleton(
-                        video_log_paths=frames, video_id=frame_list[0].path
+                        video_log_paths=frame_sequence,
+                        video_id=frame_list[0].metadata.video_id,
                     )
                 )
-                logger.info(f"Added video with {len(frames)} frames")
+                logger.info(f"Added video with {len(frame_sequence)} frames")
             progress_bar.update(1)
 
         with ThreadPoolExecutor(max_workers=10) as thread_executor:
             frame_paths = [path.obj_key for path in chunks]
+            metadata_paths = [path.metadata_obj_key for path in chunks]
             partial_fn = partial(
                 OpenWorldRunningDatasetCreator._load_image_from_s3,
                 default_s3_manager,
                 local_cache,
+            )
+            partial_metadata_fn = partial(
+                OpenWorldRunningDatasetCreator._load_metadata_from_s3,
+                default_s3_manager,
             )
             loaded_images = list(
                 thread_executor.map(
@@ -214,12 +233,24 @@ class OpenWorldRunningDatasetCreator:
                     frame_paths,
                 )
             )
-            loaded_images = [image for image in loaded_images if image is not None]
+            loaded_metadata = list[FrameMetadata | None](
+                thread_executor.map(
+                    partial_metadata_fn,
+                    metadata_paths,
+                )
+            )
+            frame_with_paths: list[FrameWithPath] = []
+            for path, image, metadata in zip(
+                frame_paths, loaded_images, loaded_metadata
+            ):
+                if image is not None and metadata is not None:
+                    frame_with_paths.append(
+                        FrameWithPath(path=path, frame=image, metadata=metadata)
+                    )
 
-            overlap = num_frames_in_video
             frames_with_paths = (
                 OpenWorldRunningDatasetCreator._get_chunked_frames_with_paths(
-                    loaded_images, frame_paths, num_frames_in_video, overlap
+                    frame_with_paths,
                 )
             )
             progress_bar = tqdm(
@@ -266,3 +297,64 @@ class OpenWorldRunningDatasetCreator:
                 all_videos.extend(sum(videos, []))
 
         return all_videos
+
+    def show_sample_grid(
+        self,
+        dataset: OpenWorldVideoLog,
+        num_trajectories: int = 20,
+        max_frames_per_trajectory: int = 10,
+        frame_size: tuple[int, int] = (128, 128),
+        padding: int = 4,
+    ):
+        # Sample trajectories from the dataset
+        num_to_sample = min(num_trajectories, len(dataset))
+        sampled_trajectories = random.sample(dataset.video_logs, num_to_sample)
+
+        # Determine grid dimensions
+        num_cols = min(
+            max_frames_per_trajectory,
+            max(len(t.video_log_paths) for t in sampled_trajectories),
+        )
+        num_rows = len(sampled_trajectories)
+
+        # Calculate final image dimensions
+        cell_width = frame_size[0] + padding
+        cell_height = frame_size[1] + padding
+        grid_width = num_cols * cell_width + padding
+        grid_height = num_rows * cell_height + padding
+
+        # Create the grid image with a dark background
+        grid_image = Image.new("RGB", (grid_width, grid_height), color=(30, 30, 30))
+
+        logger.info(
+            f"Creating sample grid with {num_rows} trajectories, {num_cols} frames each"
+        )
+
+        # Load and place frames
+        for row_idx, trajectory in enumerate(
+            tqdm(sampled_trajectories, desc="Loading trajectories")
+        ):
+            frame_paths = trajectory.video_log_paths[:max_frames_per_trajectory]
+
+            for col_idx, frame_path in enumerate(frame_paths):
+                # Try to load from cache first, then from S3
+                image = self._load_image_locally(frame_path)
+                if image is None:
+                    image = self._load_image_from_s3(
+                        default_s3_manager, self.local_cache, frame_path
+                    )
+
+                if image is None:
+                    # Create a placeholder for missing images
+                    image = Image.new("RGB", frame_size, color=(80, 80, 80))
+                else:
+                    # Resize the image to the target frame size
+                    image = image.resize(frame_size, Image.Resampling.LANCZOS)
+
+                # Calculate position and paste
+                x = padding + col_idx * cell_width
+                y = padding + row_idx * cell_height
+                grid_image.paste(image, (x, y))
+
+        # Save the grid
+        grid_image.show()

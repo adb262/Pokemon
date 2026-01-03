@@ -629,12 +629,17 @@ def main(config: VideoTrainingConfig):
         num_frames_in_video=config.num_images_in_video,
         output_log_json_file_name="log_dir_100000.json",
         local_cache=local_cache,
-        limit=10000,
+        limit=1000000,
         image_size=config.image_size,
     )
 
     logger.info("Setting up dataset...")
     train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+    logger.info(f"Train dataset length: {len(train_dataset)}")
+    logger.info(f"Test dataset length: {len(test_dataset)}")
+    dataset_creator.show_sample_grid(
+        train_dataset, num_trajectories=20, max_frames_per_trajectory=10
+    )
 
     train_dataset = OpenWorldRunningDataset(
         dataset=train_dataset,

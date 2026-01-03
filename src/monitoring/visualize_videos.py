@@ -73,66 +73,83 @@ def save_comparison_images_next_frame(
     expected_videos: list[list[Image.Image]],
     file_prefix: str,
 ):
-    # For each video in the batch, save a single plot showing:
-    # row 0: original frame
-    # row 1: expected next frame
-    # row 2: predicted next frame
-    # with columns corresponding to time steps (from frame 1 onward).
+    # Save a single plot showing all samples in a grid:
+    # Each sample gets its own set of 3 rows (original, expected next, predicted next)
+    # Columns correspond to time steps (from frame 1 onward)
     import matplotlib.pyplot as plt
+    import numpy as np
 
     os.makedirs(file_prefix, exist_ok=True)
 
-    for i, predicted_video in enumerate(predicted_videos):
-        num_frames = len(predicted_video)
+    num_samples = len(predicted_videos)
+    if num_samples == 0:
+        return
 
-        fig, axs = plt.subplots(
-            3,
-            num_frames,
-            figsize=(max(4, num_frames * 2.5), 3 * 2.5),
-        )
+    num_frames = len(predicted_videos[0])
 
-        # If there's only one column, axs will be 1D; make it 2D for uniform indexing
-        if num_frames - 1 == 1:
-            import numpy as np
-
-            axs = np.expand_dims(axs, axis=1)
-
-        if len(expected_videos[i]) - num_frames != 1:
+    # Sanity check all lengths match up
+    for i in range(num_samples):
+        if len(expected_videos[i]) - len(predicted_videos[i]) != 1:
             raise ValueError(
-                f"Expected {len(expected_videos[i])} frames, got {num_frames}"
+                f"Sample {i}: Expected {len(expected_videos[i])} frames, got {len(predicted_videos[i])}"
             )
+
+    # Each sample gets 3 rows: original, expected next, predicted next
+    total_rows = num_samples * 3
+    fig, axs = plt.subplots(
+        total_rows,
+        num_frames,
+        figsize=(max(8, num_frames * 2.2), total_rows * 2.0),
+    )
+
+    # If only one row or one column, axs might be 1D, expand as needed
+    if total_rows == 1:
+        axs = np.expand_dims(axs, axis=0)
+    if num_frames == 1:
+        axs = np.expand_dims(axs, axis=1)
+
+    for sample_idx in range(num_samples):
+        predicted_video = predicted_videos[sample_idx]
+        expected_video = expected_videos[sample_idx]
+        actions = predicted_actions[sample_idx]
+        row_offset = sample_idx * 3
 
         for col in range(num_frames):
             # The 'original frame' is frame j-1
-            original_image = expected_videos[i][col]
+            original_image = expected_video[col]
             # The 'expected next frame' is frame j
-            expected_image = expected_videos[i][col + 1]
+            expected_image = expected_video[col + 1]
             # The 'predicted next frame' is also frame j (in predicted_videos)
             predicted_image = predicted_video[col]
 
-            # Row 0: original, Row 1: expected, Row 2: predicted
-            axs[0, col].imshow(original_image)
-            axs[0, col].axis("off")
+            # Row 0: original
+            axs[row_offset + 0, col].imshow(original_image)
+            axs[row_offset + 0, col].axis("off")
             if col == 0:
-                axs[0, col].set_ylabel("Original", fontsize=10)
+                axs[row_offset + 0, col].set_ylabel(
+                    f"Sample {sample_idx}\nOriginal", fontsize=10
+                )
 
-            axs[1, col].imshow(expected_image)
-            axs[1, col].axis("off")
+            # Row 1: expected next
+            axs[row_offset + 1, col].imshow(expected_image)
+            axs[row_offset + 1, col].axis("off")
             if col == 0:
-                axs[1, col].set_ylabel("Expected Next", fontsize=10)
+                axs[row_offset + 1, col].set_ylabel("Expected Next", fontsize=10)
 
-            axs[2, col].imshow(predicted_image)
-            axs[2, col].axis("off")
+            # Row 2: predicted next
+            axs[row_offset + 2, col].imshow(predicted_image)
+            axs[row_offset + 2, col].axis("off")
             if col == 0:
-                axs[2, col].set_ylabel("Predicted Next", fontsize=10)
+                axs[row_offset + 2, col].set_ylabel("Predicted Next", fontsize=10)
 
-            axs[0, col].set_title(
-                f"t={col} action={predicted_actions[i][col]}", fontsize=9
+            # Set the title for the top row of the sample (original frame)
+            axs[row_offset + 0, col].set_title(
+                f"t={col}  action={actions[col]}", fontsize=9
             )
 
-        plt.tight_layout()
-        plt.savefig(f"{file_prefix}/sample_{i}_next_frame_comparison.png")
-        plt.close(fig)
+    plt.tight_layout()
+    plt.savefig(f"{file_prefix}/next_frame_comparison_grid.png")
+    plt.close(fig)
 
 
 def save_comparison_images(

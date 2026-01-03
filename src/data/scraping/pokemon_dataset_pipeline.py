@@ -1,4 +1,6 @@
 """
+python -m src.data.scraping.pokemon_dataset_pipeline --clean --extract --summary --extract --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16
+
 Pokemon Dataset Pipeline
 Main script that orchestrates the entire Pokemon video dataset creation process:
 1. Scrape Pokemon gameplay videos from YouTube
@@ -13,7 +15,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from data.scraping.data_config import PokemonDatasetPipelineConfig, parse_args
+import tyro
+
+from data.scraping.data_config import PokemonDatasetPipelineConfig
 from data.scraping.frame_extractor import PokemonFrameExtractor
 from data.scraping.scrape_videos import PokemonVideoScraper
 from data.scraping.video_cleaner import PokemonVideoCleaner
@@ -42,13 +46,23 @@ class PokemonDatasetPipeline:
         self._min_gameplay_ratio = config.min_gameplay_ratio
         self._target_fps = config.target_fps
         self._target_height = config.target_height
+        self._jump_seconds = config.jump_seconds
+        self._num_video_workers = config.num_video_workers
+        self._num_upload_threads = config.num_upload_threads
+        self._use_s3 = config.use_s3
+        self._keep_local_frames = config.keep_local_frames
         self.scraper = PokemonVideoScraper(
             output_dir=self._raw_videos_dir,
             max_videos_per_game=self._max_videos_per_game,
         )
         self.cleaner = PokemonVideoCleaner(min_gameplay_ratio=self._min_gameplay_ratio)
         self.extractor = PokemonFrameExtractor(
-            target_fps=self._target_fps, target_height=self._target_height
+            target_fps=self._target_fps,
+            target_height=self._target_height,
+            use_s3=self._use_s3,
+            jump_seconds=self._jump_seconds,
+            num_video_workers=self._num_video_workers,
+            num_upload_threads=self._num_upload_threads,
         )
         self._scrape = config.scrape
         self._clean = config.clean
@@ -173,7 +187,9 @@ class PokemonDatasetPipeline:
         try:
             # Process all videos in raw_videos directory
             self.extractor.process_video_directory(
-                self._raw_videos_dir, self._frames_dir
+                self._raw_videos_dir,
+                self._frames_dir,
+                keep_local_frames=self._keep_local_frames,
             )
 
             # Create dataset index
@@ -354,9 +370,10 @@ class PokemonDatasetPipeline:
 
 def main():
     """Main function with command line interface"""
-    args = parse_args()
+    config = tyro.cli(PokemonDatasetPipelineConfig)
+
     # Create and run pipeline
-    pipeline = PokemonDatasetPipeline(args)
+    pipeline = PokemonDatasetPipeline(config)
     success = pipeline.run_full_pipeline()
     logger.info(f"Pipeline completed with success: {success}")
 

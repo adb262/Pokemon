@@ -5,6 +5,8 @@ from typing import Counter
 import numpy as np
 from PIL import Image
 
+from data.scraping.frame_metadata import FrameMetadata
+
 
 def get_counts_of_pixels(arr: np.ndarray) -> Counter:
     # Get the Counter of connected same RGB pixels in the array
@@ -75,31 +77,32 @@ def get_frame_similarity(frame1: Image.Image, frame2: Image.Image):
 class FrameWithPath:
     path: str
     frame: Image.Image
+    metadata: FrameMetadata
 
 
 def filter_frame_sequence(
-    frame_sequence: list[FrameWithPath],
-) -> list[str]:
-    valid_frames = [
-        frame
-        for frame in frame_sequence
-        if is_frame_within_navigable_environment(frame.frame)
-    ]
-    if len(valid_frames) < 2:
+    frame_sequence: list[FrameWithPath], num_frames_in_video: int
+) -> list[list[str]]:
+    if len(frame_sequence) < 2:
         return []
 
-    valid_frame_paths: list[str] = []
-    for i in range(len(valid_frames) - 1):
-        curr_frame_path, curr_frame = valid_frames[i].path, valid_frames[i].frame
-        next_frame_path, next_frame = (
-            valid_frames[i + 1].path,
-            valid_frames[i + 1].frame,
-        )
-        similarity = get_frame_similarity(curr_frame, next_frame)
-        if similarity >= 0.0 and similarity <= 0.99:
-            if len(valid_frame_paths) == 0:
-                valid_frame_paths.append(curr_frame_path)
-            valid_frame_paths.append(next_frame_path)
+    valid_frame_paths: list[list[str]] = []
+    valid_frame_buffer: list[FrameWithPath] = [frame_sequence[0]]
+    for i in range(1, len(frame_sequence)):
+        curr_frame = frame_sequence[i - 1]
+        next_frame = frame_sequence[i]
+
+        if len(valid_frame_buffer) >= num_frames_in_video:
+            valid_frame_paths.append([frame.path for frame in valid_frame_buffer])
+            valid_frame_buffer = [next_frame]
+            continue
+
+        similarity = get_frame_similarity(curr_frame.frame, next_frame.frame)
+        if similarity >= 0.01 and similarity <= 0.8:
+            valid_frame_buffer.append(next_frame)
+
+    if len(valid_frame_buffer) > 0:
+        valid_frame_paths.append([frame.path for frame in valid_frame_buffer])
 
     return valid_frame_paths
 

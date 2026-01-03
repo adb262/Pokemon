@@ -9,7 +9,9 @@ Supports both local storage and S3 upload.
 import json
 import logging
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -88,6 +90,12 @@ class PokemonVideoScraper:
         else:
             self.s3_manager = None
 
+        # Lock to protect access to downloaded_videos in multithreaded context
+        self._downloaded_lock = threading.Lock()
+
+        # Number of worker threads for parallel downloads / processing
+        self.max_workers = 8
+
         self.downloaded_videos = self._load_downloaded_list()
 
     def _load_downloaded_list(self) -> set:
@@ -118,7 +126,8 @@ class PokemonVideoScraper:
 
     def _save_downloaded_list(self):
         """Save list of downloaded video IDs to local and/or S3"""
-        downloaded_data = list(self.downloaded_videos)
+        with self._downloaded_lock:
+            downloaded_data = list(self.downloaded_videos)
 
         # Save to S3 if enabled
         if self.use_s3 and self.s3_manager:
@@ -201,7 +210,17 @@ class PokemonVideoScraper:
     def _get_ydl_opts(self, game_dir: Path) -> Dict:
         """Get yt-dlp options for downloading"""
         return {
-            "format": "best[height<=720][ext=mp4]",  # Max 720p MP4
+            # Prefer low-resolution video to save space/bandwidth (target 360p)
+            # Try to explicitly get MP4 video+audio, and if that fails, fall back to other low-quality formats.
+            "format": (
+                "bv*[height<=360][ext=mp4]+ba[ext=m4a]/"
+                "b[height<=360][ext=mp4]/"
+                "b[height<=360]/"
+                "worst[ext=mp4]/"
+                "worst"
+            ),
+            # Ensure final container is MP4 when possible
+            "merge_output_format": "mp4",
             "outtmpl": str(game_dir / "%(title)s.%(id)s.%(ext)s"),
             "writeinfojson": True,
             "writesubtitles": False,
@@ -243,13 +262,8 @@ class PokemonVideoScraper:
             "trailer",
             "commercial",
             "ad",
-            "speedrun",
             "tas",
             "glitch",
-            "hack",
-            "rom hack",
-            "mod",
-            "randomizer",
         ]
 
         if any(keyword in title for keyword in bad_keywords):
@@ -266,7 +280,92 @@ class PokemonVideoScraper:
             )
             return False
 
+        logger.info(f"Using {info.get('id')}!!")
         return True
+
+    def _process_video_entry(
+        self, entry: Dict, game_name: str, game_dir: Path
+    ) -> Optional[str]:
+        """
+        Process a single video entry:
+        - Fetch full info
+        - Filter by metadata
+        - Download video
+        - Optionally upload to S3
+        Returns the video ID if a video was successfully downloaded (and/or uploaded),
+        otherwise None.
+        """
+        if not entry:
+            return None
+
+        video_id = entry.get("id")
+        if not video_id:
+            return None
+
+        # Check if we've already seen this video
+        with self._downloaded_lock:
+            if video_id in self.downloaded_videos:
+                logger.info(f"Video {video_id} already seen, skipping")
+                return None
+
+        try:
+            # Get full video info for filtering
+            with yt_dlp.YoutubeDL({"quiet": True}) as info_ydl:
+                full_info = info_ydl.extract_info(
+                    f"https://youtube.com/watch?v={video_id}",
+                    download=False,
+                )
+
+            # Mark video as seen regardless of whether we download it
+            with self._downloaded_lock:
+                self.downloaded_videos.add(video_id)
+
+            if full_info and not self._filter_video_info(full_info):
+                title = full_info.get("title", "Unknown")
+                logger.info(f"Video {title} ({video_id}) filtered out")
+                return None
+
+            # Download options per-thread to avoid any mutation issues
+            download_opts = self._get_ydl_opts(game_dir)
+
+            # Download the video
+            with yt_dlp.YoutubeDL(download_opts) as download_ydl:
+                title = full_info.get("title", "Unknown") if full_info else "Unknown"
+                logger.info(f"Downloading video: {title} ({video_id})")
+                download_ydl.download([f"https://youtube.com/watch?v={video_id}"])
+
+            # Find the downloaded file
+            video_files = list(game_dir.glob(f"*.{video_id}.*"))
+            video_file = None
+            for f in video_files:
+                if f.suffix in [".mp4", ".mkv", ".webm"]:
+                    video_file = f
+                    break
+
+            if not video_file or not video_file.exists():
+                logger.warning(f"Downloaded video file not found for {video_id}")
+                return None
+
+            # Upload to S3 if enabled
+            if self.use_s3:
+                upload_success = self._upload_video_to_s3(video_file, game_name)
+                if upload_success:
+                    logger.info(f"Successfully uploaded {video_file.name} to S3")
+                    # Clean up local file if not keeping copies
+                    self._cleanup_local_file(video_file)
+                else:
+                    logger.warning(
+                        f"Failed to upload {video_file.name} to S3, keeping local copy"
+                    )
+
+            return video_id
+
+        except Exception as e:
+            logger.error(f"Error processing video {video_id}: {e}")
+            # Still mark as seen to avoid retrying on future runs
+            with self._downloaded_lock:
+                self.downloaded_videos.add(video_id)
+            return None
 
     def search_and_download_videos(
         self, query: str, game_name: str, max_results: int = 20
@@ -275,7 +374,7 @@ class PokemonVideoScraper:
         game_dir = self.output_dir / game_name.replace(" ", "_").lower()
         game_dir.mkdir(exist_ok=True)
 
-        downloaded_files = []
+        downloaded_files: List[str] = []
 
         # Search options
         search_opts = {
@@ -296,88 +395,38 @@ class PokemonVideoScraper:
                     logger.warning(f"No results found for query: {query}")
                     return downloaded_files
 
-                # Download each video
-                download_opts = self._get_ydl_opts(game_dir)
+                entries = [e for e in search_results["entries"] if e]
+                if not entries:
+                    logger.warning(f"No valid entries found for query: {query}")
+                    return downloaded_files
 
-                for entry in search_results["entries"]:
-                    if not entry:
-                        continue
+                # Parallelize processing of individual video entries
+                max_workers = min(self.max_workers, len(entries))
+                logger.info(
+                    f"Processing {len(entries)} videos for query '{query}' with {max_workers} threads"
+                )
 
-                    video_id = entry.get("id")
-                    if video_id in self.downloaded_videos:
-                        logger.info(f"Video {video_id} already seen, skipping")
-                        continue
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_id = {
+                        executor.submit(
+                            self._process_video_entry, entry, game_name, game_dir
+                        ): entry.get("id")
+                        for entry in entries
+                    }
 
-                    # Get full video info for filtering
-                    try:
-                        with yt_dlp.YoutubeDL({"quiet": True}) as info_ydl:
-                            full_info = info_ydl.extract_info(
-                                f"https://youtube.com/watch?v={video_id}",
-                                download=False,
+                    for future in as_completed(future_to_id):
+                        video_id = future_to_id[future]
+                        try:
+                            result_id = future.result()
+                            if result_id:
+                                downloaded_files.append(result_id)
+                        except Exception as e:
+                            logger.error(
+                                f"Unhandled error processing video {video_id}: {e}"
                             )
 
-                        # Mark video as seen regardless of whether we download it
-                        self.downloaded_videos.add(video_id)
-
-                        if full_info and not self._filter_video_info(full_info):
-                            title = full_info.get("title", "Unknown")
-                            logger.info(f"Video {title} ({video_id}) filtered out")
-                            continue
-
-                        # Download the video
-                        with yt_dlp.YoutubeDL(download_opts) as download_ydl:
-                            title = (
-                                full_info.get("title", "Unknown")
-                                if full_info
-                                else "Unknown"
-                            )
-                            logger.info(f"Downloading video: {title} ({video_id})")
-                            download_ydl.download(
-                                [f"https://youtube.com/watch?v={video_id}"]
-                            )
-
-                        # Find the downloaded file
-                        video_files = list(game_dir.glob(f"*.{video_id}.*"))
-                        video_file = None
-                        for f in video_files:
-                            if f.suffix in [".mp4", ".mkv", ".webm"]:
-                                video_file = f
-                                break
-
-                        if video_file and video_file.exists():
-                            # Upload to S3 if enabled
-                            if self.use_s3:
-                                upload_success = self._upload_video_to_s3(
-                                    video_file, game_name
-                                )
-                                if upload_success:
-                                    logger.info(
-                                        f"Successfully uploaded {video_file.name} to S3"
-                                    )
-                                    # Clean up local file if not keeping copies
-                                    self._cleanup_local_file(video_file)
-                                else:
-                                    logger.warning(
-                                        f"Failed to upload {video_file.name} to S3, keeping local copy"
-                                    )
-
-                            downloaded_files.append(video_id)
-                        else:
-                            logger.warning(
-                                f"Downloaded video file not found for {video_id}"
-                            )
-
-                        # Save progress
-                        self._save_downloaded_list()
-
-                        # Rate limiting
-                        time.sleep(2)
-
-                    except Exception as e:
-                        logger.error(f"Error processing video {video_id}: {e}")
-                        # Still mark as seen to avoid retrying
-                        self.downloaded_videos.add(video_id)
-                        continue
+                # Save progress once per search query
+                self._save_downloaded_list()
 
         except Exception as e:
             logger.error(f"Error searching for query '{query}': {e}")
@@ -452,6 +501,7 @@ def main():
     parser.add_argument(
         "--keep-local", action="store_true", help="Keep local copies when using S3"
     )
+    parser.add_argument("--use-", action="store_true", help="Use Wandb for logging")
 
     args = parser.parse_args()
 
