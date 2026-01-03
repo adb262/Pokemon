@@ -1,3 +1,5 @@
+"""Video visualization utilities for converting tensors to images and saving comparison grids."""
+
 import logging
 import os
 
@@ -73,9 +75,12 @@ def save_comparison_images_next_frame(
     expected_videos: list[list[Image.Image]],
     file_prefix: str,
 ):
-    # Save a single plot showing all samples in a grid:
-    # Each sample gets its own set of 3 rows (original, expected next, predicted next)
-    # Columns correspond to time steps (from frame 1 onward)
+    """
+    Save a comparison grid showing original frame, expected next frame, and predicted next frame.
+
+    Each sample gets 3 rows: original, expected next, predicted next.
+    Columns correspond to time steps.
+    """
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -155,16 +160,24 @@ def save_comparison_images_next_frame(
 def save_comparison_images(
     predicted_videos: list[list[Image.Image]],
     expected_videos: list[list[Image.Image]],
-    file_prefix: str,
-):
-    # Save a single plot showing: original frame, predicted frame
-    # The predicted frame should be the same as the expected frame
-    import matplotlib.pyplot as plt
+    output_path: str,
+) -> str:
+    """
+    Save a comparison grid showing original and predicted frames side by side.
 
-    # Put all frames in a single grid (rows: samples, columns: frames; each cell: [original, predicted] subcolumns)
+    Args:
+        predicted_videos: List of predicted video frames per sample.
+        expected_videos: List of expected video frames per sample.
+        output_path: Full path where the comparison image will be saved.
+
+    Returns:
+        The output_path where the image was saved.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
     num_samples = len(predicted_videos)
     num_frames = len(predicted_videos[0]) if num_samples > 0 else 0
-    import numpy as np
 
     fig, axs = plt.subplots(
         num_samples, num_frames * 2, figsize=(num_frames * 2.5 * 2, num_samples * 2.5)
@@ -192,6 +205,8 @@ def save_comparison_images(
             axs[i, j * 2 + 1].axis("off")
 
     plt.tight_layout()
-    os.makedirs(file_prefix, exist_ok=True)
-    plt.savefig(f"{file_prefix}/comparison_grid.png")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path)
     plt.close(fig)
+    return output_path
+

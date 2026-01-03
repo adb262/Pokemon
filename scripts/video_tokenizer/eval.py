@@ -16,7 +16,8 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
 from loss.loss_fns import next_frame_reconstruction_loss
 from monitoring.frechet_distance import compute_frechet_distance
 from monitoring.setup_wandb import setup_wandb
-from monitoring.visualize_videos import convert_video_to_images, save_comparison_images
+from monitoring.videos import convert_video_to_images, save_comparison_images
+from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.tokenizer import VideoTokenizer
@@ -32,20 +33,24 @@ def eval_model(
     dataloader: PokemonOpenWorldLoader,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
-    epoch: int,
+    epoch: int | str,
     wandb_logger: Run,
     save_dir: str = "tokenization_results",
+    global_step: int | None = None,
 ):
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    selected_indices = [0, 10, 20, 30]
+    saved_image_paths: list[str] = []
 
     # Collect real and predicted next frames across the eval set
     real_next_frames_batches: list[torch.Tensor] = []
     pred_next_frames_batches: list[torch.Tensor] = []
 
-    os.makedirs(f"{save_dir}/eval/epoch_{epoch}", exist_ok=True)
+    eval_dir = f"{save_dir}/eval/epoch_{epoch}"
+    os.makedirs(eval_dir, exist_ok=True)
+    logger.info(f"Saving eval results to {eval_dir}")
+
     with torch.no_grad():
         for batch_idx, video_batch in enumerate(dataloader):
             video_batch = video_batch.to(device)
@@ -58,20 +63,23 @@ def eval_model(
                 real_next_frames_batches.append(video_batch.detach().cpu())
                 pred_next_frames_batches.append(decoded.detach().cpu())
 
-            if batch_idx in selected_indices:
-                # Save the image locally
-                # View as (b, num_frames, h, w, c)
-                # Decoded is the residual, must add the previous frame to get the predicted frame
-                predicted_videos = convert_video_to_images(decoded)
-                expected_videos = convert_video_to_images(video_batch)
-                save_comparison_images(
-                    predicted_videos, expected_videos, f"{save_dir}/epoch_{epoch}"
-                )
+            # Save the image locally
+            # View as (b, num_frames, h, w, c)
+            # Decoded is the residual, must add the previous frame to get the predicted frame
+            predicted_videos = convert_video_to_images(decoded)
+            expected_videos = convert_video_to_images(video_batch)
+            image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
+            save_comparison_images(predicted_videos, expected_videos, image_path)
+            saved_image_paths.append(image_path)
+            logger.info(f"Saved comparison image to {image_path}")
 
             total_loss += loss.item() * video_batch.size(0)
             total_samples += video_batch.size(0)
 
     avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+    logger.info(
+        f"Eval complete: avg_loss={avg_loss:.6f}, saved {len(saved_image_paths)} images"
+    )
 
     if real_next_frames_batches and pred_next_frames_batches:
         real_all = torch.cat(real_next_frames_batches, dim=0)
@@ -86,9 +94,26 @@ def eval_model(
         frechet_distance = float("inf")
 
     if wandb_logger:
-        wandb_logger.log(
-            {"eval/loss": avg_loss, "eval/frechet_distance": frechet_distance},
-            step=epoch,
+        # Use consistent metric names for plotting over time
+        log_dict: dict = {
+            "eval/loss": avg_loss,
+            "eval/frechet_distance": frechet_distance,
+            "eval/epoch": epoch if isinstance(epoch, int) else 0,
+        }
+
+        # Log with global_step if provided for proper x-axis alignment with training
+        if global_step is not None:
+            wandb_logger.log(log_dict, step=global_step)
+        else:
+            wandb_logger.log(log_dict)
+
+        # Log comparison images in batches of 5, stacked vertically
+        log_image_batches(
+            wandb_logger,
+            key_prefix="eval/comparison",
+            image_paths=saved_image_paths,
+            batch_size=5,
+            step=global_step,
         )
 
     return avg_loss
@@ -144,6 +169,7 @@ def main(config: VideoTokenizerTrainingConfig):
         local_cache=local_cache,
         limit=10000,
         image_size=config.image_size,
+        use_s3=config.use_s3,
     )
 
     logger.info("Setting up dataset...")
@@ -225,6 +251,7 @@ def main(config: VideoTokenizerTrainingConfig):
         device,
         epoch=0,
         wandb_logger=wandb_logger,
+        save_dir="eval_results",
     )
     logger.info(f"Test loss: {test_loss:.6f}")
 
@@ -234,8 +261,9 @@ def main(config: VideoTokenizerTrainingConfig):
             test_dataloader,
             criterion,
             device,
-            epoch="TEST_EVAL",  # type: ignore
+            epoch="TEST_EVAL",
             wandb_logger=wandb_logger,
+            save_dir="eval_results",
         )
         logger.info(f"Test loss: {eval_loss:.6f}")
 

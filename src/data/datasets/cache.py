@@ -1,6 +1,10 @@
+import logging
 import os
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class Cache:
@@ -12,13 +16,14 @@ class Cache:
         self.cache_dir = cache_dir
         self.hits = 0
         self.misses = 0
-        os.makedirs(self.cache_dir, exist_ok=True)
+        if cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
 
-    def get_cached_image_path(self, s3_key: str) -> str:
-        return s3_key.replace("/", "_").replace("\\", "_")
+    def get_cached_image_path(self, key: str) -> str:
+        return key.replace("\\", "_")
 
     def get(self, key: str) -> Image.Image | None:
-        path = f"{self.cache_dir}/{self.get_cached_image_path(key)}"
+        path = os.path.join(self.cache_dir, self.get_cached_image_path(key))
         if os.path.exists(path):
             self.hits += 1
             return Image.open(path)

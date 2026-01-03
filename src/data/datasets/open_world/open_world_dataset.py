@@ -25,7 +25,11 @@ class OpenWorldRunningDataset(Dataset):
         dataset: OpenWorldVideoLog,
         local_cache: Cache,
         image_size: int,
+        limit: int | None = None,
     ):
+        if limit is not None:
+            dataset = OpenWorldVideoLog(video_logs=dataset.video_logs[:limit])
+
         self.dataset = dataset
         self.local_cache = local_cache
         self.image_size = image_size

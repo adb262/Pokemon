@@ -8,7 +8,7 @@ Because many pairs of frames are the same, I modified the reconstruction loss to
 
 We can scrape a bunch of youtube videos with the following:
 ```
-python -m idm.data_collection.pokemon_dataset_pipeline --max-videos 10 --scrape --clean --extract
+python -m src.data.scraping.pokemon_dataset_pipeline --clean --extract --summary --extract --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
 ```
 Our end state is to have groups (starting with "pairs" i.e. group of 2) from which we can learn our latent actions. This means that we need to pair up frame x and frame x+1. Eventually, I will roll out support for larger groups, since the learning dynamics should be smoother.
 
@@ -24,6 +24,14 @@ Ablation results (see below):
 
 ![FSQ Ablation Results](public/fsq_ablation.png)
 
+## Training Video Tokenizer
+Local training
+```python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 2  --save_dir fsq_full_train --checkpoint_dir full_train --bins 8 8 6 5 --local_cache_dir ''```
+
+S3 
+```
+python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 2  --save_dir fsq_full_train --checkpoint_dir full_train --bins 8 8 6 5 --use_s3 true
+```
 
 ### TODOS:
 [] Flow Matching Transformer
@@ -45,6 +53,7 @@ X Move to single action per frame
 - When char is moving, everything should be moving. Filter to frames where the redisual is every frame or nothing
 - Use EMA codebook updates
 - Just look at center of the frames to determine action
+    - Can't bc some frames are un-croppsed
 - Dealing with codebook collapse now. Tried resetting but just collapses elsewhere. Might want to just focus on the center frame (only care about the char)
 - More homogeneous data
 - Emergence of no-action quantization. Successfully classifying when there is no action
@@ -57,3 +66,5 @@ The user interacts with this by dragging intervals over the spans of frames that
 
 Some thoughts:
 - Because the videos can be very long, we likely want to stream chunks of it in. We will not be able to show every single frame at once, and should just show windows. We need to be able to label large chunks of the video at once so that it is simple to go through many very large videos.
+
+

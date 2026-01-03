@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -38,6 +39,7 @@ class OpenWorldRunningDatasetCreator:
         local_cache: Cache,
         limit: int,
         image_size: int,
+        use_s3: bool,
     ):
         self.dataset_dir = dataset_dir
         self.num_frames_in_video = num_frames_in_video
@@ -45,6 +47,7 @@ class OpenWorldRunningDatasetCreator:
         self.local_cache = local_cache
         self.limit = limit
         self.image_size = image_size
+        self.use_s3 = use_s3
 
     def _get_or_create_dataset(
         self, train_percentage: float = 0.9
@@ -59,7 +62,7 @@ class OpenWorldRunningDatasetCreator:
                 self._load_existing_dataset(test_dataset_key),
             )
 
-        data = self._pull_dataset_from_s3(self.dataset_dir)
+        data = self._pull_dataset(self.dataset_dir)
         dataset = OpenWorldVideoLog(video_logs=data)
         train, test = train_test_split(
             dataset.video_logs, test_size=1 - train_percentage, random_state=42
@@ -120,6 +123,9 @@ class OpenWorldRunningDatasetCreator:
     def _load_image_locally(self, frame_path: str) -> Image.Image | None:
         return self.local_cache.get(frame_path)
 
+    def _load_metadata_locally(self, frame_path: str) -> FrameMetadata | None:
+        return FrameMetadata(**json.load(open(frame_path.replace(".png", ".json"))))
+
     @staticmethod
     def _load_image_from_s3(
         s3_manager: S3Manager, local_cache: Cache, s3_key: str
@@ -178,43 +184,74 @@ class OpenWorldRunningDatasetCreator:
         return chunked_frames_with_paths
 
     @staticmethod
-    def _get_frame_sequences(
+    def _get_valid_frame_sequences(
+        *,
+        frame_list: list[FrameWithPath],
+        progress_bar: tqdm,
+        limit: int,
+        num_frames_in_video: int,
+    ) -> list[OpenWorldVideoLogSingleton]:
+        if progress_bar.n >= limit:
+            return []
+
+        if len(frame_list) < num_frames_in_video:
+            return []
+
+        frames = filter_frame_sequence(frame_list, num_frames_in_video)
+        videos: list[OpenWorldVideoLogSingleton] = [
+            OpenWorldVideoLogSingleton(
+                video_log_paths=frame_sequence, video_id=frame_list[0].metadata.video_id
+            )
+            for frame_sequence in frames
+        ]
+        logger.info(f"Added {len(videos)} videos")
+        progress_bar.update(len(videos))
+        return videos
+
+    def _get_frame_sequences_from_local(
+        self,
+        frame_paths: list[str],
+        limit: int,
+        num_frames_in_video: int,
+        progress_bar: tqdm,
+    ) -> list[OpenWorldVideoLogSingleton]:
+        frame_with_paths: list[FrameWithPath] = []
+        metadata = [self._load_metadata_locally(path) for path in frame_paths]
+        images = [self._load_image_locally(path) for path in frame_paths]
+        for path, image, metadata in zip(frame_paths, images, metadata):
+            if image is not None and metadata is not None:
+                frame_with_paths.append(
+                    FrameWithPath(path=path, frame=image, metadata=metadata)
+                )
+
+        if not frame_with_paths:
+            return []
+
+        frames_with_paths = (
+            OpenWorldRunningDatasetCreator._get_chunked_frames_with_paths(
+                frame_with_paths,
+            )
+        )
+
+        all_videos = [
+            OpenWorldRunningDatasetCreator._get_valid_frame_sequences(
+                progress_bar=progress_bar,
+                limit=limit,
+                num_frames_in_video=num_frames_in_video,
+                frame_list=frames_with_paths,
+            )
+            for frames_with_paths in frames_with_paths
+        ]
+
+        return sum(all_videos, [])
+
+    def _get_frame_sequences_from_s3(
+        self,
         chunks: list[S3Frame],
         limit: int,
-        max_frame_sequence_length: int,
         num_frames_in_video: int,
         local_cache: Cache,
     ) -> list[OpenWorldVideoLogSingleton]:
-        videos: list[OpenWorldVideoLogSingleton] = []
-
-        def get_valid_frame_sequence(
-            frame_list: list[FrameWithPath], progress_bar: tqdm
-        ):
-            if len(videos) >= limit:
-                progress_bar.update(1)
-                return
-
-            if len(frame_list) > max_frame_sequence_length:
-                progress_bar.update(1)
-                raise ValueError(
-                    f"Frame sequence length is greater than {max_frame_sequence_length}"
-                )
-
-            if len(frame_list) < num_frames_in_video:
-                progress_bar.update(1)
-                return
-
-            frames = filter_frame_sequence(frame_list, num_frames_in_video)
-            for frame_sequence in frames:
-                videos.append(
-                    OpenWorldVideoLogSingleton(
-                        video_log_paths=frame_sequence,
-                        video_id=frame_list[0].metadata.video_id,
-                    )
-                )
-                logger.info(f"Added video with {len(frame_sequence)} frames")
-            progress_bar.update(1)
-
         with ThreadPoolExecutor(max_workers=10) as thread_executor:
             frame_paths = [path.obj_key for path in chunks]
             metadata_paths = [path.metadata_obj_key for path in chunks]
@@ -258,11 +295,94 @@ class OpenWorldRunningDatasetCreator:
                 desc=f"Processing {len(frames_with_paths)} frames with paths",
             )
 
-            partial_fn = partial(get_valid_frame_sequence, progress_bar=progress_bar)
+            partial_fn = partial(
+                OpenWorldRunningDatasetCreator._get_valid_frame_sequences,
+                progress_bar=progress_bar,
+                limit=limit,
+                num_frames_in_video=num_frames_in_video,
+            )
 
-            thread_executor.map(partial_fn, frames_with_paths)
+            videos = list(thread_executor.map(partial_fn, frames_with_paths))
 
-        return videos
+        return sum(videos, [])
+
+    def _pull_dataset(self, source_dir: str) -> list[OpenWorldVideoLogSingleton]:
+        if self.use_s3:
+            return self._pull_dataset_from_s3(source_dir)
+        else:
+            return self._pull_dataset_from_local(source_dir)
+
+    @staticmethod
+    def _unpack_directory(directory: str) -> list[str]:
+        # Frame files are in the format of frame_<frame_number>.png
+        if not os.path.isdir(directory):
+            return []
+
+        items = os.listdir(directory)
+        frame_items = [
+            os.path.join(directory, item) for item in items if item.endswith(".png")
+        ]
+        subdirectories = [
+            os.path.join(directory, item)
+            for item in items
+            if os.path.isdir(os.path.join(directory, item))
+        ]
+        for subdirectory in subdirectories:
+            frame_items.extend(
+                OpenWorldRunningDatasetCreator._unpack_directory(subdirectory)
+            )
+
+        return frame_items
+
+    def _pull_dataset_from_local(
+        self, source_dir: str
+    ) -> list[OpenWorldVideoLogSingleton]:
+        directories_to_process = os.listdir(source_dir)
+
+        all_videos: list[OpenWorldVideoLogSingleton] = []
+        progress_bar = tqdm(
+            total=self.limit,
+            desc=f"Processing {self.limit} frames with paths",
+        )
+        for directory in tqdm(
+            directories_to_process,
+            desc=f"Processing {len(directories_to_process)} directories",
+        ):
+            frames = sorted(
+                OpenWorldRunningDatasetCreator._unpack_directory(
+                    os.path.join(source_dir, directory)
+                )
+            )
+            chunks: list[list[str]] = [
+                frames[i : i + self.frame_chunk_size]
+                for i in range(0, len(frames), self.frame_chunk_size)
+            ]
+
+            # with Pool(2) as process_executor:
+            #     partial_fn = partial(
+            #         self._get_frame_sequences_from_local,
+            #         limit=self.limit,
+            #         num_frames_in_video=self.num_frames_in_video,
+            #         progress_bar=progress_bar,
+            #     )
+            #     videos = process_executor.map(partial_fn, chunks)
+            #     logger.info(f"Found {len(videos)} videos")
+
+            #     all_videos.extend(sum(videos, []))
+
+            for frame_path in chunks:
+                all_videos.extend(
+                    self._get_frame_sequences_from_local(
+                        frame_paths=frame_path,
+                        limit=self.limit,
+                        num_frames_in_video=self.num_frames_in_video,
+                        progress_bar=progress_bar,
+                    )
+                )
+                if len(all_videos) >= self.limit:
+                    break
+
+        return all_videos
 
     def _pull_dataset_from_s3(
         self, source_dir: str
@@ -285,9 +405,8 @@ class OpenWorldRunningDatasetCreator:
 
             with Pool(10) as process_executor:
                 partial_fn = partial(
-                    self._get_frame_sequences,
+                    self._get_frame_sequences_from_s3,
                     limit=self.limit,
-                    max_frame_sequence_length=self.max_frame_sequence_length,
                     num_frames_in_video=self.num_frames_in_video,
                     local_cache=self.local_cache,
                 )
