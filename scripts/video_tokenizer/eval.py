@@ -20,7 +20,7 @@ from monitoring.videos import convert_video_to_images, save_comparison_images
 from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
-from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 from wandb.wandb_run import Run
 
