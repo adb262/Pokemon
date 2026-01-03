@@ -73,3 +73,12 @@ Some thoughts:
 ```
 python -m scripts.data.sync_dataset_to_s3 --source pokemon_frames/pokemon_emerald_train_0_9_5_frames.json --bucket [bucket_name] --verbose
 ```
+
+## Observations
+
+### Latent Action Model
+During training, the easiest way to minimize the loss early is to just regurgitate the previous frame. Over time, this transitions to learning a sort of middle ground between the previous and next frame. This manifests as somewhat of a motion blur, where you see the previous frame and the current frame together. Below is an example of this phenomena. This is from epoch 50 over a dataset of only 100 frame transitions
+
+![FSQ Ablation Results](public/lam_frame_blurring.png)
+
+Eventually we overfit and learn the exact next frame. I am working on experiments of this at scale.
