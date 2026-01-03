@@ -15,7 +15,8 @@ def _get_inception_model(device: torch.device) -> nn.Module:
     Uses lru_cache to avoid reloading the model multiple times.
     """
     inception = models.inception_v3(weights=models.Inception_V3_Weights.IMAGENET1K_V1)
-    inception.fc = nn.Identity()  # Remove final classification layer
+
+    inception.fc = nn.Identity()  # type: ignore
     inception.eval()
     inception.to(device)
     return inception
