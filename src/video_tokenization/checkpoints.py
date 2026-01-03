@@ -5,7 +5,7 @@ import torch
 import torch.optim as optim
 
 from video_tokenization.create_tokenizer import create_model
-from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 
 logger = logging.getLogger(__name__)

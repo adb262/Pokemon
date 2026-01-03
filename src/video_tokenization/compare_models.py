@@ -14,7 +14,7 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
 from monitoring.frechet_distance import compute_frechet_distance
 from monitoring.videos import convert_video_to_images
 from video_tokenization.checkpoints import load_model_from_checkpoint
-from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,7 @@ def build_dataloaders(
         local_cache=local_cache,
         limit=max(num_eval_samples, 1000),
         image_size=config.image_size,
+        use_s3=config.use_s3,
     )
 
     train_dataset_raw, test_dataset_raw = dataset_creator.setup(train_percentage=0.9)

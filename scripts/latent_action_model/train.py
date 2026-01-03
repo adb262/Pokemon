@@ -22,7 +22,7 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
 from data.s3.s3_utils import S3Manager, default_s3_manager
-from latent_action_model.latent_action_vq_vae import LatentActionVQVAE
+from latent_action_model.model import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
 from loss.loss_fns import next_frame_reconstruction_loss
 from monitoring.videos import (
