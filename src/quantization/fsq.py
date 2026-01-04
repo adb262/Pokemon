@@ -76,21 +76,21 @@ class FiniteScalarQuantizer(BaseQuantizer):
         logger.debug(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
         return quantized / half_width
 
-    def _scale_and_shift(self, zhat_normalized):
+    def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
         levels = self._levels_np
         half_width = levels // 2  # type: ignore[operator]
         return (zhat_normalized * half_width) + half_width
 
-    def _scale_and_shift_inverse(self, zhat):
+    def _scale_and_shift_inverse(self, zhat: torch.Tensor) -> torch.Tensor:
         levels = self._levels_np
         half_width = levels // 2  # type: ignore[operator]
         return (zhat - half_width) / half_width
 
-    def codes_to_indexes(self, zhat):
+    def quantized_value_to_codes(self, zhat: torch.Tensor) -> torch.Tensor:
         """Converts a ‘code‘ to an index in the codebook."""
         assert zhat.shape[-1] == len(self._levels)
         zhat = self._scale_and_shift(zhat)  # type: ignore[arg-type]
-        return (zhat * self._basis).sum(dim=-1).to(torch.uint32)
+        return (zhat * self._basis).sum(dim=-1).to(torch.uint32)  # type: ignore[arg-type]
 
     def indexes_to_codes(self, indices: torch.Tensor):
         """Inverse of ‘indexes_to_codes‘."""
@@ -103,7 +103,7 @@ class FiniteScalarQuantizer(BaseQuantizer):
         codes_non_centered = torch.fmod(div, long_levels)  # type: ignore[arg-type]
         return self._scale_and_shift_inverse(codes_non_centered)
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: [B, T, P, L]
         return self.quantize(z)
 

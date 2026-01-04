@@ -179,10 +179,14 @@ class VideoTokenizer(nn.Module):
             embedding_dim=len(bins),
         )
 
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(x)
+
+    def quantized_value_to_codes(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fsq.quantized_value_to_codes(x)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fsq(self.encoder(x))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(x)
-
-        x = self.fsq(x)
-
-        x = self.decoder(x)
-        return x
+        return self.decode(self.encode(x))

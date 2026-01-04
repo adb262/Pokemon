@@ -57,6 +57,8 @@ X Move to single action per frame
 - Dealing with codebook collapse now. Tried resetting but just collapses elsewhere. Might want to just focus on the center frame (only care about the char)
 - More homogeneous data
 - Emergence of no-action quantization. Successfully classifying when there is no action
+- Test out JEPA style learning
+- Test out DiT
 
 
 Create streamlit for labeling images as valid or invalid. Highlight spans over a low calibre preview of an entire video

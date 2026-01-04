@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VideoTokenizerTrainingConfig:
+    dataset_train_key: Optional[str]
     image_size: int = 256
     patch_size: int = 8
     batch_size: int = 1

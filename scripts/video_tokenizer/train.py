@@ -216,18 +216,25 @@ def main(config: VideoTokenizerTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
-        num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_50000.json",
-        local_cache=local_cache,
-        limit=50000,
-        image_size=config.image_size,
-        use_s3=config.use_s3,
-    )
+    if config.dataset_train_key is None:
+        dataset_creator = OpenWorldRunningDatasetCreator(
+            dataset_dir=config.frames_dir,
+            num_frames_in_video=config.num_images_in_video,
+            output_log_json_file_name="log_dir_50000.json",
+            local_cache=local_cache,
+            limit=50000,
+            image_size=config.image_size,
+            use_s3=config.use_s3,
+        )
 
-    logger.info("Setting up dataset...")
-    train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+        logger.info("Setting up dataset...")
+        train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+    else:
+        test_key = config.dataset_train_key.replace("train", "test")
+        train_dataset = OpenWorldRunningDatasetCreator.load_existing_dataset(
+            config.dataset_train_key
+        )
+        test_dataset = OpenWorldRunningDatasetCreator.load_existing_dataset(test_key)
 
     train_dataset = OpenWorldRunningDataset(
         dataset=train_dataset,

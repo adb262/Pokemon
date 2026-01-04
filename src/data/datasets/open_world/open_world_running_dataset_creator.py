@@ -58,8 +58,8 @@ class OpenWorldRunningDatasetCreator:
         logger.info(f"Test dataset key: {test_dataset_key}")
         if os.path.exists(train_dataset_key) and os.path.exists(test_dataset_key):
             return (
-                self._load_existing_dataset(train_dataset_key),
-                self._load_existing_dataset(test_dataset_key),
+                self.load_existing_dataset(train_dataset_key),
+                self.load_existing_dataset(test_dataset_key),
             )
 
         data = self._pull_dataset(self.dataset_dir)
@@ -109,8 +109,8 @@ class OpenWorldRunningDatasetCreator:
         formatted_split = str(split).replace(".", "_")
         return f"{self.dataset_dir}_{stage}_{formatted_split}_{self.num_frames_in_video}_frames.json"
 
-    def _load_existing_dataset(
-        self,
+    @staticmethod
+    def load_existing_dataset(
         key: str,
     ) -> OpenWorldVideoLog:
         with open(key, "r") as f:

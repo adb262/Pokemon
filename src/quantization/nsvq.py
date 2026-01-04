@@ -274,8 +274,8 @@ class NSVQ(BaseQuantizer):
             input_data.shape[0], self.num_embeddings, device=input_data.device
         )
         encodings.scatter_(1, min_indices.reshape([-1, 1]), 1)
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
+        # avg_probs = torch.mean(encodings, dim=0)
+        # perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
 
         with torch.no_grad():
             min_indices_cpu = min_indices.cpu()
@@ -288,12 +288,18 @@ class NSVQ(BaseQuantizer):
 
         quantized_input = self.decode(quantized_input, batch_size)
         logger.debug(f"Used codebooks: {self.codebooks_used.cpu().numpy()}")
-        return (
-            quantized_input,
-            perplexity,
-            self.codebooks_used.cpu().numpy(),
-            min_indices.reshape(batch_size, -1),
+        return quantized_input
+
+    def quantized_value_to_codes(self, quantized_value: torch.Tensor) -> torch.Tensor:
+        quantized_value = quantized_value.reshape(-1, self.embedding_dim)
+
+        distances = (
+            torch.sum(quantized_value**2, dim=1, keepdim=True)
+            - 2 * (torch.matmul(quantized_value, self.codebooks.t()))
+            + torch.sum(self.codebooks.t() ** 2, dim=0, keepdim=True)
         )
+
+        return torch.argmin(distances, dim=1)
 
     def replace_unused_codebooks(self, num_batches):
         """
