@@ -15,7 +15,7 @@ logger.setLevel(logging.INFO)
 def save_checkpoint(
     model: VideoTokenizer,
     optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    scheduler: optim.lr_scheduler.LRScheduler,
     epoch: int,
     batch_idx: int,
     loss: float,
@@ -45,9 +45,9 @@ def load_checkpoint(
     checkpoint_path: str,
     model: VideoTokenizer,
     optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    scheduler: optim.lr_scheduler.LRScheduler,
     device: torch.device,
-) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.CosineAnnealingLR]:
+) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.LRScheduler]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

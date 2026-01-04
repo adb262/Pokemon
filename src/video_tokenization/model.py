@@ -1,5 +1,6 @@
 import logging
 
+from torch_utilities.initialize import init_weights
 import torch
 import torch.nn as nn
 
@@ -54,6 +55,7 @@ class VideoTokenizerEncoder(nn.Module):
         )
 
         self.latent_projection = nn.Linear(d_model, embedding_dim)
+        init_weights(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is of shape (batch_size, num_images_in_video, c, h, w)

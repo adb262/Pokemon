@@ -1,5 +1,6 @@
 import logging
 import random
+import traceback
 
 import numpy as np
 import torch
@@ -61,20 +62,27 @@ class OpenWorldRunningDataset(Dataset):
 
         return len(self.dataset.video_logs)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+
+    def __getitem__(self, idx: int) -> torch.Tensor | None:
         if self.dataset is None:
             raise ValueError("Dataset not loaded")
 
         video_paths = self.dataset.video_logs[idx].video_log_paths
 
-        # At this point, all images are loaded
-        video = [self._load_image_locally(frame_path) for frame_path in video_paths]
-        if any(video is None for video in video):
-            raise ValueError("Failed to load video")
+        try:
+            # At this point, all images should be loaded
+            video = [self._load_image_locally(frame_path) for frame_path in video_paths]
+            if any(video is None for video in video):
+                raise ValueError("Failed to load video")
 
-        video_tensors = [self._preprocess_image(x) for x in video if x is not None]
+            # Type checker doesn't pick up that video elements are not None
+            video_tensors = [self._preprocess_image(x) for x in video] # type: ignore
 
-        out = torch.stack(video_tensors)
-        logger.debug(f"Out shape: {out.shape}")
+            out = torch.stack(video_tensors)
+            logger.debug(f"Out shape: {out.shape}")
 
-        return out
+            return out
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Error loading video: {e}")
+            return None

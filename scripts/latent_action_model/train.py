@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from monitoring.setup_wandb import setup_wandb
 import torch
 import torch.optim as optim
 import tyro
@@ -562,26 +563,6 @@ def train_epoch(
     return avg_loss
 
 
-def setup_wandb(config: VideoTrainingConfig):
-    """Initialize Weights & Biases logging"""
-    if not config.use_wandb:
-        return None
-
-    # Initialize wandb
-    wandb.init(
-        project=config.wandb_project,
-        group="video-vqvae-test",
-        entity=config.wandb_entity,
-        name=config.experiment_name,
-        tags=config.wandb_tags,
-        notes=config.wandb_notes,
-        config=config.__dict__,
-    )
-
-    # Watch the model for gradients and parameters
-    return wandb
-
-
 def main(config: VideoTrainingConfig):
     """Main training function with resumable training support and S3 integration"""
 
@@ -591,7 +572,15 @@ def main(config: VideoTrainingConfig):
         config.experiment_name = f"pokemon_vqvae_{timestamp}"
 
     # Setup wandb
-    wandb_logger = setup_wandb(config)
+    wandb_logger = setup_wandb(
+        project=config.wandb_project,
+        group="latent-action-model-test",
+        entity=config.wandb_entity,
+        name=config.experiment_name,
+        tags=config.wandb_tags or [],
+        notes=config.wandb_notes or "",
+        config=config.__dict__,
+    )
 
     logger.info(
         f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}"
