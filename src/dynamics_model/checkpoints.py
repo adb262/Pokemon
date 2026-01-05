@@ -6,7 +6,7 @@ import torch
 import torch.optim as optim
 
 from dynamics_model.training_args import DynamicsModelTrainingConfig
-from transformers.mask_git import DynamicsModel
+from dynamics_model.model import DynamicsModel
 
 logging.basicConfig(
     level=logging.INFO,

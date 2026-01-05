@@ -131,7 +131,9 @@ def _calculate_frechet_distance(
     diff = mu1 - mu2
 
     # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    # Add a small offset to the covariance matrices to improve numerical stability
+    offset = np.eye(sigma1.shape[0]) * eps
+    covmean, _ = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset), disp=False)
 
     # Numerical error might give slight imaginary component
     if np.iscomplexobj(covmean):

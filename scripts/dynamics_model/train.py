@@ -3,11 +3,13 @@ import logging
 import os
 import time
 from datetime import datetime
+import traceback
 
 import torch
 import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+import wandb
 
 from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
 from data.datasets.cache import Cache
@@ -70,7 +72,7 @@ def evaluate_model(
 
             try:
                 video_batch = video_batch.to(device)
-                _, token_loss, action_loss = model(video_batch)
+                decoded, token_loss, action_loss = model(video_batch)
 
                 total_token_loss += token_loss.item() * video_batch.size(0)
                 total_action_loss += action_loss.item() * video_batch.size(0)
@@ -78,12 +80,12 @@ def evaluate_model(
 
                 # Get reconstructed video from action model for FID/FVD
                 # The action model reconstructs frames 1:T from frames 0:T-1
-                action_encoded = model.action_model.encode(video_batch)
+                action_encoded, patched_video_from_action_embedder = model.action_model.encode(video_batch)
                 action_tokens = model.action_model.get_action_sequence(action_encoded)
-                reconstructed_video = model.action_model.decode(action_tokens)
+                reconstructed_video = model.action_model.decode(action_encoded, patched_video_from_action_embedder)
 
                 # Real target frames: video[:, 1:, :, :, :]
-                real_target_frames = video_batch[:, 1:, :, :, :]
+                real_target_frames = video_batch
                 real_frames_batches.append(real_target_frames.detach().cpu())
                 pred_frames_batches.append(reconstructed_video.detach().cpu())
 
@@ -97,10 +99,18 @@ def evaluate_model(
                     expected_videos,
                     image_path,
                 )
+
+                # Log comparison image to wandb
+                if wandb_logger:
+                    wandb_logger.log(
+                        {f"eval/comparison_{batch_idx}": wandb.Image(image_path)},
+                        step=global_step,
+                    )
                 saved_image_paths.append(image_path)
                 logger.debug(f"Saved comparison image to {image_path}")
 
             except Exception as e:
+                traceback.print_exc()
                 logging.warning(f"Error in evaluation batch {batch_idx}: {e}")
                 continue
 
@@ -187,7 +197,7 @@ def train_epoch(
     config: DynamicsModelTrainingConfig,
     wandb_logger,
     start_batch: int = 0,
-    save_dir: str = "mask_git_results",
+    save_dir: str = "dynamics_model_results",
 ):
     """Train for one epoch"""
     total_loss = 0.0
@@ -203,7 +213,7 @@ def train_epoch(
     os.makedirs(f"{save_dir}/train/epoch_{epoch}", exist_ok=True)
 
     epoch_start_time = time.time()
-    action_loss, token_loss = [], []
+    action_loss_acc, token_loss_acc = [], []
 
     for batch_idx, video_batch in enumerate(train_dataloader):
         # Skip batches if resuming
@@ -221,8 +231,8 @@ def train_epoch(
         # Backward pass (accumulate gradients)
         token_loss.backward()
         action_loss.backward()
-        token_loss.append(token_loss.item())
-        action_loss.append(action_loss.item())
+        token_loss_acc.append(token_loss.item())
+        action_loss_acc.append(action_loss.item())
 
         # Only step optimizer after accumulating enough gradients
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -244,8 +254,8 @@ def train_epoch(
             dynamics_optimizer.zero_grad()
             action_optimizer.zero_grad()
 
-            avg_token_loss = sum(token_loss) / len(token_loss)
-            avg_action_loss = sum(action_loss) / len(action_loss)
+            avg_token_loss = sum(token_loss_acc) / len(token_loss_acc)
+            avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
             total_loss = avg_token_loss + avg_action_loss
 
             batch_time = time.time() - batch_start_time
@@ -277,7 +287,7 @@ def train_epoch(
                     f"LR: {current_lr:.2e}, Time: {batch_time:.2f}s"
                 )
 
-            action_loss, token_loss = [], []
+            action_loss_acc, token_loss_acc = [], []
 
             # Save checkpoint periodically
             optimizer_step = batch_idx // accumulation_steps

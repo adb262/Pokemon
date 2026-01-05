@@ -74,7 +74,13 @@ def load_model_from_checkpoint(
             setattr(config, key, value)
 
     model = create_model(config)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if missing:
+        # Optionally print or log for debugging
+        logger.warning(f"Missing keys when loading model checkpoint: {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys when loading model checkpoint: {unexpected}")
+
     model.to(device)
     model.eval()
 

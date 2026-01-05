@@ -198,7 +198,7 @@ class VideoTokenizer(nn.Module):
         return x
 
     def mask_codebook_tokens(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        x[mask] = self.fsq.mask_token_idx
+        x[mask] = torch.tensor(self.fsq.mask_token_idx, dtype=torch.long, device=x.device)
         return x
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:

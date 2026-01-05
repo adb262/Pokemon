@@ -3,7 +3,7 @@ import logging
 
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.model import LatentActionVQVAE
-from transformers.mask_git import DynamicsModel
+from dynamics_model.model import DynamicsModel
 from video_tokenization.model import VideoTokenizer
 
 logging.basicConfig(
