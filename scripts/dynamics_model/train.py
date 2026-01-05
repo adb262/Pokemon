@@ -92,12 +92,14 @@ def evaluate_model(
                 # Save comparison images
                 predicted_videos = convert_video_to_images(reconstructed_video)
                 expected_videos = convert_video_to_images(real_target_frames)
-                image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
+                batch_dir = f"{eval_dir}/batch_{batch_idx}"
+                os.makedirs(batch_dir, exist_ok=True)
+                image_path = f"{batch_dir}/next_frame_comparison_grid.png"
                 save_comparison_images_next_frame(
                     predicted_videos,
                     action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
                     expected_videos,
-                    image_path,
+                    batch_dir,
                 )
 
                 # Log comparison image to wandb
@@ -121,35 +123,29 @@ def evaluate_model(
         total_action_loss / total_samples if total_samples > 0 else float("inf")
     )
 
-    # Compute FID and FVD
-    frechet_distance = float("inf")
-    fvd_score = float("inf")
-
+    frechet_metrics = {}
     if real_frames_batches and pred_frames_batches:
-        real_all = torch.cat(real_frames_batches, dim=0)
+        real_all = torch.cat(real_frames_batches, dim=0)[:, 1:, :, :, :]
         pred_all = torch.cat(pred_frames_batches, dim=0)
 
         # Compute FID (Frechet Inception Distance) - frame-level metric
         logger.info(f"Computing FID between {real_all.shape} and {pred_all.shape}")
         t = time.time()
-        try:
-            frechet_distance = compute_frechet_distance(real_all, pred_all)
-            logger.info(
-                f"FID computed in {time.time() - t:.2f} seconds: {frechet_distance:.4f}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to compute FID: {e}")
-
+        frechet_distance = compute_frechet_distance(real_all, pred_all)
+        logger.info(
+            f"FID computed in {time.time() - t:.2f} seconds: {frechet_distance:.4f}"
+        )
         # Compute FVD (Frechet Video Distance) - video-level metric
         logger.info(f"Computing FVD between {real_all.shape} and {pred_all.shape}")
         t = time.time()
-        try:
-            fvd_score = compute_fvd(real_all, pred_all)
-            logger.info(
-                f"FVD computed in {time.time() - t:.2f} seconds: {fvd_score:.4f}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to compute FVD: {e}")
+        fvd_score = compute_fvd(real_all, pred_all)
+        logger.info(
+            f"FVD computed in {time.time() - t:.2f} seconds: {fvd_score:.4f}"
+        )
+        frechet_metrics = {
+            "eval/fid": frechet_distance,
+            "eval/fvd": fvd_score,
+        }
 
     logger.info(
         f"Eval complete: token_loss={avg_token_loss:.6f}, action_loss={avg_action_loss:.6f}, "
@@ -162,9 +158,8 @@ def evaluate_model(
             "eval/token_loss": avg_token_loss,
             "eval/action_loss": avg_action_loss,
             "eval/total_loss": avg_token_loss + avg_action_loss,
-            "eval/fid": frechet_distance,
-            "eval/fvd": fvd_score,
             "eval/epoch": epoch,
+            **frechet_metrics,
         }
         wandb_logger.log(log_dict, step=global_step)
 

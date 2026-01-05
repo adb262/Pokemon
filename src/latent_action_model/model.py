@@ -127,7 +127,7 @@ class LatentActionVQVAE(nn.Module):
         )
 
         params = sum(p.numel() for p in self.parameters())
-        logger.info(f"LatentActionVQVAE initialized. Num params: {params}")
+        logger.debug(f"LatentActionVQVAE initialized. Num params: {params}")
         init_weights(self)
 
     def decode(self, quantized: torch.Tensor, patch_video_for_decoder: torch.Tensor) -> torch.Tensor:
@@ -170,19 +170,19 @@ class LatentActionVQVAE(nn.Module):
 
         # quantized, indices, commitment_loss = self.quantizer(action_continuous)
         logger.debug(f"quantized shape: {quantized.shape}")
-        logger.info(f"quantized values: {quantized}")
+        logger.debug(f"quantized values: {quantized}")
         return quantized, patched_video_from_embedder
 
     def project_quantized_actions_fsq(self, quantized: torch.Tensor, patched_video_from_embedder: torch.Tensor) -> torch.Tensor:
         # Project the quantized action to the d_model space
         action_projected = self.action_projection(quantized)
-        logger.info(f"action_projected shape: {action_projected.shape}")
+        logger.debug(f"action_projected shape: {action_projected.shape}")
 
         return patched_video_from_embedder[:, :-1, :, :] + action_projected.unsqueeze(2)
 
     def project_quantized_actions_nsvq(self, quantized: torch.Tensor, patched_video_from_embedder: torch.Tensor) -> torch.Tensor:
         # quantized, indices, commitment_loss = self.quantizer(action_continuous)
-        logger.info(f"quantized shape: {quantized.shape}")
+        logger.debug(f"quantized shape: {quantized.shape}")
 
         actions = rearrange(
             quantized,

@@ -1,4 +1,4 @@
-# python -m src.video_tokenization.train --use_s3 true --frames_dir pokemon --seed_cache --num_images_in_video 2 --batch_size 2
+# python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 16 --save_dir fsq_tokenizer_2k_128_4_512_8_heads_4_layers --bins 8 8 6 5 --use_s3 --dataset_train_key pokemon_emerald_train_0_9_5_frames.json --checkpoint_dir fsq_tokenizer_2k_128_4_512_8_heads_4_layers --patch_size 4 --image_size 128 --d_model 512 --num_heads 8 --num_transformer_layers 4 --num_epochs 20
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import logging

@@ -102,8 +102,8 @@ class DynamicsModel(nn.Module):
         # targets is of shape (batch_size, num_images_in_video, num_patches)
         x = self.tokenizer_embedding(targets.long())
         action_embeddings = self.action_embedding(action_tokens.long())
-        logger.info(f"action_embeddings shape: {action_embeddings.shape}")
-        logger.info(f"x shape: {x.shape}")
+        logger.debug(f"action_embeddings shape: {action_embeddings.shape}")
+        logger.debug(f"x shape: {x.shape}")
 
         # Unsqueeze to add to each patch in the sequence
         x[:, :-1, :] += action_embeddings.unsqueeze(2)
@@ -120,10 +120,10 @@ class DynamicsModel(nn.Module):
         original_targets[:, 1:, :][~mask] = torch.tensor(-100, dtype=torch.long, device=original_targets.device)  # ~mask is proper boolean NOT here
 
         # View both as 3d tensors for the loss function
-        logger.info(f"x shape: {x.shape}, targets shape: {targets.shape}")
+        logger.debug(f"x shape: {x.shape}, targets shape: {targets.shape}")
         predicted_tokens = rearrange(x[:, 1:, :, :], "b t p d -> b (t p) d")
         target_tokens = rearrange(original_targets[:, 1:, :], "b t p -> b (t p)")
-        logger.info(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
+        logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
         token_loss = self.token_loss_fn(predicted_tokens.transpose(1, 2), target_tokens)
 
         return x, token_loss, action_loss

@@ -1,3 +1,4 @@
+import logging
 import math
 from functools import lru_cache
 
@@ -7,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy import linalg
 from torchvision import models, transforms
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # FID (Frechet Inception Distance) - Image-based metric
@@ -25,6 +28,23 @@ def _get_inception_model(device: torch.device) -> nn.Module:
     inception.eval()
     inception.to(device)
     return inception
+
+
+def _sanitize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    """Replace NaN/Inf values to keep downstream metrics finite."""
+    if not torch.isfinite(tensor).all():
+        logger.warning("Found non-finite values in %s; replacing with finite defaults", name)
+    return torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _filter_nonfinite_features(features: torch.Tensor, name: str) -> torch.Tensor:
+    """Drop feature rows that still contain NaN/Inf after sanitization."""
+    mask = torch.isfinite(features).all(dim=1)
+    if not mask.all():
+        dropped = (~mask).sum().item()
+        logger.warning("Dropping %d/%d %s feature vectors containing NaN/Inf", dropped, features.shape[0], name)
+        features = features[mask]
+    return features
 
 
 def _get_inception_transforms() -> transforms.Compose:
@@ -210,8 +230,8 @@ def compute_frechet_distance(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Convert to float and detach
-    real = real.detach().float()
-    fake = fake.detach().float()
+    real = _sanitize_tensor(real.detach().float(), "real")
+    fake = _sanitize_tensor(fake.detach().float(), "fake")
 
     # Handle video input by converting to frames
     if real.dim() == 5:
@@ -231,6 +251,14 @@ def compute_frechet_distance(
     # Extract features
     real_features = _extract_inception_features(real, model, transform, batch_size)
     fake_features = _extract_inception_features(fake, model, transform, batch_size)
+
+    # Remove any remaining invalid feature rows
+    real_features = _filter_nonfinite_features(real_features, "real")
+    fake_features = _filter_nonfinite_features(fake_features, "fake")
+
+    if real_features.shape[0] < 2 or fake_features.shape[0] < 2:
+        logger.warning("Not enough valid features for FID (real=%d, fake=%d); returning inf", real_features.shape[0], fake_features.shape[0])
+        return math.inf
 
     # Compute statistics
     mu_real, sigma_real = _compute_statistics(real_features)
@@ -457,8 +485,8 @@ def compute_fvd(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Convert to float and detach
-    real = real.detach().float()
-    fake = fake.detach().float()
+    real = _sanitize_tensor(real.detach().float(), "real")
+    fake = _sanitize_tensor(fake.detach().float(), "fake")
 
     # Ensure correct format [B, T, C, H, W]
     real = _ensure_video_format(real)
@@ -475,6 +503,18 @@ def compute_fvd(
     # Extract features
     real_features = _extract_i3d_features(real, model, transform, batch_size)
     fake_features = _extract_i3d_features(fake, model, transform, batch_size)
+
+    # Remove any remaining invalid feature rows
+    real_features = _filter_nonfinite_features(real_features, "real (video)")
+    fake_features = _filter_nonfinite_features(fake_features, "fake (video)")
+
+    if real_features.shape[0] < 2 or fake_features.shape[0] < 2:
+        logger.warning(
+            "Not enough valid features for FVD (real=%d, fake=%d); returning inf",
+            real_features.shape[0],
+            fake_features.shape[0],
+        )
+        return math.inf
 
     # Compute statistics (reuse from FID)
     mu_real, sigma_real = _compute_statistics(real_features)
