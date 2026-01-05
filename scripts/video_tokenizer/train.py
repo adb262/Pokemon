@@ -103,12 +103,16 @@ def train_epoch(
             optimizer.zero_grad()
 
             # Calculate average loss over accumulated steps
-            avg_accumulated_loss = accumulated_loss / min(accumulation_steps, (batch_idx % accumulation_steps) + 1)
+            avg_accumulated_loss = accumulated_loss / min(
+                accumulation_steps, (batch_idx % accumulation_steps) + 1
+            )
             total_loss += avg_accumulated_loss
             batch_time = time.time() - batch_start_time
 
             # Calculate global step (counts optimizer steps, not batches)
-            global_step = epoch * (num_batches // accumulation_steps) + (batch_idx // accumulation_steps)
+            global_step = epoch * (num_batches // accumulation_steps) + (
+                batch_idx // accumulation_steps
+            )
 
             # Log to wandb with system metrics
             wandb_metrics = {
@@ -143,10 +147,10 @@ def train_epoch(
 
                 predicted_videos = convert_video_to_images(decoded)
                 expected_videos = convert_video_to_images(video_batch)
-                comparison_path = (
-                    f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
+                comparison_path = f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
+                save_comparison_images(
+                    predicted_videos, expected_videos, comparison_path
                 )
-                save_comparison_images(predicted_videos, expected_videos, comparison_path)
 
                 # Log comparison image to wandb
                 wandb_logger.log(
@@ -196,7 +200,7 @@ def train_epoch(
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
     )
-    return avg_loss
+    return avg_loss, global_step
 
 
 def main(config: VideoTokenizerTrainingConfig):
@@ -241,7 +245,7 @@ def main(config: VideoTokenizerTrainingConfig):
         max_size=config.max_cache_size,
         cache_dir=config.local_cache_dir,
     )
-    
+
     dataset_creator = OpenWorldRunningDatasetCreator(
         dataset_dir=config.frames_dir,
         num_frames_in_video=config.num_images_in_video,
@@ -256,10 +260,10 @@ def main(config: VideoTokenizerTrainingConfig):
         train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
     else:
         logger.info(f"Loading dataset from {config.dataset_train_key}")
-        train_dataset = dataset_creator.load_existing_dataset(
-            config.dataset_train_key
+        train_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key)
+        test_dataset = dataset_creator.load_existing_dataset(
+            config.dataset_train_key.replace("train", "test")
         )
-        test_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key.replace("train", "test"))
 
         if config.sync_from_s3:
             logger.info("Syncing dataset from S3...")
@@ -327,7 +331,8 @@ def main(config: VideoTokenizerTrainingConfig):
         )
         wandb_logger.log(
             {
-                "config/effective_batch_size": config.batch_size * config.gradient_accumulation_steps,
+                "config/effective_batch_size": config.batch_size
+                * config.gradient_accumulation_steps,
                 "config/gradient_accumulation_steps": config.gradient_accumulation_steps,
             },
             commit=False,
@@ -356,7 +361,7 @@ def main(config: VideoTokenizerTrainingConfig):
     steps_per_epoch = len(train_dataloader) // config.gradient_accumulation_steps
     total_steps = config.num_epochs * steps_per_epoch
     warmup_steps = config.warmup_steps
-    
+
     # Linear warmup from 0 to learning_rate over warmup_steps
     warmup_scheduler = LinearLR(
         optimizer,
@@ -364,21 +369,21 @@ def main(config: VideoTokenizerTrainingConfig):
         end_factor=1.0,
         total_iters=warmup_steps,
     )
-    
+
     # Cosine annealing for the remaining steps
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
         T_max=total_steps - warmup_steps,
         eta_min=config.min_learning_rate,
     )
-    
+
     # Combine warmup + cosine annealing
     scheduler = SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_steps],
     )
-    
+
     logger.info(f"Warmup steps: {warmup_steps}")
 
     # Log effective batch size
@@ -401,7 +406,6 @@ def main(config: VideoTokenizerTrainingConfig):
     best_loss = float("inf")
 
     # first, evaluate on test dataset
-    num_batches = len(train_dataloader)
     test_loss = eval_model(
         model,
         test_dataloader,
@@ -419,7 +423,7 @@ def main(config: VideoTokenizerTrainingConfig):
         for epoch in range(start_epoch, config.num_epochs):
             epoch_start_batch = start_batch if epoch == start_epoch else 0
 
-            avg_loss = train_epoch(
+            avg_loss, global_step = train_epoch(
                 model,
                 train_dataloader,
                 test_dataloader,
@@ -442,7 +446,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 epoch,
                 wandb_logger=wandb_logger,
                 save_dir=config.save_dir,
-                global_step=(epoch + 1) * num_batches,
+                global_step=global_step,
             )
             logger.info(f"Test loss: {eval_loss:.6f}")
 

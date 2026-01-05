@@ -20,6 +20,7 @@ logger.setLevel(logging.INFO)
 
 class LatentActionVQVAE(nn.Module):
     quantizer: BaseQuantizer
+    action_vocab_size: int
 
     def __init__(
         self,
@@ -35,7 +36,6 @@ class LatentActionVQVAE(nn.Module):
         num_layers: int,
         use_spatial_transformer: bool,
         use_temporal_transformer: bool,
-        num_embeddings: int,
         embedding_dim: int,
         quantizer_type: Literal["nsvq", "fsq"] = "fsq",
         bins: list[int] = [8],  # vocab size of 8
@@ -79,7 +79,7 @@ class LatentActionVQVAE(nn.Module):
         if quantizer_type == "nsvq":
             self.quantizer = NSVQ(
                 dim=d_model,
-                num_embeddings=num_embeddings,
+                num_embeddings=len(bins),
                 embedding_dim=embedding_dim,
                 patch_size=patch_height,
                 image_size=image_height,
@@ -97,6 +97,7 @@ class LatentActionVQVAE(nn.Module):
         else:
             raise ValueError(f"Invalid quantizer type: {quantizer_type}")
 
+        self.action_vocab_size = self.quantizer.codebook_size
         self.decoder = SpatioTemporalTransformer(
             num_images_in_video=num_images_in_video,
             num_heads=num_heads,

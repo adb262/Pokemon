@@ -19,12 +19,12 @@ def round_ste(z):
 
 
 class FiniteScalarQuantizer(BaseQuantizer):
+    mask_token_idx: int
+    mask_token_embedding: nn.Parameter
+
     def __init__(self, levels: list[int], embedding_dim: int, device: torch.device):
         super().__init__()
-        # Keep a simple Python list for length/type checks
         self._levels: list[int] = list(levels)
-        # Register levels and derived tensors as buffers so they are saved/restored
-        # with the checkpoint and move correctly across devices.
         levels_tensor = torch.tensor(self._levels, dtype=torch.long)
         self.register_buffer("_levels_np", levels_tensor, persistent=True)
 
@@ -36,18 +36,21 @@ class FiniteScalarQuantizer(BaseQuantizer):
         )
         self.register_buffer("_basis", basis, persistent=True)
 
-        self._codebook_size: int = int(
+        self.codebook_size: int = int(
             torch.prod(self._levels_np).item()  # type: ignore[arg-type]
         )
         self.device = device
 
         implicit_codebook = self.indexes_to_codes(
-            torch.arange(self._codebook_size, dtype=torch.long)
+            torch.arange(self.codebook_size, dtype=torch.long)
         )
         self.register_buffer("_implicit_codebook", implicit_codebook, persistent=True)
 
         # levels_tensor is 1D LongTensor, so len(levels) is a plain int
         self.project_in = nn.Linear(embedding_dim, len(self._levels))
+
+        self.mask_token_idx = self.codebook_size
+        self.mask_token_embedding = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
         nn.init.xavier_uniform_(self.project_in.weight)
         if self.project_in.bias is not None:

@@ -34,10 +34,8 @@ class VideoTokenizerTrainingConfig:
     d_model: int = 256
     num_transformer_layers: int = 4
     latent_dim: int = 64
-    fsq_latent_dim: int = 1
     num_embeddings: int = 8
     num_heads: int = 2
-    resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
     # Wandb Configuration

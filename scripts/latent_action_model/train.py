@@ -9,13 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-from monitoring.setup_wandb import setup_wandb
 import torch
 import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-import wandb
 from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
 from data.datasets.cache import Cache
 from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
@@ -23,9 +21,11 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
 from data.s3.s3_utils import S3Manager, default_s3_manager
+from latent_action_model.create_model import create_action_model
 from latent_action_model.model import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
 from loss.loss_fns import next_frame_reconstruction_loss
+from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import (
     convert_video_to_images,
     save_comparison_images_next_frame,
@@ -60,27 +60,6 @@ def upload_logs_to_s3(config: VideoTrainingConfig, s3_manager: S3Manager):
             logger.info(f"Uploaded logs to S3: {s3_log_key}")
         else:
             logging.error(f"Failed to upload logs to S3: {s3_log_key}")
-
-
-def create_model(config: VideoTrainingConfig):
-    """Create and initialize the VQVAE model"""
-    model = LatentActionVQVAE(
-        channels=3,
-        image_height=config.image_size,
-        image_width=config.image_size,
-        patch_height=config.patch_size,
-        patch_width=config.patch_size,
-        num_images_in_video=config.num_images_in_video,
-        d_model=config.d_model,
-        num_heads=config.num_heads,
-        num_layers=config.num_transformer_layers,
-        num_embeddings=config.num_embeddings,
-        embedding_dim=config.latent_dim,
-        use_temporal_transformer=True,
-        use_spatial_transformer=True,
-    )
-
-    return model
 
 
 def save_checkpoint(
@@ -192,7 +171,7 @@ def load_checkpoint(
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
     config = checkpoint["config"]
-    model = create_model(config)
+    model = create_action_model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -533,13 +512,6 @@ def train_epoch(
         #     logger.info(f"Evaluation loss at batch {batch_idx}: {eval_loss:.6f}")
 
         # Upload logs to S3 periodically
-        if (
-            config.use_s3
-            and s3_manager
-            and batch_idx > 0
-            and batch_idx % (config.save_interval * 2) == 0
-        ):
-            upload_logs_to_s3(config, s3_manager)
 
     # model.quantizer.replace_unused_codebooks(num_batches)
 
@@ -682,7 +654,7 @@ def main(config: VideoTrainingConfig):
 
     # Create model
     logger.info(f"Creating model on device {device}...")
-    model = create_model(config)
+    model = create_action_model(config)
     model.to(device)
 
     # Watch model with wandb

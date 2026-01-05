@@ -52,9 +52,6 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    logger.info(f"Loaded checkpoint: {checkpoint_path}")
-    logger.info(f"FSQ shape: {model.fsq._levels_np.shape}")
-    logger.info(f"FSQ levels: {model.fsq._levels_np}")
     return model, optimizer, scheduler
 
 
@@ -80,9 +77,5 @@ def load_model_from_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-
-    logger.info(f"Loaded model from checkpoint: {checkpoint_path}")
-    logger.info(f"FSQ shape: {model.fsq._levels_np.shape}")
-    logger.info(f"FSQ levels: {model.fsq._levels_np}")
 
     return model, config

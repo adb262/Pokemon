@@ -8,6 +8,7 @@ import logging
 import torch
 import torch.distributions.normal as normal_dist
 import torch.distributions.uniform as uniform_dist
+import torch.nn as nn
 
 from quantization.base import BaseQuantizer
 
@@ -16,6 +17,10 @@ logger.setLevel(logging.INFO)
 
 
 class NSVQ(BaseQuantizer):
+    mask_token_idx: int
+    mask_token_embedding: nn.Parameter
+    codebook_size: int
+
     def __init__(
         self,
         dim,
@@ -54,6 +59,9 @@ class NSVQ(BaseQuantizer):
         self.eps = 1e-12
         self.dim = dim
         self.patch_size = patch_size
+        self.mask_token_idx = num_embeddings
+        self.mask_token_embedding = nn.Parameter(torch.randn(1, 1, self.embedding_dim))
+        self.codebook_size = num_embeddings
 
         if initialization == "normal":
             codebooks = torch.randn(

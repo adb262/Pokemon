@@ -38,6 +38,20 @@ python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emer
 - [ ] Flow Matching Transformer
 - [ ] Larger group dynamics (not just pairs)
 - [ ] Do we really need video tokenization or would frame tokenization suffice?
+- [X] Use additive embeddings
+- [X] Move to single action per frame
+- [ ] When char is moving, everything should be moving. Filter to frames where the residual is every frame or nothing
+- [ ] Use EMA codebook updates
+- [ ] Just look at center of the frames to determine action
+    - [ ] Can't because some frames are un-cropped
+- [ ] Deal with codebook collapse (tried resetting but just collapses elsewhere; might want to focus on center frame, only care about the char)
+- [ ] Use more homogeneous data
+- [ ] Handle emergence of no-action quantization; successfully classify when there is no action
+- [ ] Test out JEPA style learning
+- [ ] Test out DiT
+- [ ] Test out BPTT using Gumbel Softmax for iterative decoding (bridge train/inference gap)
+- [ ] Fix data leakage between train/test (the test set can be interspersed with segments from training)
+- [ ] Trim out the borders present
 
 #### Data
 
@@ -47,30 +61,6 @@ python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emer
 - [ ] Horrible Heart Gold/Soul Silver
 - [ ] When we enter into trainer battle
 - [ ] We cannot tell when the frame is exactly the same
-
-
-## TODO
-X Use additive embeddings
-X Move to single action per frame
-- When char is moving, everything should be moving. Filter to frames where the redisual is every frame or nothing
-- Use EMA codebook updates
-- Just look at center of the frames to determine action
-    - Can't bc some frames are un-croppsed
-- Dealing with codebook collapse now. Tried resetting but just collapses elsewhere. Might want to just focus on the center frame (only care about the char)
-- More homogeneous data
-- Emergence of no-action quantization. Successfully classifying when there is no action
-- Test out JEPA style learning
-- Test out DiT
-- Test out BPTT using Gumbel Softmax for iterative decoding. This should bridge train/inference gap
-
-
-Create streamlit for labeling images as valid or invalid. Highlight spans over a low calibre preview of an entire video
-
-This streamlit should load in a .mp4. It should show the video preview in a sort of spread out "timeline". This timeline should be very low resolution so to allow us to view large chunks of the video at once. The video should not play, but rather it should just show the expanded frames. We should show 5 frames/second. 
-The user interacts with this by dragging intervals over the spans of frames that we want to label as "valid". When we save the annotation, the frame indices for the valid frames are written to a .json in the directory (create if doesn't exist) f"labeled_frames/{video_name_without.mp4}.json". The structure of the json is a list of lists, where each list represents a chunk of viable frames.
-
-Some thoughts:
-- Because the videos can be very long, we likely want to stream chunks of it in. We will not be able to show every single frame at once, and should just show windows. We need to be able to label large chunks of the video at once so that it is simple to go through many very large videos.
 
 
 ## Data Scripts
@@ -116,9 +106,9 @@ I'm reasonably happy with the 50m model performance and it comes at a pretty che
 
 Genie explores scaling the decoder separately. Since the decoder is essentially the bottleneck for reconstruction fidelity, this is worthwhile to pursue. I may come back to this.
 
-12M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/lhek7ncp
-50M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/mu0wmzo3
-100M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/t0e7zv8b
+- 12M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/lhek7ncp
+- 50M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/mu0wmzo3
+- 100M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/t0e7zv8b
 
 
 **You'll notice that a lot of the frames have not been trimmed. I originally removed these artifacts but decided that they actually may improve diversity of generation over time.

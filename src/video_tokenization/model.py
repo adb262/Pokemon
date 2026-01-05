@@ -1,11 +1,11 @@
 import logging
 
-from torch_utilities.initialize import init_weights
 import torch
 import torch.nn as nn
 
 from latent_action_model.patch_embedding import PatchEmbedding
 from quantization.fsq import FiniteScalarQuantizer
+from torch_utilities.initialize import init_weights
 from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
@@ -181,11 +181,25 @@ class VideoTokenizer(nn.Module):
             embedding_dim=len(bins),
         )
 
+    def get_vocab_size(self) -> int:
+        return self.fsq.codebook_size
+
+    def get_mask_token_idx(self) -> int:
+        return self.fsq.mask_token_idx
+
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(x)
 
     def quantized_value_to_codes(self, x: torch.Tensor) -> torch.Tensor:
         return self.fsq.quantized_value_to_codes(x)
+
+    def mask_latent_tokens(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x[mask] = self.fsq.mask_token_embedding
+        return x
+
+    def mask_codebook_tokens(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x[mask] = self.fsq.mask_token_idx
+        return x
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.fsq(self.encoder(x))

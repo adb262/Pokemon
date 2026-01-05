@@ -1,71 +1,106 @@
-import logging
-
 import torch
 import torch.nn as nn
+from torch.distributions import uniform
 
 from latent_action_model.model import LatentActionVQVAE
+from loss.loss_fns import reconstruction_loss
+from torch_utilities.initialize import init_weights
+from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 from video_tokenization.model import VideoTokenizer
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class DynamicsModel(nn.Module):
     def __init__(
         self,
         *,
+        mask_ratio_lower_bound: float,
+        mask_ratio_upper_bound: float,
         num_images_in_video: int,
-        image_height: int,
-        image_width: int,
-        channels: int,
-        patch_height: int,
-        patch_width: int,
-        d_model: int,
         num_heads: int,
         num_layers: int,
-        action_model: LatentActionVQVAE,
+        d_model: int,
         tokenizer: VideoTokenizer,
-        device: torch.device,
+        action_model: LatentActionVQVAE,
     ):
         super(DynamicsModel, self).__init__()
-        self.num_images_in_video = num_images_in_video
-        self.image_height = image_height
-        self.image_width = image_width
-        self.channels = channels
-        self.patch_height = patch_height
-        self.patch_width = patch_width
+        self.mask_ratio_lower_bound = mask_ratio_lower_bound
+        self.mask_ratio_upper_bound = mask_ratio_upper_bound
         self.d_model = d_model
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.action_model = action_model
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.mask_ratio_distribution = uniform.Uniform(
+            self.mask_ratio_lower_bound, self.mask_ratio_upper_bound
+        )
+
+        self.tokenizer_vocab_size = tokenizer.get_vocab_size()
+        self.action_vocab_size = action_model.action_vocab_size
+
         self.tokenizer = tokenizer
+        self.action_model = action_model
 
-        self.tokenizer.eval().to(device)
-        self.action_model.eval().to(device)
-        self.to(device)
+        # +1 for the mask token
+        self.tokenizer_embedding = nn.Embedding(self.tokenizer_vocab_size + 1, d_model)
+        self.action_embedding = nn.Embedding(self.action_vocab_size + 1, d_model)
+        self.decoder = SpatioTemporalTransformer(
+            num_images_in_video=num_images_in_video,
+            num_heads=num_heads,
+            d_model=d_model,
+            num_layers=num_layers,
+            use_spatial_transformer=True,
+            use_temporal_transformer=True,
+        )
+        self.vocab_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, self.tokenizer.get_vocab_size()),
+        )
+        self.token_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.action_loss_fn = reconstruction_loss
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
+        init_weights(self)
 
-        # First, encode the video into a sequence of patches
-        # We don't need the last frame for the tokenizer or the action model
-        x = x[:, :-1, :, :]
-        targets = x[:, 1:, :, :]
+    def forward(
+        self, video: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # input is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
+        # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
+        # And the masked targets
+
+        # x is of shape (batch_size, num_images_in_video, num_patches)
         with torch.no_grad():
-            encoded_video = self.tokenizer.encode(x)
-            targets = self.tokenizer.encode(targets)
-            target_codes = self.tokenizer.quantized_value_to_codes(targets)
+            # x is of shape (batch_size, num_images_in_video, num_patches)
+            targets = self.tokenizer.quantized_value_to_codes(
+                self.tokenizer.encode(video)
+            )
 
-        logger.debug(f"encoded_video shape: {encoded_video.shape}")
-        logger.debug(f"target_codes shape: {target_codes.shape}")
+        batch_size, num_images_in_video, num_patches = targets.shape
+        mask = (
+            torch.rand(batch_size, num_images_in_video - 1, num_patches)
+            < self.mask_ratio_distribution.sample()
+        )
 
-        # Next, grab the action sequence from the action model (original video, not encoded)
-        action_video = self.action_model.encode(x)
-        logger.debug(f"action_video shape: {action_video.shape}")
+        targets[:, 1:, :] = self.tokenizer.mask_codebook_tokens(targets[:, 1:, :], mask)
 
-        # This will be of shape (batch_size, num_images_in_video - 1, num_patches, d_model)
-        # Represents the action to go from frame i to frame i+1 for each frame in the video
-        # TODO: Experiment with other ways to combine the embedding and the action video
-        embedding = encoded_video + action_video
+        # TODO: Should this also use the mask?
+        # (batch_size, num_images_in_video - 1, num_patches, d_model)
+        action_video_encoded = self.action_model.encode(video)
+        action_tokens = self.action_model.get_action_sequence(
+            action_video_encoded.detach()
+        )
 
-        # Now, we need to generate our prediction for the next frame
+        # targets is of shape (batch_size, num_images_in_video, num_patches)
+        x = self.tokenizer_embedding(targets)
+        x[:, :-1, :] += self.action_embedding(action_tokens)
+
+        x = self.decoder(x)
+        x = self.vocab_head(x)
+
+        reconstructed_action_video = self.action_model.decode(action_tokens)
+        action_loss = self.action_loss_fn(
+            video[:, 1:, :, :], reconstructed_action_video
+        )
+
+        targets[:, 1:, :][~mask] = -100
+        token_loss = self.token_loss_fn(x[:, 1:, :, :], targets[:, 1:, :])
+
+        return x, token_loss, action_loss

@@ -5,6 +5,10 @@ from torch import nn
 
 
 class BaseQuantizer(nn.Module, ABC):
+    codebook_size: int
+    mask_token_idx: int
+    mask_token_embedding: nn.Parameter
+
     @abstractmethod
     def replace_unused_codebooks(self, num_batches: int):
         pass
