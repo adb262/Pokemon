@@ -6,8 +6,6 @@ Supports lazy loading, batch generation, resumable training, and S3 storage.
 """
 
 import logging
-
-# Add the parent directory to the path so we can import from idm
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional

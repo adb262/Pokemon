@@ -19,7 +19,6 @@ import yt_dlp
 
 from data.s3.s3_utils import S3Manager, get_s3_manager_from_env
 
-# Add the parent directory to the path so we can import from idm
 sys.path.append(str(Path(__file__).parent.parent))
 
 
