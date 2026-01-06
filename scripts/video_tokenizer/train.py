@@ -1,4 +1,4 @@
-# python -m src.video_tokenization.train --use_s3 true --frames_dir pokemon --seed_cache --num_images_in_video 2 --batch_size 2
+# python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 16 --save_dir fsq_tokenizer_2k_128_4_512_8_heads_4_layers --bins 8 8 6 5 --use_s3 --dataset_train_key pokemon_emerald_train_0_9_5_frames.json --checkpoint_dir fsq_tokenizer_2k_128_4_512_8_heads_4_layers --patch_size 4 --image_size 128 --d_model 512 --num_heads 8 --num_transformer_layers 4 --num_epochs 20
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import logging
@@ -10,7 +10,7 @@ from typing import Callable
 import torch
 import torch.optim as optim
 import tyro
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 import wandb
 from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
@@ -26,7 +26,7 @@ from monitoring.videos import convert_video_to_images, save_comparison_images
 from scripts.video_tokenizer.eval import eval_model
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
-from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 from wandb.wandb_run import Run
 
@@ -42,8 +42,9 @@ logger = logging.getLogger(__name__)
 def train_epoch(
     model: VideoTokenizer,
     dataloader: PokemonOpenWorldLoader,
+    test_dataloader: PokemonOpenWorldLoader,
     optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.CosineAnnealingLR,
+    scheduler: optim.lr_scheduler.LRScheduler,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     epoch: int,
@@ -55,6 +56,7 @@ def train_epoch(
     total_loss = 0.0
     num_batches = len(dataloader)
     best_loss = float("inf")
+    accumulation_steps = config.gradient_accumulation_steps
 
     # Set up resumable dataloader
     if start_batch > 0:
@@ -65,6 +67,7 @@ def train_epoch(
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
+    accumulated_loss = 0.0
 
     for batch_idx, video_batch in enumerate(dataloader):
         # Skip batches if resuming
@@ -72,9 +75,6 @@ def train_epoch(
             continue
 
         batch_start_time = time.time()
-
-        # Zero gradients
-        optimizer.zero_grad()
 
         # Move to device
         video_batch = video_batch.to(device)
@@ -84,76 +84,106 @@ def train_epoch(
         decoded = model(video_batch)
 
         # Calculate loss (reconstruction loss)
-        loss = criterion(video_batch, decoded)
+        # Scale loss by accumulation steps for correct gradient averaging
+        loss = criterion(video_batch, decoded) / accumulation_steps
 
-        # Backward pass
+        # Backward pass (accumulate gradients)
         loss.backward()
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Track unscaled loss for logging
+        accumulated_loss += loss.item() * accumulation_steps
 
-        optimizer.step()
-        scheduler.step()  # Step scheduler every batch for cosine annealing
+        # Only step optimizer after accumulating enough gradients
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == num_batches:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        total_loss += loss.item()
-        batch_time = time.time() - batch_start_time
+            optimizer.step()
+            scheduler.step()  # Step scheduler every optimizer step for cosine annealing
+            optimizer.zero_grad()
 
-        # Calculate global step
-        global_step = epoch * num_batches + batch_idx
+            # Calculate average loss over accumulated steps
+            avg_accumulated_loss = accumulated_loss / min(
+                accumulation_steps, (batch_idx % accumulation_steps) + 1
+            )
+            total_loss += avg_accumulated_loss
+            batch_time = time.time() - batch_start_time
 
-        # Log to wandb with system metrics
-        wandb_metrics = {
-            "train/loss": loss.item(),
-            "train/learning_rate": scheduler.get_last_lr()[0],
-            "train/batch_time": batch_time,
-            "train/epoch": epoch,
-            "train/batch": batch_idx,
-        }
-
-        wandb_logger.log(wandb_metrics, step=global_step)
-
-        # Log progress
-        if batch_idx % config.log_interval == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            logger.info(
-                f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
-                f"Loss: {loss.item():.6f}, LR: {current_lr:.2e}, "
-                f"Time: {batch_time:.2f}s"
+            # Calculate global step (counts optimizer steps, not batches)
+            global_step = epoch * (num_batches // accumulation_steps) + (
+                batch_idx // accumulation_steps
             )
 
-        # Save checkpoint periodically
-        if batch_idx > 0 and batch_idx % config.save_interval == 0:
-            dataloader_state = dataloader.get_state()
-            is_best = loss < best_loss
-            if is_best:
-                best_loss = loss.item()
+            # Log to wandb with system metrics
+            wandb_metrics = {
+                "train/loss": avg_accumulated_loss,
+                "train/learning_rate": scheduler.get_last_lr()[0],
+                "train/batch_time": batch_time,
+                "train/epoch": epoch,
+                "train/batch": batch_idx,
+            }
 
-            predicted_videos = convert_video_to_images(decoded)
-            expected_videos = convert_video_to_images(video_batch)
-            comparison_path = (
-                f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
-            )
-            save_comparison_images(predicted_videos, expected_videos, comparison_path)
+            wandb_logger.log(wandb_metrics, step=global_step)
 
-            # Log comparison image to wandb
-            wandb_logger.log(
-                {"train/comparison": wandb.Image(comparison_path)},
-                step=global_step,
-            )
+            # Log progress
+            if (batch_idx // accumulation_steps) % config.log_interval == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                logger.info(
+                    f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
+                    f"Loss: {avg_accumulated_loss:.6f}, LR: {current_lr:.2e}, "
+                    f"Time: {batch_time:.2f}s"
+                )
 
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                batch_idx,
-                loss.item(),
-                config,
-                best_loss,
-                dataloader_state,
-            )
+            # Reset accumulated loss
+            accumulated_loss = 0.0
 
-    avg_loss = total_loss / num_batches
+            # Save checkpoint periodically (based on optimizer steps)
+            optimizer_step = batch_idx // accumulation_steps
+            if optimizer_step > 0 and optimizer_step % config.save_interval == 0:
+                dataloader_state = dataloader.get_state()
+                is_best = avg_accumulated_loss < best_loss
+                if is_best:
+                    best_loss = avg_accumulated_loss
+
+                predicted_videos = convert_video_to_images(decoded)
+                expected_videos = convert_video_to_images(video_batch)
+                comparison_path = f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
+                save_comparison_images(
+                    predicted_videos, expected_videos, comparison_path
+                )
+
+                # Log comparison image to wandb
+                wandb_logger.log(
+                    {"train/comparison": wandb.Image(comparison_path)},
+                    step=global_step,
+                )
+
+                eval_model(
+                    model,
+                    test_dataloader,
+                    criterion,
+                    device,
+                    epoch,
+                    wandb_logger=wandb_logger,
+                    save_dir=config.save_dir,
+                    global_step=global_step,
+                )
+
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    batch_idx,
+                    avg_accumulated_loss,
+                    config,
+                    best_loss,
+                    dataloader_state,
+                )
+
+    # Calculate average loss over optimizer steps
+    num_optimizer_steps = num_batches // accumulation_steps
+    avg_loss = total_loss / max(num_optimizer_steps, 1)
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch metrics
@@ -170,7 +200,7 @@ def train_epoch(
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
     )
-    return avg_loss
+    return avg_loss, global_step
 
 
 def main(config: VideoTokenizerTrainingConfig):
@@ -225,9 +255,20 @@ def main(config: VideoTokenizerTrainingConfig):
         image_size=config.image_size,
         use_s3=config.use_s3,
     )
+    if config.dataset_train_key is None:
+        logger.info("Setting up dataset...")
+        train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+    else:
+        logger.info(f"Loading dataset from {config.dataset_train_key}")
+        train_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key)
+        test_dataset = dataset_creator.load_existing_dataset(
+            config.dataset_train_key.replace("train", "test")
+        )
 
-    logger.info("Setting up dataset...")
-    train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
+        if config.sync_from_s3:
+            logger.info("Syncing dataset from S3...")
+            dataset_creator.ensure_files_exist(train_dataset)
+            dataset_creator.ensure_files_exist(test_dataset)
 
     train_dataset = OpenWorldRunningDataset(
         dataset=train_dataset,
@@ -288,6 +329,14 @@ def main(config: VideoTokenizerTrainingConfig):
             {f"test_dataset/{key}": value for key, value in test_info.items()},
             commit=False,
         )
+        wandb_logger.log(
+            {
+                "config/effective_batch_size": config.batch_size
+                * config.gradient_accumulation_steps,
+                "config/gradient_accumulation_steps": config.gradient_accumulation_steps,
+            },
+            commit=False,
+        )
 
     # Create model
     logger.info(f"Creating model on device {device}...")
@@ -308,11 +357,42 @@ def main(config: VideoTokenizerTrainingConfig):
     )
     logger.info(f"Optimizer created with learning rate: {config.learning_rate}")
 
-    # Cosine annealing scheduler
-    total_steps = config.num_epochs * len(train_dataloader)
-    scheduler = CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=config.min_learning_rate
+    # Cosine annealing scheduler with warmup (steps per epoch is reduced by accumulation)
+    steps_per_epoch = len(train_dataloader) // config.gradient_accumulation_steps
+    total_steps = config.num_epochs * steps_per_epoch
+    warmup_steps = config.warmup_steps
+
+    # Linear warmup from 0 to learning_rate over warmup_steps
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=1e-8,  # Start from near-zero
+        end_factor=1.0,
+        total_iters=warmup_steps,
     )
+
+    # Cosine annealing for the remaining steps
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=config.min_learning_rate,
+    )
+
+    # Combine warmup + cosine annealing
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],
+    )
+
+    logger.info(f"Warmup steps: {warmup_steps}")
+
+    # Log effective batch size
+    effective_batch_size = config.batch_size * config.gradient_accumulation_steps
+    logger.info(f"Gradient accumulation steps: {config.gradient_accumulation_steps}")
+    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Effective batch size: {effective_batch_size}")
+    logger.info(f"Steps per epoch: {steps_per_epoch}")
+    logger.info(f"Total optimizer steps: {total_steps}")
 
     # Loss function
     criterion = reconstruction_loss
@@ -326,7 +406,6 @@ def main(config: VideoTokenizerTrainingConfig):
     best_loss = float("inf")
 
     # first, evaluate on test dataset
-    num_batches = len(train_dataloader)
     test_loss = eval_model(
         model,
         test_dataloader,
@@ -344,9 +423,10 @@ def main(config: VideoTokenizerTrainingConfig):
         for epoch in range(start_epoch, config.num_epochs):
             epoch_start_batch = start_batch if epoch == start_epoch else 0
 
-            avg_loss = train_epoch(
+            avg_loss, global_step = train_epoch(
                 model,
                 train_dataloader,
+                test_dataloader,
                 optimizer,
                 scheduler,
                 criterion,
@@ -366,7 +446,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 epoch,
                 wandb_logger=wandb_logger,
                 save_dir=config.save_dir,
-                global_step=(epoch + 1) * num_batches,
+                global_step=global_step,
             )
             logger.info(f"Test loss: {eval_loss:.6f}")
 

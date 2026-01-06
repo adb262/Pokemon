@@ -1,7 +1,7 @@
 # from beartype import BeartypeConf
 # from beartype.claw import beartype_all
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -32,6 +32,7 @@ class VideoTrainingConfig:
     resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
+    bins: list[int] = field(default_factory=lambda: [8])
     # Wandb Configuration
     use_wandb: bool = True
     wandb_project: str = "pokemon-action-vqvae"

@@ -6,65 +6,22 @@ import torch.nn as nn
 from einops import rearrange
 
 from latent_action_model.patch_embedding import PatchEmbeddingConv
+from quantization.base import BaseQuantizer
 from quantization.fsq import FiniteScalarQuantizer
 from quantization.nsvq import NSVQ
 from torch_utilities.crop_center_patches import get_center_patch_indices
 from torch_utilities.initialize import init_weights
+from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
-from video_tokenization.tokenizer import PixelShuffleFrameHead
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class ActionCondenserNet(nn.Module):
-    def __init__(
-        self,
-        num_patches: int,
-        d_model_input: int,
-        d_model_output: int,
-        d_model_intermediate_factor: int = 1,
-    ):
-        super().__init__()
-        self.num_patches = num_patches
-        self.d_model_input = d_model_input
-        d_model_intermediate = d_model_input * d_model_intermediate_factor
-
-        self.conv_block = nn.Sequential(
-            nn.Conv1d(
-                in_channels=d_model_input,
-                out_channels=d_model_intermediate,
-                kernel_size=3,
-                padding=1,
-                stride=1,
-            ),
-            nn.GELU(),
-            nn.Conv1d(
-                in_channels=d_model_intermediate,
-                out_channels=d_model_intermediate,
-                kernel_size=3,
-                padding=1,
-                stride=1,
-            ),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
-        )
-        self.fc = nn.Linear(d_model_intermediate, d_model_output)
-        self.ln = nn.LayerNorm(d_model_output)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is (B, T, P, D_in)
-        batch_size, num_frames, num_patches, d_model = x.shape
-        x = x.view(batch_size * num_frames, d_model, num_patches)  # (B * T, D_in, P)
-        x = self.conv_block(x)  # (B * T, D_inter, 1)
-        x = x.squeeze(-1).view(batch_size, num_frames, d_model)  # (B, T, D_inter)
-        logger.debug(f"x shape after conv_block: {x.shape}")
-        x = self.fc(x)  # (B, T, D_out)
-        x = self.ln(x)  # (B, T, D_out)
-        return x
-
-
 class LatentActionVQVAE(nn.Module):
+    quantizer: BaseQuantizer
+    action_vocab_size: int
+
     def __init__(
         self,
         *,
@@ -79,7 +36,6 @@ class LatentActionVQVAE(nn.Module):
         num_layers: int,
         use_spatial_transformer: bool,
         use_temporal_transformer: bool,
-        num_embeddings: int,
         embedding_dim: int,
         quantizer_type: Literal["nsvq", "fsq"] = "fsq",
         bins: list[int] = [8],  # vocab size of 8
@@ -112,12 +68,6 @@ class LatentActionVQVAE(nn.Module):
         num_patches_w = image_width // patch_width
         self.num_patches_per_image = num_patches_h * num_patches_w
 
-        self.action_condenser = ActionCondenserNet(
-            num_patches=self.num_patches_per_image,
-            d_model_input=d_model,
-            d_model_output=d_model,
-        )
-
         device = torch.device("cpu")
         if torch.backends.mps.is_available():
             device = torch.device("mps")
@@ -126,24 +76,28 @@ class LatentActionVQVAE(nn.Module):
 
         self.quantizer_type = quantizer_type
 
-        self.quantizer_nsvq = NSVQ(
-            dim=d_model,
-            num_embeddings=num_embeddings,
-            embedding_dim=embedding_dim,
-            patch_size=patch_height,
-            image_size=image_height,
-            device=device,
-            discarding_threshold=0.1,
-            initialization="normal",
-            code_seq_len=1,
-        )
+        if quantizer_type == "nsvq":
+            self.quantizer = NSVQ(
+                dim=d_model,
+                num_embeddings=len(bins),
+                embedding_dim=embedding_dim,
+                patch_size=patch_height,
+                image_size=image_height,
+                device=device,
+                discarding_threshold=0.1,
+                initialization="normal",
+                code_seq_len=1,
+            )
+        elif quantizer_type == "fsq":
+            self.quantizer = FiniteScalarQuantizer(
+                levels=bins,
+                embedding_dim=d_model,
+                device=device,
+            )
+        else:
+            raise ValueError(f"Invalid quantizer type: {quantizer_type}")
 
-        self.quantizer_fsq = FiniteScalarQuantizer(
-            levels=bins,
-            embedding_dim=d_model,
-            device=device,
-        )
-
+        self.action_vocab_size = self.quantizer.codebook_size
         self.decoder = SpatioTemporalTransformer(
             num_images_in_video=num_images_in_video,
             num_heads=num_heads,
@@ -173,12 +127,23 @@ class LatentActionVQVAE(nn.Module):
         )
 
         params = sum(p.numel() for p in self.parameters())
-        logger.info(f"LatentActionVQVAE initialized. Num params: {params}")
+        logger.debug(f"LatentActionVQVAE initialized. Num params: {params}")
         init_weights(self)
 
-    def forward_with_fsq(
-        self, video: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def decode(self, quantized: torch.Tensor, patch_video_for_decoder: torch.Tensor) -> torch.Tensor:
+        # Trim off the final image from the video for decoder input
+        # Patches for frames 0 to T-2
+
+        # Now, we need to decode. The decoder aims to predict frame T-1 using frames 0 to T-2 and the quantized_action.
+        # decoded = self.decoder(patch_video_for_decoder)
+
+        # Shape is (B, N_images_in_video - 1, num_patches, d_model)
+        # logger.debug(
+        #     f"decoded shape: {decoded.shape}"
+        # )  # Decoder outputs a single frame (B, C, H, W)
+        return self.reconstruct(self.project_quantized_actions_fsq(quantized, patch_video_for_decoder))
+
+    def encode_with_fsq(self, video: torch.Tensor) ->tuple[torch.Tensor, torch.Tensor]:
         # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
         # We want to encode the video into a sequence of patches
         logger.debug(f"video shape: {video.shape}")
@@ -201,37 +166,36 @@ class LatentActionVQVAE(nn.Module):
         x_encoded_mean = self.layer_norm(x_encoded_mean)
 
         logger.debug(f"x_encoded_mean shape: {x_encoded_mean.shape}")
-        quantized = self.quantizer_fsq(x_encoded_mean)
+        quantized = self.quantizer(x_encoded_mean)
 
         # quantized, indices, commitment_loss = self.quantizer(action_continuous)
         logger.debug(f"quantized shape: {quantized.shape}")
-        logger.info(f"quantized values: {quantized}")
+        logger.debug(f"quantized values: {quantized}")
+        return quantized, patched_video_from_embedder
 
-        # Project the action to the d_model space
+    def project_quantized_actions_fsq(self, quantized: torch.Tensor, patched_video_from_embedder: torch.Tensor) -> torch.Tensor:
+        # Project the quantized action to the d_model space
         action_projected = self.action_projection(quantized)
-        logger.info(f"action_projected shape: {action_projected.shape}")
+        logger.debug(f"action_projected shape: {action_projected.shape}")
+
+        return patched_video_from_embedder[:, :-1, :, :] + action_projected.unsqueeze(2)
+
+    def project_quantized_actions_nsvq(self, quantized: torch.Tensor, patched_video_from_embedder: torch.Tensor) -> torch.Tensor:
+        # quantized, indices, commitment_loss = self.quantizer(action_continuous)
+        logger.debug(f"quantized shape: {quantized.shape}")
+
+        actions = rearrange(
+            quantized,
+            "(b t) p d -> b t p d",
+            b=patched_video_from_embedder.shape[0],
+            t=patched_video_from_embedder.shape[1] - 1,
+        )
 
         # Trim off the final image from the video for decoder input
         # Patches for frames 0 to T-2
-        patch_video_for_decoder = patched_video_from_embedder[
-            :, :-1, :, :
-        ] + action_projected.unsqueeze(2)
+        return patched_video_from_embedder[:, :-1, :, :] + actions
 
-        # Now, we need to decode. The decoder aims to predict frame T-1 using frames 0 to T-2 and the quantized_action.
-        # decoded = self.decoder(patch_video_for_decoder)
-
-        # Shape is (B, N_images_in_video - 1, num_patches, d_model)
-        # logger.debug(
-        #     f"decoded shape: {decoded.shape}"
-        # )  # Decoder outputs a single frame (B, C, H, W)
-        decoded = self.reconstruct(patch_video_for_decoder)
-        # logger.debug(f"decoded shape after patch_to_pixels: {decoded.shape}")
-        return decoded, quantized
-
-    def forward_with_nsvq(
-        self, video: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_frames = video.shape[1]
+    def encode_with_nsvq(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
         # We want to encode the video into a sequence of patches
         logger.debug(f"video shape: {video.shape}")
@@ -262,46 +226,22 @@ class LatentActionVQVAE(nn.Module):
         )  # (B*(T-1), P, D)
 
         # pass to NSVQ
-        quantized, perplexity, used, indices = self.quantizer_nsvq(
-            first_images, target_images
-        )
+        quantized = self.quantizer(first_images, target_images)
 
-        # quantized, indices, commitment_loss = self.quantizer(action_continuous)
-        logger.info(f"quantized shape: {quantized.shape}")
-        logger.info(f"indices values: {indices}")
+        return quantized, patched_video_from_embedder
 
-        actions = rearrange(
-            quantized,
-            "(b t) p d -> b t p d",
-            b=x_encoded_full.shape[0],
-            t=num_frames - 1,
-        )
-
-        logger.info(f"actions shape: {actions.shape}")
-
-        # Trim off the final image from the video for decoder input
-        # Patches for frames 0 to T-2
-        patch_video_for_decoder = patched_video_from_embedder[:, :-1, :, :] + actions
-
-        # Now, we need to decode. The decoder aims to predict frame T-1 using frames 0 to T-2 and the quantized_action.
-        decoded = self.decoder(patch_video_for_decoder)
-
-        # Shape is (B, N_images_in_video - 1, num_patches, d_model)
-        logger.debug(
-            f"decoded shape: {decoded.shape}"
-        )  # Decoder outputs a single frame (B, C, H, W)
-        decoded = self.patch_to_pixels(decoded)
-        logger.debug(f"decoded shape after patch_to_pixels: {decoded.shape}")
-        logger.debug(f"indices shape: {indices.shape}")
-        return decoded, indices.reshape(
-            decoded.shape[0],
-            num_frames - 1,
-        )
-
-    def forward(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, video: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Return the quantized values and the patched video from the embedder
         if self.quantizer_type == "nsvq":
-            return self.forward_with_nsvq(video)
+            return self.encode_with_nsvq(video)
         elif self.quantizer_type == "fsq":
-            return self.forward_with_fsq(video)
+            return self.encode_with_fsq(video)
         else:
             raise ValueError(f"Invalid quantizer type: {self.quantizer_type}")
+
+    def get_action_sequence(self, quantized: torch.Tensor) -> torch.Tensor:
+        return self.quantizer.quantized_value_to_codes(quantized)
+
+    def forward(self, video: torch.Tensor) -> torch.Tensor:
+        actions, patched_video_from_embedder = self.encode(video)
+        return self.decode(actions, patched_video_from_embedder)

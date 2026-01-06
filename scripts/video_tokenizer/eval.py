@@ -14,13 +14,13 @@ from data.datasets.open_world.open_world_running_dataset_creator import (
     OpenWorldRunningDatasetCreator,
 )
 from loss.loss_fns import next_frame_reconstruction_loss
-from monitoring.frechet_distance import compute_frechet_distance
+from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
 from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images
 from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
-from video_tokenization.tokenizer import VideoTokenizer
+from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
 from wandb.wandb_run import Run
 
@@ -84,20 +84,31 @@ def eval_model(
     if real_next_frames_batches and pred_next_frames_batches:
         real_all = torch.cat(real_next_frames_batches, dim=0)
         pred_all = torch.cat(pred_next_frames_batches, dim=0)
-        logger.info(
-            f"Computing Frechet distance between {real_all.shape} and {pred_all.shape}"
-        )
+
+        # Compute FID (Frechet Inception Distance) - frame-level metric
+        logger.info(f"Computing FID between {real_all.shape} and {pred_all.shape}")
         t = time.time()
         frechet_distance = compute_frechet_distance(real_all, pred_all)
-        logger.info(f"Frechet distance computed in {time.time() - t} seconds")
+        logger.info(
+            f"FID computed in {time.time() - t:.2f} seconds: {frechet_distance:.4f}"
+        )
+
+        # Compute FVD (Frechet Video Distance) - video-level metric
+        logger.info(f"Computing FVD between {real_all.shape} and {pred_all.shape}")
+        t = time.time()
+        fvd_score = compute_fvd(real_all, pred_all)
+        logger.info(f"FVD computed in {time.time() - t:.2f} seconds: {fvd_score:.4f}")
     else:
         frechet_distance = float("inf")
+        fvd_score = float("inf")
 
     if wandb_logger:
         # Use consistent metric names for plotting over time
         log_dict: dict = {
             "eval/loss": avg_loss,
-            "eval/frechet_distance": frechet_distance,
+            "eval/fid": frechet_distance,  # FID - frame-level quality
+            "eval/fvd": fvd_score,  # FVD - video-level quality + temporal coherence
+            "eval/frechet_distance": frechet_distance,  # Keep for backwards compatibility
             "eval/epoch": epoch if isinstance(epoch, int) else 0,
         }
 

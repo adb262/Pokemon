@@ -51,7 +51,7 @@ def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]
     for video in videos:
         # video shape: (T, H, W, C)
         video_images: list[Image.Image] = []
-        logger.info(f"Video shape: {video.shape}")
+        logger.debug(f"Video shape: {video.shape}")
         for frame_idx in range(video.shape[0]):
             frame = video[frame_idx]
             # Defensive: If the mode is not correct, force RGB for 3-channels
@@ -64,7 +64,7 @@ def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]
                     f"Frame has unexpected channel count: {frame.shape[-1]}"
                 )
             video_images.append(image)
-        logger.info(f"Video images shape: {len(video_images)}")
+        logger.debug(f"Video images shape: {len(video_images)}")
         images.append(video_images)
     return images
 

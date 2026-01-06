@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from latent_action_model.patch_embedding import PatchEmbedding
 from quantization.fsq import FiniteScalarQuantizer
+from torch_utilities.initialize import init_weights
+from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,7 @@ class VideoTokenizerEncoder(nn.Module):
         )
 
         self.latent_projection = nn.Linear(d_model, embedding_dim)
+        init_weights(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is of shape (batch_size, num_images_in_video, c, h, w)
@@ -63,37 +66,6 @@ class VideoTokenizerEncoder(nn.Module):
         logger.debug(f"x shape after encoder: {x.shape}")
         x = self.latent_projection(x)
         logger.debug(f"x shape after latent_projection: {x.shape}")
-        return x
-
-
-class PixelShuffleFrameHead(nn.Module):
-    # conv2D embeddings to pixels head
-    def __init__(self, embed_dim, patch_size=8, channels=3, H=128, W=128):
-        super().__init__()
-        self.patch_size = patch_size
-        self.Hp, self.Wp = H // patch_size, W // patch_size
-        self.to_pixels = nn.Conv2d(embed_dim, channels * (patch_size**2), kernel_size=1)
-
-    def forward(self, tokens):  # [B, T, P, E]
-        from einops import rearrange
-
-        B, T, P, E = tokens.shape
-        logger.debug(f"tokens shape: {tokens.shape}")
-        x = rearrange(
-            tokens, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
-        )  # [(B*T), E, Hp, Wp]
-        logger.debug(f"x shape after rearrange: {x.shape}")
-        x = self.to_pixels(x)  # [(B*T), C*p^2, Hp, Wp]
-        logger.debug(f"x shape after to_pixels: {x.shape}")
-        x = rearrange(
-            x,
-            "(b t) (c p1 p2) hp wp -> b t c (hp p1) (wp p2)",
-            p1=self.patch_size,
-            p2=self.patch_size,
-            b=B,
-            t=T,
-        )  # [B, T, C, H, W]
-        logger.debug(f"x shape after final rearrange: {x.shape}")
         return x
 
 
@@ -209,10 +181,28 @@ class VideoTokenizer(nn.Module):
             embedding_dim=len(bins),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.encoder(x)
+    def get_vocab_size(self) -> int:
+        return self.fsq.codebook_size
 
-        x = self.fsq(x)
+    def get_mask_token_idx(self) -> int:
+        return self.fsq.mask_token_idx
 
-        x = self.decoder(x)
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(x)
+
+    def quantized_value_to_codes(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fsq.quantized_value_to_codes(x)
+
+    def mask_latent_tokens(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x[mask] = self.fsq.mask_token_embedding
         return x
+
+    def mask_codebook_tokens(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x[mask] = torch.tensor(self.fsq.mask_token_idx, dtype=torch.long, device=x.device)
+        return x
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fsq(self.encoder(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decode(self.encode(x))

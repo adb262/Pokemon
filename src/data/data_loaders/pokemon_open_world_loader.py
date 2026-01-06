@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 
 from data.data_loaders.resumable_data_loader import ResumableDataLoader
 from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
@@ -66,6 +66,8 @@ class PokemonOpenWorldLoader:
         self.dataset = dataset
 
         # Create data loader
+        # prefetch_factor controls how many batches each worker loads ahead
+        # With num_workers=4 and prefetch_factor=4, up to 16 batches are prepared in background
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=batch_size,
@@ -74,6 +76,8 @@ class PokemonOpenWorldLoader:
             pin_memory=False if torch.backends.mps.is_available() else True,
             drop_last=True,
             persistent_workers=True,
+            prefetch_factor=4,  # Default is 2; increase if image processing is the bottleneck
+            collate_fn=self.collate_fn_ignore_none,
         )
 
         # Create resumable wrapper
@@ -125,3 +129,6 @@ class PokemonOpenWorldLoader:
             "max_cache_size": self.max_cache_size,
             "loader_state": self.resumable_loader.get_state(),
         }
+
+    def collate_fn_ignore_none(self, batch: list[torch.Tensor | None]) -> torch.Tensor:
+        return default_collate([x for x in batch if x is not None])

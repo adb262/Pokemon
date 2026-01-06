@@ -32,5 +32,27 @@
     "./apps/consumer_ask_precompute/src",
     "./packages/form2/src/form2",
     "./packages/form2/src"
-  ]
+  ],
+  "cursorpyright.analysis.autoImportCompletions": true,
+  "cursorpyright.analysis.diagnosticMode": "openFilesOnly",
+  "cursorpyright.analysis.exclude": [
+    "**/venv/lib/python3.11/site-packages/prisma",
+    "/var/tmp/node_modules",
+    "**/prisma/client",
+    "**/lib/db/client",
+    "**/.venv/**"
+  ],
+  "cursorpyright.analysis.extraPaths": [
+    "./apps/consumer_ask_precompute/src",
+    "./packages/form2/src/form2",
+    "./packages/form2/src"
+  ],
+  "cursorpyright.analysis.ignore": [
+    "**/venv/lib/python3.11/site-packages/prisma",
+    "/var/tmp/node_modules",
+    "**/prisma/client",
+    "**/lib/db/client",
+    "**/.venv/**"
+  ],
+  "cursorpyright.analysis.typeCheckingMode": "basic"
 }

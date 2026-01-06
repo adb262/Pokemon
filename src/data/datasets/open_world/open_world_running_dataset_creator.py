@@ -5,6 +5,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from multiprocessing import Pool
+import traceback
 from typing import Literal
 
 from PIL import Image
@@ -58,8 +59,8 @@ class OpenWorldRunningDatasetCreator:
         logger.info(f"Test dataset key: {test_dataset_key}")
         if os.path.exists(train_dataset_key) and os.path.exists(test_dataset_key):
             return (
-                self._load_existing_dataset(train_dataset_key),
-                self._load_existing_dataset(test_dataset_key),
+                self.load_existing_dataset(train_dataset_key),
+                self.load_existing_dataset(test_dataset_key),
             )
 
         data = self._pull_dataset(self.dataset_dir)
@@ -109,12 +110,28 @@ class OpenWorldRunningDatasetCreator:
         formatted_split = str(split).replace(".", "_")
         return f"{self.dataset_dir}_{stage}_{formatted_split}_{self.num_frames_in_video}_frames.json"
 
-    def _load_existing_dataset(
-        self,
-        key: str,
+    def _filter_to_correct_num_frames(self, dataset: OpenWorldVideoLog) -> OpenWorldVideoLog:
+        return OpenWorldVideoLog(video_logs=[video for video in dataset.video_logs if len(video.video_log_paths) == self.num_frames_in_video])
+
+    def load_existing_dataset(
+        self, key: str,
     ) -> OpenWorldVideoLog:
         with open(key, "r") as f:
-            return OpenWorldVideoLog.model_validate_json(f.read())
+            dataset = OpenWorldVideoLog.model_validate_json(f.read())
+            return self._filter_to_correct_num_frames(dataset)
+
+    def ensure_files_exist(self, log: OpenWorldVideoLog) -> None:
+        # Check that these files exist in the cache. If they don't, download them from S3.
+        # Use multithreading to download the files.
+        progress_bar = tqdm(total=len([path for video in log.video_logs for path in video.video_log_paths]), desc="Ensuring files exist")
+
+        def _populate_cache_and_progress(s3_manager: S3Manager, local_cache: Cache, path: str) -> None:
+            self._load_image_from_s3(s3_manager, local_cache, path)
+            progress_bar.update(1)
+
+        with ThreadPoolExecutor(max_workers=32) as thread_executor:
+            partial_fn = partial(_populate_cache_and_progress, default_s3_manager, self.local_cache)
+            thread_executor.map(partial_fn, [path for video in log.video_logs for path in video.video_log_paths])
 
     def _save_dataset(self, dataset: OpenWorldVideoLog, key: str):
         with open(key, "w") as f:
@@ -146,6 +163,7 @@ class OpenWorldRunningDatasetCreator:
             local_cache.set(s3_key, image)
             return image.convert("RGB")
         except Exception as e:
+            traceback.print_exc()
             logger.error(f"Error loading image from S3: {e}")
             return None
 
@@ -357,18 +375,6 @@ class OpenWorldRunningDatasetCreator:
                 frames[i : i + self.frame_chunk_size]
                 for i in range(0, len(frames), self.frame_chunk_size)
             ]
-
-            # with Pool(2) as process_executor:
-            #     partial_fn = partial(
-            #         self._get_frame_sequences_from_local,
-            #         limit=self.limit,
-            #         num_frames_in_video=self.num_frames_in_video,
-            #         progress_bar=progress_bar,
-            #     )
-            #     videos = process_executor.map(partial_fn, chunks)
-            #     logger.info(f"Found {len(videos)} videos")
-
-            #     all_videos.extend(sum(videos, []))
 
             for frame_path in chunks:
                 all_videos.extend(

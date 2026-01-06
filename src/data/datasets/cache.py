@@ -32,6 +32,11 @@ class Cache:
         return None
 
     def set(self, key: str, value: Image.Image):
+        # Ensure the subdirectories exist
+        subdirs = os.path.dirname(self.get_cached_image_path(key))
+        if subdirs and not os.path.exists(os.path.join(self.cache_dir, subdirs)):
+            os.makedirs(os.path.join(self.cache_dir, subdirs), exist_ok=True)
+
         value.save(f"{self.cache_dir}/{self.get_cached_image_path(key)}", "PNG")
 
     def print_stats(self):

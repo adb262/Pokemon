@@ -19,12 +19,12 @@ def round_ste(z):
 
 
 class FiniteScalarQuantizer(BaseQuantizer):
+    mask_token_idx: int
+    mask_token_embedding: nn.Parameter
+
     def __init__(self, levels: list[int], embedding_dim: int, device: torch.device):
         super().__init__()
-        # Keep a simple Python list for length/type checks
         self._levels: list[int] = list(levels)
-        # Register levels and derived tensors as buffers so they are saved/restored
-        # with the checkpoint and move correctly across devices.
         levels_tensor = torch.tensor(self._levels, dtype=torch.long)
         self.register_buffer("_levels_np", levels_tensor, persistent=True)
 
@@ -36,18 +36,21 @@ class FiniteScalarQuantizer(BaseQuantizer):
         )
         self.register_buffer("_basis", basis, persistent=True)
 
-        self._codebook_size: int = int(
+        self.codebook_size: int = int(
             torch.prod(self._levels_np).item()  # type: ignore[arg-type]
         )
         self.device = device
 
         implicit_codebook = self.indexes_to_codes(
-            torch.arange(self._codebook_size, dtype=torch.long)
+            torch.arange(self.codebook_size, dtype=torch.long)
         )
         self.register_buffer("_implicit_codebook", implicit_codebook, persistent=True)
 
         # levels_tensor is 1D LongTensor, so len(levels) is a plain int
         self.project_in = nn.Linear(embedding_dim, len(self._levels))
+
+        self.mask_token_idx = self.codebook_size
+        self.mask_token_embedding = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
         nn.init.xavier_uniform_(self.project_in.weight)
         if self.project_in.bias is not None:
@@ -76,21 +79,22 @@ class FiniteScalarQuantizer(BaseQuantizer):
         logger.debug(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
         return quantized / half_width
 
-    def _scale_and_shift(self, zhat_normalized):
+    def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
         levels = self._levels_np
         half_width = levels // 2  # type: ignore[operator]
         return (zhat_normalized * half_width) + half_width
 
-    def _scale_and_shift_inverse(self, zhat):
+    def _scale_and_shift_inverse(self, zhat: torch.Tensor) -> torch.Tensor:
         levels = self._levels_np
         half_width = levels // 2  # type: ignore[operator]
         return (zhat - half_width) / half_width
 
-    def codes_to_indexes(self, zhat):
+    def quantized_value_to_codes(self, zhat: torch.Tensor) -> torch.Tensor:
         """Converts a ‘code‘ to an index in the codebook."""
+        logger.debug(f"zhat shape: {zhat.shape}, levels: {self._levels}")
         assert zhat.shape[-1] == len(self._levels)
         zhat = self._scale_and_shift(zhat)  # type: ignore[arg-type]
-        return (zhat * self._basis).sum(dim=-1).to(torch.uint32)
+        return (zhat * self._basis).sum(dim=-1).to(torch.uint32)  # type: ignore[arg-type]
 
     def indexes_to_codes(self, indices: torch.Tensor):
         """Inverse of ‘indexes_to_codes‘."""
@@ -103,7 +107,7 @@ class FiniteScalarQuantizer(BaseQuantizer):
         codes_non_centered = torch.fmod(div, long_levels)  # type: ignore[arg-type]
         return self._scale_and_shift_inverse(codes_non_centered)
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: [B, T, P, L]
         return self.quantize(z)
 

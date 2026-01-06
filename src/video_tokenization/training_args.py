@@ -12,9 +12,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VideoTokenizerTrainingConfig:
+    dataset_train_key: Optional[str] = None
+    sync_from_s3: bool = False
     image_size: int = 256
     patch_size: int = 8
     batch_size: int = 1
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     min_learning_rate: float = 1e-6
     num_epochs: int = 5
@@ -27,13 +30,12 @@ class VideoTokenizerTrainingConfig:
     tensorboard_dir: str = "runs"
     seed: int = 42
     num_images_in_video: int = 2
+    warmup_steps: int = 100
     d_model: int = 256
     num_transformer_layers: int = 4
     latent_dim: int = 64
-    fsq_latent_dim: int = 1
     num_embeddings: int = 8
     num_heads: int = 2
-    resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
     # Wandb Configuration
