@@ -143,6 +143,7 @@ def _build_test_dataloader(
         dataset=test_dataset,
         local_cache=local_cache,
         image_size=config.image_size,
+        num_images_in_video=config.num_images_in_video,
         limit=100,
     )
 
