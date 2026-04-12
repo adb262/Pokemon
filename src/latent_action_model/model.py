@@ -170,7 +170,7 @@ class LatentActionVQVAE(nn.Module):
 
         # quantized, indices, commitment_loss = self.quantizer(action_continuous)
         logger.debug(f"quantized shape: {quantized.shape}")
-        logger.debug(f"quantized values: {quantized}")
+        # logger.debug(f"quantized values: {quantized}")
         return quantized, patched_video_from_embedder
 
     def project_quantized_actions_fsq(self, quantized: torch.Tensor, patched_video_from_embedder: torch.Tensor) -> torch.Tensor:

@@ -74,6 +74,7 @@ def save_comparison_images_next_frame(
     predicted_actions: list[list[float]],
     expected_videos: list[list[Image.Image]],
     file_prefix: str,
+    file_suffix: str = "next_frame_comparison_grid.png",
 ):
     """
     Save a comparison grid showing original frame, expected next frame, and predicted next frame.
@@ -153,7 +154,7 @@ def save_comparison_images_next_frame(
             )
 
     plt.tight_layout()
-    plt.savefig(f"{file_prefix}/next_frame_comparison_grid.png")
+    plt.savefig(f"{file_prefix}/{file_suffix}")
     plt.close(fig)
 
 

@@ -91,10 +91,13 @@ class FiniteScalarQuantizer(BaseQuantizer):
 
     def quantized_value_to_codes(self, zhat: torch.Tensor) -> torch.Tensor:
         """Converts a ‘code‘ to an index in the codebook."""
-        logger.debug(f"zhat shape: {zhat.shape}, levels: {self._levels}")
+        logger.info(f"zhat shape: {zhat.shape}, levels: {self._levels}")
         assert zhat.shape[-1] == len(self._levels)
         zhat = self._scale_and_shift(zhat)  # type: ignore[arg-type]
-        return (zhat * self._basis).sum(dim=-1).to(torch.uint32)  # type: ignore[arg-type]
+        # Round to nearest integer and clamp to valid range to avoid floating point precision issues
+        codes = (zhat * self._basis).sum(dim=-1)
+        codes = torch.round(codes).clamp(0, self.codebook_size - 1).to(torch.long)
+        return codes
 
     def indexes_to_codes(self, indices: torch.Tensor):
         """Inverse of ‘indexes_to_codes‘."""
