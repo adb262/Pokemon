@@ -112,3 +112,12 @@ Genie explores scaling the decoder separately. Since the decoder is essentially 
 
 
 **You'll notice that a lot of the frames have not been trimmed. I originally removed these artifacts but decided that they actually may improve diversity of generation over time.
+
+- The lookup table only looks at users current action...
+- Train over variable lengths
+
+
+## TODOs
+- []: Update data loader to create an n length sequence of frames, where n >> num_images_in_video, split this up into k samples where each len(sample) == num_images_in_video, k = n - (num_images_in_video - 1). This is because each sequence must be of length num_images_in_video, so we cannot use the first (num_images_in_video - 1) frames as training data. Importantly, we must shuffle our dataset post collection, such that we have a reasonable data mixture for our dynamics model.
+- []: Use data from https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5
+- []: Update our MaskGiT implementation

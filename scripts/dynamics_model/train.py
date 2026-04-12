@@ -25,6 +25,7 @@ from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from latent_action_model.model import LatentActionVQVAE
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
+from monitoring.psnr import compute_delta_psnr
 from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame
 from monitoring.wandb_media import log_image_batches
@@ -60,6 +61,11 @@ def evaluate_model(
     # Collect real and reconstructed frames for FID/FVD computation
     real_frames_batches: list[torch.Tensor] = []
     pred_frames_batches: list[torch.Tensor] = []
+    
+    # Collect metrics for Δt PSNR computation
+    psnr_inferred_list: list[float] = []
+    psnr_random_list: list[float] = []
+    delta_psnr_list: list[float] = []
 
     eval_dir = f"{save_dir}/eval/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
@@ -125,8 +131,10 @@ def evaluate_model(
 
     frechet_metrics = {}
     if real_frames_batches and pred_frames_batches:
-        real_all = torch.cat(real_frames_batches, dim=0)[:, 1:, :, :, :]
-        pred_all = torch.cat(pred_frames_batches, dim=0)
+        trimmed_frames = [frame[:, -2:, :, :, :] for frame in real_frames_batches]
+        trimmed_pred_frames = [frame[:, -2:, :, :, :] for frame in pred_frames_batches]
+        real_all = torch.cat(trimmed_frames, dim=0)
+        pred_all = torch.cat(trimmed_pred_frames, dim=0)
 
         # Compute FID (Frechet Inception Distance) - frame-level metric
         logger.info(f"Computing FID between {real_all.shape} and {pred_all.shape}")
@@ -147,10 +155,32 @@ def evaluate_model(
             "eval/fvd": fvd_score,
         }
 
-    logger.info(
-        f"Eval complete: token_loss={avg_token_loss:.6f}, action_loss={avg_action_loss:.6f}, "
-        f"FID={frechet_distance:.4f}, FVD={fvd_score:.4f}, saved {len(saved_image_paths)} images"
-    )
+    # Compute average PSNR metrics
+    psnr_metrics = {}
+    if psnr_inferred_list:
+        avg_psnr_inferred = sum(psnr_inferred_list) / len(psnr_inferred_list)
+        avg_psnr_random = sum(psnr_random_list) / len(psnr_random_list)
+        avg_delta_psnr = sum(delta_psnr_list) / len(delta_psnr_list)
+        psnr_metrics = {
+            "eval/psnr_inferred": avg_psnr_inferred,
+            "eval/psnr_random": avg_psnr_random,
+            "eval/delta_psnr": avg_delta_psnr,
+        }
+        logger.info(
+            f"PSNR metrics: inferred={avg_psnr_inferred:.4f}, random={avg_psnr_random:.4f}, "
+            f"delta={avg_delta_psnr:.4f}"
+        )
+
+    # Build log string with available metrics
+    log_parts = [f"token_loss={avg_token_loss:.6f}", f"action_loss={avg_action_loss:.6f}"]
+    if frechet_metrics:
+        log_parts.append(f"FID={frechet_metrics.get('eval/fid', float('nan')):.4f}")
+        log_parts.append(f"FVD={frechet_metrics.get('eval/fvd', float('nan')):.4f}")
+    if psnr_metrics:
+        log_parts.append(f"delta_PSNR={psnr_metrics.get('eval/delta_psnr', float('nan')):.4f}")
+    log_parts.append(f"saved {len(saved_image_paths)} images")
+    
+    logger.info(f"Eval complete: {', '.join(log_parts)}")
 
     # Log to wandb if available
     if wandb_logger and global_step is not None:
@@ -160,6 +190,7 @@ def evaluate_model(
             "eval/total_loss": avg_token_loss + avg_action_loss,
             "eval/epoch": epoch,
             **frechet_metrics,
+            **psnr_metrics,
         }
         wandb_logger.log(log_dict, step=global_step)
 
@@ -180,7 +211,6 @@ def evaluate_model(
 def train_epoch(
     dynamics_model: DynamicsModel,
     action_model: LatentActionVQVAE,
-    tokenizer: VideoTokenizer,
     train_dataloader: PokemonOpenWorldLoader,
     test_dataloader: PokemonOpenWorldLoader,
     dynamics_optimizer: optim.Optimizer,
@@ -191,6 +221,7 @@ def train_epoch(
     epoch: int,
     config: DynamicsModelTrainingConfig,
     wandb_logger,
+    global_step: int,
     start_batch: int = 0,
     save_dir: str = "dynamics_model_results",
 ):
@@ -255,11 +286,6 @@ def train_epoch(
 
             batch_time = time.time() - batch_start_time
 
-            # Calculate global step
-            global_step = epoch * (num_batches // accumulation_steps) + (
-                batch_idx // accumulation_steps
-            )
-
             # Log to wandb
             if wandb_logger:
                 wandb_metrics = {
@@ -302,6 +328,7 @@ def train_epoch(
                     wandb_logger=wandb_logger,
                     save_dir=config.save_dir,
                 )
+
                 logger.info(
                     f"Eval - Token Loss: {eval_token_loss:.6f}, Action Loss: {eval_action_loss:.6f}"
                 )
@@ -318,6 +345,9 @@ def train_epoch(
                     dataloader_state,
                 )
 
+            # Increment global step
+            global_step += 1
+
     # Calculate average loss over optimizer steps
     num_optimizer_steps = num_batches // accumulation_steps
     avg_loss = total_loss / max(num_optimizer_steps, 1)
@@ -330,7 +360,7 @@ def train_epoch(
             "train/epoch_time": epoch_time,
             "train/epoch": epoch,
         }
-        wandb_logger.log(epoch_metrics, step=epoch * num_batches)
+        wandb_logger.log(epoch_metrics, step=global_step)
 
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
@@ -595,6 +625,7 @@ def main(config: DynamicsModelTrainingConfig):
 
     # Initial evaluation
     logger.info("Running initial evaluation...")
+    global_step = 0
     eval_token_loss, eval_action_loss = evaluate_model(
         model,
         test_dataloader,
@@ -619,7 +650,6 @@ def main(config: DynamicsModelTrainingConfig):
             avg_loss, global_step = train_epoch(
                 model,
                 action_model,
-                tokenizer,
                 train_dataloader,
                 test_dataloader,
                 optimizer,
@@ -630,6 +660,7 @@ def main(config: DynamicsModelTrainingConfig):
                 epoch,
                 config,
                 wandb_logger,
+                global_step,
                 epoch_start_batch,
                 config.save_dir,
             )
