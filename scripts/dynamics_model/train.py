@@ -474,12 +474,18 @@ def main(config: DynamicsModelTrainingConfig):
         dataset=train_dataset,
         local_cache=local_cache,
         image_size=config.image_size,
+        num_images_in_video=config.num_images_in_video,
+        frame_spacing=config.frame_spacing,
+        num_unique_frames=config.num_unique_frames,
     )
 
     test_dataset = OpenWorldRunningDataset(
         dataset=test_dataset,
         local_cache=local_cache,
         image_size=config.image_size,
+        num_images_in_video=config.num_images_in_video,
+        frame_spacing=config.frame_spacing,
+        num_unique_frames=config.num_unique_frames,
         limit=100,
     )
 

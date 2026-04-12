@@ -13,6 +13,8 @@ class DynamicsModelTrainingConfig:
     image_size: int = 128
     patch_size: int = 4
     num_images_in_video: int = 5
+    frame_spacing: int = 1
+    num_unique_frames: Optional[int] = None
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
     num_epochs: int = 20

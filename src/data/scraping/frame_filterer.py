@@ -80,33 +80,6 @@ class FrameWithPath:
     metadata: FrameMetadata
 
 
-def filter_frame_sequence(
-    frame_sequence: list[FrameWithPath], num_frames_in_video: int
-) -> list[list[str]]:
-    if len(frame_sequence) < num_frames_in_video:
-        return []
-
-    valid_frame_paths: list[list[str]] = []
-    valid_frame_buffer: list[FrameWithPath] = [frame_sequence[0]]
-    for i in range(1, len(frame_sequence)):
-        curr_frame = frame_sequence[i - 1]
-        next_frame = frame_sequence[i]
-
-        if len(valid_frame_buffer) >= num_frames_in_video:
-            valid_frame_paths.append([frame.path for frame in valid_frame_buffer])
-            valid_frame_buffer = [next_frame]
-            continue
-
-        similarity = get_frame_similarity(curr_frame.frame, next_frame.frame)
-        if similarity <= 0.8:
-            valid_frame_buffer.append(next_frame)
-
-    if len(valid_frame_buffer) > 0:
-        valid_frame_paths.append([frame.path for frame in valid_frame_buffer])
-
-    return valid_frame_paths
-
-
 if __name__ == "__main__":
     for frame in os.listdir("cache"):
         with open(os.path.join("cache", frame), "rb") as f:

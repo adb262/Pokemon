@@ -20,7 +20,7 @@ from data.datasets.data_types.open_world_types import (
 from data.s3.gather_frames_in_dirs import S3Frame, list_frames_in_s3
 from data.s3.s3_utils import S3Manager, default_s3_manager
 from data.scraping.frame_extractor import FrameMetadata
-from data.scraping.frame_filterer import FrameWithPath, filter_frame_sequence
+from data.scraping.frame_filterer import FrameWithPath
 
 random.seed(42)
 
@@ -86,12 +86,7 @@ class OpenWorldRunningDatasetCreator:
         for video in dataset.video_logs:
             if len(video.video_log_paths) < self.num_frames_in_video:
                 continue
-
-            trimmed_log = OpenWorldVideoLogSingleton(
-                video_log_paths=video.video_log_paths[: self.num_frames_in_video],
-                video_id=video.video_id,
-            )
-            valid_videos.append(trimmed_log)
+            valid_videos.append(video)
 
         valid_videos = list(set(valid_videos))[:limit]
         return OpenWorldVideoLog(video_logs=valid_videos)
@@ -108,10 +103,10 @@ class OpenWorldRunningDatasetCreator:
 
     def _get_dataset_key(self, stage: Literal["train", "test"], split: float) -> str:
         formatted_split = str(split).replace(".", "_")
-        return f"{self.dataset_dir}_{stage}_{formatted_split}_{self.num_frames_in_video}_frames.json"
+        return f"{self.dataset_dir}_{stage}_{formatted_split}_{self.num_frames_in_video}_frames_v2.json"
 
     def _filter_to_correct_num_frames(self, dataset: OpenWorldVideoLog) -> OpenWorldVideoLog:
-        return OpenWorldVideoLog(video_logs=[video for video in dataset.video_logs if len(video.video_log_paths) == self.num_frames_in_video])
+        return OpenWorldVideoLog(video_logs=[video for video in dataset.video_logs if len(video.video_log_paths) >= self.num_frames_in_video])
 
     def load_existing_dataset(
         self, key: str,
@@ -215,16 +210,13 @@ class OpenWorldRunningDatasetCreator:
         if len(frame_list) < num_frames_in_video:
             return []
 
-        frames = filter_frame_sequence(frame_list, num_frames_in_video)
-        videos: list[OpenWorldVideoLogSingleton] = [
-            OpenWorldVideoLogSingleton(
-                video_log_paths=frame_sequence, video_id=frame_list[0].metadata.video_id
-            )
-            for frame_sequence in frames
-        ]
-        logger.info(f"Added {len(videos)} videos")
-        progress_bar.update(len(videos))
-        return videos
+        video = OpenWorldVideoLogSingleton(
+            video_log_paths=[frame.path for frame in frame_list],
+            video_id=frame_list[0].metadata.video_id,
+        )
+        logger.info(f"Added 1 video ({len(frame_list)} frames)")
+        progress_bar.update(1)
+        return [video]
 
     def _get_frame_sequences_from_local(
         self,
