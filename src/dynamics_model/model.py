@@ -61,10 +61,15 @@ class DynamicsModel(nn.Module):
             nn.GELU(),
             nn.Linear(d_model * 4, self.tokenizer.get_vocab_size()),
         )
+        self.softmax = nn.Softmax(dim=-1)
         self.token_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         self.action_loss_fn = reconstruction_loss
 
         init_weights(self)
+
+    @staticmethod
+    def cosine_scheduler(max_steps: int, current_step: int, device: torch.device):
+        return 0.5 * (1 + torch.cos(torch.pi * torch.tensor(current_step) / torch.tensor(max_steps, device=device)))
 
     def forward(
         self, video: torch.Tensor
@@ -80,16 +85,20 @@ class DynamicsModel(nn.Module):
                 self.tokenizer.encode(video)
             ).long()
 
-        batch_size, num_images_in_video, num_patches = targets.shape
+        batch_size, _, num_patches = targets.shape
+        mask_ratio = torch.empty(batch_size, 1, 1, device=targets.device).uniform_(
+            self.mask_ratio_lower_bound, self.mask_ratio_upper_bound
+        )
         mask = (
-            torch.rand(batch_size, num_images_in_video - 1, num_patches, device=targets.device)
-            < self.mask_ratio_distribution.sample()
-        )  # Boolean mask: True = masked position
+            torch.rand(batch_size, 1, num_patches, device=targets.device) < mask_ratio
+        )  # Boolean mask over only the target frame
 
         # Save original targets for loss computation before masking
         original_targets = targets.clone()
 
-        targets[:, 1:, :] = self.tokenizer.mask_codebook_tokens(targets[:, 1:, :].long(), mask.long())
+        targets[:, -1:, :] = self.tokenizer.mask_codebook_tokens(
+            targets[:, -1:, :].long(), mask
+        )
 
         # TODO: Should this also use the mask?
         # (batch_size, num_images_in_video - 1, num_patches, d_model)
@@ -116,14 +125,124 @@ class DynamicsModel(nn.Module):
             video[:, 1:, :, :], reconstructed_action_video
         )
 
-        # Use original targets for loss; ignore unmasked positions
-        original_targets[:, 1:, :][~mask] = torch.tensor(-100, dtype=torch.long, device=original_targets.device)  # ~mask is proper boolean NOT here
+        # Only compute token loss on masked positions of the final frame.
+        target_frame = original_targets[:, -1:, :].masked_fill(~mask, -100)
 
         # View both as 3d tensors for the loss function
         logger.debug(f"x shape: {x.shape}, targets shape: {targets.shape}")
-        predicted_tokens = rearrange(x[:, 1:, :, :], "b t p d -> b (t p) d")
-        target_tokens = rearrange(original_targets[:, 1:, :], "b t p -> b (t p)")
+        predicted_tokens = rearrange(x[:, -1:, :, :], "b t p d -> b (t p) d")
+        target_tokens = rearrange(target_frame, "b t p -> b (t p)")
         logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
         token_loss = self.token_loss_fn(predicted_tokens.transpose(1, 2), target_tokens)
 
         return x, token_loss, action_loss
+
+    @torch.inference_mode()
+    def inference(self, video: torch.Tensor, action: int, max_steps: int = 10):
+        # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
+        # input is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
+        # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
+        # And the masked targets
+
+        # x is of shape (batch_size, num_images_in_video, num_patches)
+        with torch.no_grad():
+            # x is of shape (batch_size, num_images_in_video, num_patches)
+            targets = self.tokenizer.quantized_value_to_codes(
+                self.tokenizer.encode(video)
+            ).long()
+
+        action_token = torch.tensor([action], dtype=torch.long, device=targets.device)
+        batch_size, num_images_in_video, num_patches = targets.shape
+        mask_tensor = torch.full((1, 1, num_patches), self.tokenizer.get_mask_token_idx(), dtype=torch.long, device=targets.device)
+        targets = torch.cat([targets, mask_tensor], dim=1)
+
+        # TODO: Should this also use the mask?
+        # (batch_size, num_images_in_video - 1, num_patches, d_model)
+        action_video_encoded, patched_video_from_action_embedder = self.action_model.encode(video)
+
+        action_tokens = self.action_model.get_action_sequence(
+            action_video_encoded
+        )
+        logger.info(f"action_tokens shape: {action_tokens.shape}")
+        logger.info(f"action_token shape: {action_token.shape}")
+        action_tokens = torch.cat([action_tokens.long(), action_token.unsqueeze(1)], dim=1)
+
+        # action_tokens is of shape (batch_size, num_images_in_video, num_patches)
+        # Produces a sequence of action embeddings of shape (batch_size, num_images_in_video, num_patches, d_model)
+        action_embeddings = self.action_embedding(action_tokens.long())
+
+        # targets is of shape (batch_size, num_images_in_video, num_patches)
+        step = 0
+        mask_locations = torch.full((batch_size, num_patches), True, dtype=torch.bool, device=targets.device)
+        while step < max_steps:
+            x = self.tokenizer_embedding(targets.long())
+            logger.info(f"action_embeddings shape: {action_embeddings.shape}")
+            logger.info(f"x shape: {x.shape}")
+
+            # Unsqueeze to add to each patch in the sequence
+            x[:, :-1, :] += action_embeddings.unsqueeze(2)
+
+            x = self.decoder(x)
+
+            # logits is of shape (batch_size, num_images_in_video, num_patches, vocab_size)
+            logits = self.vocab_head(x)
+
+            # Stop early if everything is filled
+            if not mask_locations.any():
+                break
+
+            # MaskGIT schedule: γ(t/T) gives fraction that should REMAIN masked after step t
+            # tokens_to_unmask = current_masked - target_remaining_masked
+            ratio_remaining = self.cosine_scheduler(max_steps, step + 1, targets.device)
+            target_still_masked = int(num_patches * ratio_remaining)
+            current_masked = int(mask_locations.sum(dim=1).amax().item())
+            tokens_to_update = max(0, current_masked - target_still_masked)
+
+            # logits[:, -1] -> (batch_size, num_patches, vocab_size)
+            probs = self.softmax(logits[:, -1])
+
+            # Sample only masked positions to avoid zero-probability rows
+            mask_flat = mask_locations.view(-1)
+            probs_flat = probs.view(-1, probs.size(-1))
+            samples_flat = torch.full(
+                (batch_size * num_patches,),
+                -100,
+                device=targets.device,
+                dtype=torch.long,
+            )
+            if mask_flat.any():
+                probs_masked = probs_flat[mask_flat]
+                probs_masked = probs_masked / (probs_masked.sum(-1, keepdim=True) + 1e-9)
+                sampled_masked = torch.multinomial(probs_masked, 1, replacement=False).squeeze(-1)
+                samples_flat[mask_flat] = sampled_masked
+
+            samples = samples_flat.view(batch_size, num_patches)
+
+            # Score sampled tokens to pick which patches to commit this step
+            sampled_scores = probs.gather(
+                -1, samples.clamp_min(0).unsqueeze(-1)
+            ).squeeze(-1)
+            sampled_scores[samples < 0] = -1
+
+            logger.info(f"tokens_to_update: {tokens_to_update}")
+
+            if tokens_to_update > 0:
+                _, top_positions = torch.topk(
+                    sampled_scores, tokens_to_update, dim=-1
+                )
+                top_tokens = samples.gather(1, top_positions)
+
+                # Scatter sampled tokens into the target frame at chosen positions
+                targets_last = targets[:, -1, :]
+                targets_last = targets_last.scatter(1, top_positions, top_tokens)
+                targets[:, -1, :] = targets_last
+
+                # Mark those positions as filled
+                mask_locations = mask_locations.scatter(
+                    1, top_positions, torch.zeros_like(top_positions, dtype=torch.bool)
+                )
+
+            step += 1
+
+        return self.tokenizer.decode_from_codes(targets.float())
+
