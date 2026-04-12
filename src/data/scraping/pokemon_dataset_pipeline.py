@@ -54,6 +54,9 @@ class PokemonDatasetPipeline:
         self.scraper = PokemonVideoScraper(
             output_dir=self._raw_videos_dir,
             max_videos_per_game=self._max_videos_per_game,
+            video_url=config.video_url,
+            game_name=config.game_name,
+            cookies_file=config.cookies_file,
         )
         self.cleaner = PokemonVideoCleaner(min_gameplay_ratio=self._min_gameplay_ratio)
         self.extractor = PokemonFrameExtractor(

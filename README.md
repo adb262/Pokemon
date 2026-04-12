@@ -8,7 +8,12 @@ Because many pairs of frames are the same, I modified the reconstruction loss to
 
 We can scrape a bunch of youtube videos with the following:
 ```
-python -m src.data.scraping.pokemon_dataset_pipeline --clean --extract --summary --extract --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
+python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
+```
+
+To download from a specific YouTube video or playlist URL:
+```
+python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --video_url "https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5" --game_name "Pokemon Emerald" --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16
 ```
 Our end state is to have groups (starting with "pairs" i.e. group of 2) from which we can learn our latent actions. This means that we need to pair up frame x and frame x+1. Eventually, I will roll out support for larger groups, since the learning dynamics should be smoother.
 

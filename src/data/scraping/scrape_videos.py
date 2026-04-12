@@ -52,6 +52,9 @@ class PokemonVideoScraper:
         s3_manager: Optional[S3Manager] = None,
         s3_prefix: str = "raw_videos",
         keep_local_copy: bool = False,
+        video_url: Optional[str] = None,
+        game_name: str = "Pokemon Emerald",
+        cookies_file: Optional[str] = None,
     ):
         """
         Initialize the Pokemon video scraper
@@ -63,10 +66,16 @@ class PokemonVideoScraper:
             s3_manager: S3Manager instance (if None and use_s3=True, will create from env)
             s3_prefix: S3 prefix for uploaded videos
             keep_local_copy: Whether to keep local copies when using S3
+            video_url: Direct YouTube URL (video or playlist) to download from
+            game_name: Game name to use when downloading from a URL
+            cookies_file: Path to a Netscape-format cookies.txt file for YouTube auth
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.max_videos_per_game = max_videos_per_game
+        self.video_url = video_url
+        self.game_name = game_name
+        self.cookies_file = cookies_file
         self.use_s3 = use_s3
         self.s3_prefix = s3_prefix
         self.keep_local_copy = keep_local_copy
@@ -206,11 +215,21 @@ class PokemonVideoScraper:
         logger.info(f"Generated {len(queries)} search queries")
         return queries
 
+    YT_EXTRACTOR_ARGS = {"youtube": {"player_client": ["mediaconnect"]}}
+
+    def _base_ydl_opts(self) -> Dict:
+        """Base yt-dlp options shared across all calls (auth, extractor args)."""
+        opts: Dict[str, Any] = {
+            "extractor_args": self.YT_EXTRACTOR_ARGS,
+        }
+        if self.cookies_file:
+            opts["cookiefile"] = self.cookies_file
+        return opts
+
     def _get_ydl_opts(self, game_dir: Path) -> Dict:
         """Get yt-dlp options for downloading"""
         return {
-            # Prefer low-resolution video to save space/bandwidth (target 360p)
-            # Try to explicitly get MP4 video+audio, and if that fails, fall back to other low-quality formats.
+            **self._base_ydl_opts(),
             "format": (
                 "bv*[height<=360][ext=mp4]+ba[ext=m4a]/"
                 "b[height<=360][ext=mp4]/"
@@ -218,7 +237,6 @@ class PokemonVideoScraper:
                 "worst[ext=mp4]/"
                 "worst"
             ),
-            # Ensure final container is MP4 when possible
             "merge_output_format": "mp4",
             "outtmpl": str(game_dir / "%(title)s.%(id)s.%(ext)s"),
             "writeinfojson": True,
@@ -283,12 +301,16 @@ class PokemonVideoScraper:
         return True
 
     def _process_video_entry(
-        self, entry: Dict, game_name: str, game_dir: Path
+        self,
+        entry: Dict,
+        game_name: str,
+        game_dir: Path,
+        skip_filter: bool = False,
     ) -> Optional[str]:
         """
         Process a single video entry:
         - Fetch full info
-        - Filter by metadata
+        - Filter by metadata (unless skip_filter is True)
         - Download video
         - Optionally upload to S3
         Returns the video ID if a video was successfully downloaded (and/or uploaded),
@@ -309,7 +331,9 @@ class PokemonVideoScraper:
 
         try:
             # Get full video info for filtering
-            with yt_dlp.YoutubeDL({"quiet": True}) as info_ydl:
+            with yt_dlp.YoutubeDL(
+                {**self._base_ydl_opts(), "quiet": True}
+            ) as info_ydl:
                 full_info = info_ydl.extract_info(
                     f"https://youtube.com/watch?v={video_id}",
                     download=False,
@@ -319,7 +343,7 @@ class PokemonVideoScraper:
             with self._downloaded_lock:
                 self.downloaded_videos.add(video_id)
 
-            if full_info and not self._filter_video_info(full_info):
+            if not skip_filter and full_info and not self._filter_video_info(full_info):
                 title = full_info.get("title", "Unknown")
                 logger.info(f"Video {title} ({video_id}) filtered out")
                 return None
@@ -375,8 +399,8 @@ class PokemonVideoScraper:
 
         downloaded_files: List[str] = []
 
-        # Search options
         search_opts = {
+            **self._base_ydl_opts(),
             "quiet": True,
             "no_warnings": True,
             "extract_flat": True,
@@ -432,14 +456,68 @@ class PokemonVideoScraper:
 
         return downloaded_files
 
+    def download_from_url(self, url: str, game_name: str) -> List[str]:
+        """Download videos from a direct YouTube URL (single video or playlist).
+
+        Downloads the entire URL in a single yt-dlp invocation to avoid
+        per-video extract_info calls that trigger bot detection.
+
+        Args:
+            url: YouTube video or playlist URL
+            game_name: Game name for organizing downloads
+
+        Returns:
+            List of successfully downloaded video file paths
+        """
+        game_dir = self.output_dir / game_name.replace(" ", "_").lower()
+        game_dir.mkdir(exist_ok=True)
+
+        download_opts = self._get_ydl_opts(game_dir)
+
+        downloaded_files: List[str] = []
+
+        try:
+            logger.info(f"Downloading from URL: {url}")
+            with yt_dlp.YoutubeDL(download_opts) as ydl:
+                ydl.download([url])
+
+            video_extensions = {".mp4", ".mkv", ".webm"}
+            for f in game_dir.iterdir():
+                if f.suffix in video_extensions:
+                    downloaded_files.append(str(f))
+
+            logger.info(f"Downloaded {len(downloaded_files)} videos to {game_dir}")
+
+            if self.use_s3:
+                for video_path in downloaded_files:
+                    video_file = Path(video_path)
+                    upload_success = self._upload_video_to_s3(video_file, game_name)
+                    if upload_success:
+                        self._cleanup_local_file(video_file)
+
+            self._save_downloaded_list()
+
+        except Exception as e:
+            logger.error(f"Error downloading from URL '{url}': {e}")
+
+        return downloaded_files
+
     def scrape_all_games(self):
-        """Scrape videos for all Pokemon games"""
+        """Scrape videos for all Pokemon games, or from a specific URL if provided."""
         logger.info("Starting Pokemon video scraping...")
         if self.use_s3:
             logger.info(
                 f"S3 upload enabled - bucket: {self.s3_manager.bucket_name if self.s3_manager else 'Unknown'}"
             )
             logger.info(f"Keep local copies: {self.keep_local_copy}")
+
+        if self.video_url:
+            logger.info(f"Downloading from URL: {self.video_url}")
+            downloaded = self.download_from_url(self.video_url, self.game_name)
+            logger.info(
+                f"Scraping complete! Total videos downloaded: {len(downloaded)}"
+            )
+            return
 
         total_downloaded = 0
 

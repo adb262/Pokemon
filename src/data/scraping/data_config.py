@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -12,6 +13,9 @@ class PokemonDatasetPipelineConfig:
     clean: bool = False
     extract: bool = False
     summary: bool = False
+    video_url: Optional[str] = None
+    game_name: str = "Pokemon Emerald"
+    cookies_file: Optional[str] = None
     min_gameplay_ratio: float = 0.6
     target_fps: int = 5
     target_height: int = 360
