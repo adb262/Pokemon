@@ -1,7 +1,6 @@
 import logging
 import random
 import traceback
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -12,6 +11,7 @@ from tqdm import tqdm
 from data.datasets.cache import Cache
 from data.datasets.data_types.open_world_types import (
     OpenWorldVideoLog,
+    OpenWorldVideoLogSingleton,
 )
 from data.scraping.frame_filterer import get_frame_similarity
 
@@ -19,13 +19,17 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-@dataclass
-class SlidingWindowSample:
-    video_log_index: int
-    start_offset: int
-
-
 class OpenWorldRunningDataset(Dataset):
+    """Dataset of pre-extracted sliding-window video clips.
+
+    Sliding windows are baked into the video logs at dataset-creation time by
+    `OpenWorldRunningDatasetCreator` (each `OpenWorldVideoLogSingleton` is
+    already a single window of exactly `num_images_in_video` frames, sampled
+    with the configured frame_spacing). This dataset therefore just shuffles
+    the pre-extracted windows and optionally filters them by distinct-frame
+    count.
+    """
+
     dataset: OpenWorldVideoLog
 
     def __init__(
@@ -34,7 +38,6 @@ class OpenWorldRunningDataset(Dataset):
         local_cache: Cache,
         image_size: int,
         num_images_in_video: int,
-        frame_spacing: int = 1,
         num_unique_frames: int | None = None,
         limit: int | None = None,
     ):
@@ -45,35 +48,18 @@ class OpenWorldRunningDataset(Dataset):
         self.local_cache = local_cache
         self.image_size = image_size
         self.num_images_in_video = num_images_in_video
-        self.frame_spacing = frame_spacing
         self.num_unique_frames = num_unique_frames
 
-        self.samples = self._build_sliding_window_index()
+        self.samples = self._build_sample_index()
         logger.info(
-            f"Built {len(self.samples)} sliding-window samples from "
-            f"{len(dataset.video_logs)} video sequences "
-            f"(num_images_in_video={num_images_in_video}, frame_spacing={frame_spacing})"
+            f"Using {len(self.samples)} pre-extracted window samples from "
+            f"{len(dataset.video_logs)} video logs "
+            f"(num_images_in_video={num_images_in_video})"
         )
 
-    def _get_frame_paths_for_window(
-        self, video_paths: list[str], start_offset: int
-    ) -> list[str]:
-        return [
-            video_paths[i]
-            for i in range(
-                start_offset,
-                start_offset + self.num_images_in_video * self.frame_spacing,
-                self.frame_spacing,
-            )
-        ]
-
-    def _count_unique_frames_for_sample(self, sample: SlidingWindowSample) -> int:
-        """Load the frames for a sample and count how many are distinct."""
-        paths = self._get_frame_paths_for_window(
-            self.dataset.video_logs[sample.video_log_index].video_log_paths,
-            sample.start_offset,
-        )
-        images = [self.local_cache.get(p) for p in paths]
+    def _count_unique_frames(self, window: OpenWorldVideoLogSingleton) -> int:
+        """Load the frames for a window and count how many are distinct."""
+        images = [self.local_cache.get(p) for p in window.video_log_paths]
 
         unique = 1
         for i in range(1, len(images)):
@@ -83,31 +69,18 @@ class OpenWorldRunningDataset(Dataset):
                 unique += 1
         return unique
 
-    def _build_sliding_window_index(self) -> list[SlidingWindowSample]:
-        """Build a shuffled flat index of sliding window samples.
-
-        1. Generate all valid sliding windows across every video sequence.
-        2. If num_unique_frames is set, filter out windows with too few distinct frames.
-        3. Shuffle the result for training data mixture.
-        """
-        span = (self.num_images_in_video - 1) * self.frame_spacing + 1
-
-        samples: list[SlidingWindowSample] = []
-        for video_idx, video_log in enumerate(self.dataset.video_logs):
-            n = len(video_log.video_log_paths)
-            num_windows = n - span + 1
-            if num_windows <= 0:
-                continue
-            samples.extend(
-                SlidingWindowSample(video_log_index=video_idx, start_offset=offset)
-                for offset in range(num_windows)
-            )
+    def _build_sample_index(self) -> list[OpenWorldVideoLogSingleton]:
+        """Return the (optionally filtered and shuffled) list of window samples."""
+        samples = [
+            v for v in self.dataset.video_logs
+            if len(v.video_log_paths) >= self.num_images_in_video
+        ]
 
         if self.num_unique_frames is not None:
             pre_filter_count = len(samples)
             samples = [
                 s for s in tqdm(samples, desc="Filtering by unique frames")
-                if self._count_unique_frames_for_sample(s) >= self.num_unique_frames  # type: ignore[operator]
+                if self._count_unique_frames(s) >= self.num_unique_frames  # type: ignore[operator]
             ]
             logger.info(
                 f"Unique-frame filter: {pre_filter_count} -> {len(samples)} samples "
@@ -138,9 +111,7 @@ class OpenWorldRunningDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> torch.Tensor | None:
-        sample = self.samples[idx]
-        all_paths = self.dataset.video_logs[sample.video_log_index].video_log_paths
-        video_paths = self._get_frame_paths_for_window(all_paths, sample.start_offset)
+        video_paths = self.samples[idx].video_log_paths
 
         try:
             images = [self._load_image_locally(path) for path in video_paths]

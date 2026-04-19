@@ -1,4 +1,13 @@
-# python -m scripts.mask_git.train --tokenizer_checkpoint_path checkpoints/tokenizer.pt --frames_dir pokemon --num_images_in_video 4 --batch_size 4
+"""
+python -m scripts.dynamics_model.train \
+  --tokenizer_checkpoint_path fsq_tokenizer_2k_128_4_512_8_heads_4_layers/checkpoint_epoch1_batch2000.pt \
+  --image_size 128 \
+  --patch_size 4 \
+  --num_images_in_video 5 \
+  --batch_size 4 \
+  --frames_dir pokemon_frames
+
+  """
 import logging
 import os
 import time
@@ -25,7 +34,7 @@ from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from latent_action_model.model import LatentActionVQVAE
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
-from monitoring.psnr import compute_delta_psnr
+from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity
 from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame
 from monitoring.wandb_media import log_image_batches
@@ -67,6 +76,10 @@ def evaluate_model(
     psnr_random_list: list[float] = []
     delta_psnr_list: list[float] = []
 
+    # Collect pixel similarity between last two frames (t-2 vs t-1)
+    gt_next_frame_sim_list: list[float] = []
+    pred_next_frame_sim_list: list[float] = []
+
     eval_dir = f"{save_dir}/eval/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
     logger.info(f"Saving eval results to {eval_dir}")
@@ -94,6 +107,21 @@ def evaluate_model(
                 real_target_frames = video_batch
                 real_frames_batches.append(real_target_frames.detach().cpu())
                 pred_frames_batches.append(reconstructed_video.detach().cpu())
+
+                # Pixel similarity between the last two frames (t-2 vs t-1)
+                # for both ground truth and predicted videos.
+                if real_target_frames.shape[1] >= 2:
+                    gt_next_frame_sim_list.append(
+                        compute_frame_pixel_similarity(
+                            real_target_frames[:, -2], real_target_frames[:, -1]
+                        )
+                    )
+                if reconstructed_video.shape[1] >= 2:
+                    pred_next_frame_sim_list.append(
+                        compute_frame_pixel_similarity(
+                            reconstructed_video[:, -2], reconstructed_video[:, -1]
+                        )
+                    )
 
                 # Save comparison images
                 predicted_videos = convert_video_to_images(reconstructed_video)
@@ -171,6 +199,17 @@ def evaluate_model(
             f"delta={avg_delta_psnr:.4f}"
         )
 
+    # Pixel similarity between the last two frames (t-2 vs t-1).
+    frame_sim_metrics: dict[str, float] = {}
+    if gt_next_frame_sim_list:
+        frame_sim_metrics["eval/ground_truth_next_frame_sim"] = sum(
+            gt_next_frame_sim_list
+        ) / len(gt_next_frame_sim_list)
+    if pred_next_frame_sim_list:
+        frame_sim_metrics["eval/predicted_next_frame_sim"] = sum(
+            pred_next_frame_sim_list
+        ) / len(pred_next_frame_sim_list)
+
     # Build log string with available metrics
     log_parts = [f"token_loss={avg_token_loss:.6f}", f"action_loss={avg_action_loss:.6f}"]
     if frechet_metrics:
@@ -178,6 +217,13 @@ def evaluate_model(
         log_parts.append(f"FVD={frechet_metrics.get('eval/fvd', float('nan')):.4f}")
     if psnr_metrics:
         log_parts.append(f"delta_PSNR={psnr_metrics.get('eval/delta_psnr', float('nan')):.4f}")
+    if frame_sim_metrics:
+        log_parts.append(
+            f"gt_sim={frame_sim_metrics.get('eval/ground_truth_next_frame_sim', float('nan')):.4f}"
+        )
+        log_parts.append(
+            f"pred_sim={frame_sim_metrics.get('eval/predicted_next_frame_sim', float('nan')):.4f}"
+        )
     log_parts.append(f"saved {len(saved_image_paths)} images")
     
     logger.info(f"Eval complete: {', '.join(log_parts)}")
@@ -191,6 +237,7 @@ def evaluate_model(
             "eval/epoch": epoch,
             **frechet_metrics,
             **psnr_metrics,
+            **frame_sim_metrics,
         }
         wandb_logger.log(log_dict, step=global_step)
 
@@ -453,6 +500,7 @@ def main(config: DynamicsModelTrainingConfig):
         limit=50000,
         image_size=config.image_size,
         use_s3=config.use_s3,
+        frame_spacing=config.frame_spacing,
     )
 
     if config.dataset_train_key is None:
@@ -475,7 +523,6 @@ def main(config: DynamicsModelTrainingConfig):
         local_cache=local_cache,
         image_size=config.image_size,
         num_images_in_video=config.num_images_in_video,
-        frame_spacing=config.frame_spacing,
         num_unique_frames=config.num_unique_frames,
     )
 
@@ -484,7 +531,6 @@ def main(config: DynamicsModelTrainingConfig):
         local_cache=local_cache,
         image_size=config.image_size,
         num_images_in_video=config.num_images_in_video,
-        frame_spacing=config.frame_spacing,
         num_unique_frames=config.num_unique_frames,
         limit=100,
     )

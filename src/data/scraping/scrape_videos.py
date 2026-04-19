@@ -459,47 +459,80 @@ class PokemonVideoScraper:
     def download_from_url(self, url: str, game_name: str) -> List[str]:
         """Download videos from a direct YouTube URL (single video or playlist).
 
-        Downloads the entire URL in a single yt-dlp invocation to avoid
-        per-video extract_info calls that trigger bot detection.
-
         Args:
             url: YouTube video or playlist URL
             game_name: Game name for organizing downloads
 
         Returns:
-            List of successfully downloaded video file paths
+            List of successfully downloaded video IDs
         """
         game_dir = self.output_dir / game_name.replace(" ", "_").lower()
         game_dir.mkdir(exist_ok=True)
 
-        download_opts = self._get_ydl_opts(game_dir)
-
         downloaded_files: List[str] = []
 
+        extract_opts = {
+            **self._base_ydl_opts(),
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "ignoreerrors": True,
+        }
+
         try:
-            logger.info(f"Downloading from URL: {url}")
-            with yt_dlp.YoutubeDL(download_opts) as ydl:
-                ydl.download([url])
+            with yt_dlp.YoutubeDL(extract_opts) as ydl:
+                logger.info(f"Extracting video info from URL: {url}")
+                info = ydl.extract_info(url, download=False)
 
-            video_extensions = {".mp4", ".mkv", ".webm"}
-            for f in game_dir.iterdir():
-                if f.suffix in video_extensions:
-                    downloaded_files.append(str(f))
+                if not info:
+                    logger.error(f"Could not extract info from URL: {url}")
+                    return downloaded_files
 
-            logger.info(f"Downloaded {len(downloaded_files)} videos to {game_dir}")
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    logger.info(
+                        f"Found playlist with {len(entries)} videos"
+                    )
+                else:
+                    entries = [info]
+                    logger.info("Found single video")
 
-            if self.use_s3:
-                for video_path in downloaded_files:
-                    video_file = Path(video_path)
-                    upload_success = self._upload_video_to_s3(video_file, game_name)
-                    if upload_success:
-                        self._cleanup_local_file(video_file)
+            max_workers = min(self.max_workers, len(entries))
+            logger.info(
+                f"Downloading {len(entries)} videos with {max_workers} threads"
+            )
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_id = {
+                    executor.submit(
+                        self._process_video_entry,
+                        entry,
+                        game_name,
+                        game_dir,
+                        skip_filter=True,
+                    ): entry.get("id")
+                    for entry in entries
+                }
+
+                for future in as_completed(future_to_id):
+                    video_id = future_to_id[future]
+                    try:
+                        result_id = future.result()
+                        if result_id:
+                            downloaded_files.append(result_id)
+                    except Exception as e:
+                        logger.error(
+                            f"Unhandled error processing video {video_id}: {e}"
+                        )
 
             self._save_downloaded_list()
 
         except Exception as e:
             logger.error(f"Error downloading from URL '{url}': {e}")
 
+        logger.info(
+            f"Downloaded {len(downloaded_files)} videos from URL"
+        )
         return downloaded_files
 
     def scrape_all_games(self):

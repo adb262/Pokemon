@@ -10,7 +10,7 @@ from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrame
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class VideoTokenizerEncoder(nn.Module):

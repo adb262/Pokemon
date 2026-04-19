@@ -32,6 +32,7 @@ class S3Manager:
         region_name: str = "us-east-1",
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        aws_session_token: Optional[str] = None,
     ):
         """
         Initialize S3 manager
@@ -41,12 +42,14 @@ class S3Manager:
             region_name: AWS region
             aws_access_key_id: AWS access key (optional, can use env vars)
             aws_secret_access_key: AWS secret key (optional, can use env vars)
+            aws_session_token: AWS session token for temporary credentials
+                (optional, can use env vars)
         """
         self.bucket_name = bucket_name
         self.region_name = region_name
 
         # Initialize S3 client
-        session_kwargs = {"region_name": region_name}
+        session_kwargs: Dict[str, Any] = {"region_name": region_name}
         if aws_access_key_id and aws_secret_access_key:
             session_kwargs.update(
                 {
@@ -54,6 +57,8 @@ class S3Manager:
                     "aws_secret_access_key": aws_secret_access_key,
                 }
             )
+            if aws_session_token:
+                session_kwargs["aws_session_token"] = aws_session_token
 
         try:
             self.session = boto3.Session(**session_kwargs)
@@ -419,6 +424,8 @@ def get_s3_manager_from_env() -> S3Manager:
     - AWS_REGION: AWS region (default: us-east-1)
     - AWS_ACCESS_KEY_ID: AWS access key
     - AWS_SECRET_ACCESS_KEY: AWS secret key
+    - AWS_SESSION_TOKEN: AWS session token (required for temporary/session
+      based credentials, e.g. STS / AWS SSO)
 
     Returns:
         S3Manager instance
@@ -430,6 +437,7 @@ def get_s3_manager_from_env() -> S3Manager:
     region_name = os.getenv("AWS_REGION", "us-east-1")
     aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
     aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_session_token = os.getenv("AWS_SESSION_TOKEN")
 
     if not aws_access_key_id or not aws_secret_access_key:
         raise ValueError(
@@ -441,6 +449,7 @@ def get_s3_manager_from_env() -> S3Manager:
         region_name=region_name,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
     )
 
 
