@@ -158,6 +158,99 @@ def save_comparison_images_next_frame(
     plt.close(fig)
 
 
+def save_rollout_comparison_grid(
+    gt_videos: list[list[Image.Image]],
+    predicted_videos: list[list[Image.Image]],
+    predicted_actions: list[list[int]],
+    output_dir: str,
+    context_len: int,
+    file_suffix: str = "rollout_comparison_grid.png",
+):
+    """Save a comparison grid for a dynamics-model rollout eval.
+
+    Each sample produces 2 rows × 2T columns:
+      Row 0 (GT):        gt[0..2T-1]
+      Row 1 (Predicted): gt[0..T-1] then pred_0..pred_{T-1}
+
+    A vertical divider is drawn between the context region (cols 0..T-1)
+    and the rollout region (cols T..2T-1).
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_samples = len(gt_videos)
+    if num_samples == 0:
+        return
+
+    total_cols = len(gt_videos[0])
+
+    total_rows = num_samples * 2
+    fig, axs = plt.subplots(
+        total_rows,
+        total_cols,
+        figsize=(max(8, total_cols * 2.2), total_rows * 2.0),
+    )
+
+    if total_rows == 1:
+        axs = np.expand_dims(axs, axis=0)
+    if total_cols == 1:
+        axs = np.expand_dims(axs, axis=1)
+
+    for sample_idx in range(num_samples):
+        gt = gt_videos[sample_idx]
+        pred = predicted_videos[sample_idx]
+        actions = predicted_actions[sample_idx]
+        row_offset = sample_idx * 2
+
+        for col in range(total_cols):
+            # Row 0: ground truth
+            axs[row_offset, col].imshow(gt[col])
+            axs[row_offset, col].axis("off")
+            if col == 0:
+                axs[row_offset, col].set_ylabel(
+                    f"Sample {sample_idx}\nGT", fontsize=10
+                )
+
+            # Row 1: predicted (context region = raw GT, rollout region = model predictions)
+            axs[row_offset + 1, col].imshow(pred[col])
+            axs[row_offset + 1, col].axis("off")
+            if col == 0:
+                axs[row_offset + 1, col].set_ylabel("Predicted", fontsize=10)
+
+            # Column titles on top row of each sample
+            if col < context_len:
+                title = f"t={col}"
+            else:
+                action_idx = col - context_len
+                action_val = actions[action_idx] if action_idx < len(actions) else "?"
+                title = f"t={col}  a={action_val}"
+            axs[row_offset, col].set_title(title, fontsize=9)
+
+        # Draw vertical divider at the context/rollout boundary
+        for row in range(2):
+            r = row_offset + row
+            if context_len - 1 < total_cols:
+                ax_left = axs[r, context_len - 1]
+                for spine in ax_left.spines.values():
+                    spine.set_visible(False)
+                ax_left.spines["right"].set_visible(True)
+                ax_left.spines["right"].set_color("red")
+                ax_left.spines["right"].set_linewidth(3)
+            if context_len < total_cols:
+                ax_right = axs[r, context_len]
+                for spine in ax_right.spines.values():
+                    spine.set_visible(False)
+                ax_right.spines["left"].set_visible(True)
+                ax_right.spines["left"].set_color("red")
+                ax_right.spines["left"].set_linewidth(3)
+
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/{file_suffix}")
+    plt.close(fig)
+
+
 def save_comparison_images(
     predicted_videos: list[list[Image.Image]],
     expected_videos: list[list[Image.Image]],

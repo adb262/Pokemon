@@ -9,6 +9,7 @@ python -m scripts.dynamics_model.train \
 
   """
 import logging
+import math
 import os
 import time
 from datetime import datetime
@@ -20,20 +21,22 @@ import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import wandb
 
-from data.data_loaders.factory import build_datasets
+from data.data_loaders.factory import build_datasets, build_rollout_eval_dataset
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
 from data.s3.s3_utils import default_s3_manager
-from dynamics_model.checkpoints import save_checkpoint
+from dynamics_model.checkpoints import load_checkpoint, save_checkpoint
 from dynamics_model.create_model import create_dynamics_model
 from dynamics_model.model import DynamicsModel
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from latent_action_model.model import LatentActionVQVAE
+from monitoring.codebook_usage import compute_codebook_usage
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
 from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity
+from monitoring.residual_coverage import compute_residual_coverage
 from monitoring.setup_wandb import setup_wandb
-from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame
+from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame, save_rollout_comparison_grid
 from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_model_from_checkpoint
 from video_tokenization.model import VideoTokenizer
@@ -45,6 +48,32 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+@torch.no_grad()
+def maskgit_predict_last_frame(
+    model: DynamicsModel,
+    video_batch: torch.Tensor,
+    max_steps: int = 10,
+) -> torch.Tensor:
+    """Run MaskGIT inference to predict the last frame of ``video_batch``.
+
+    Uses the action model to infer the action for the final transition, then
+    calls ``model.inference`` on the context frames (all but the last) with
+    that action.
+
+    Args:
+        video_batch: [B, T, C, H, W] full video including the target frame.
+        max_steps: number of MaskGIT iterative-decoding steps.
+
+    Returns:
+        Predicted video of shape [B, T, C, H, W] (context + predicted frame).
+    """
+    context = video_batch[:, :-1]
+    action_encoded, patched = model.action_model.encode(video_batch)
+    action_tokens = model.action_model.get_action_sequence(action_encoded)
+    last_action = action_tokens[:, -1]  # (B,)
+    return model.inference(context, last_action, max_steps=max_steps)
 
 
 def evaluate_model(
@@ -77,6 +106,12 @@ def evaluate_model(
     gt_next_frame_sim_list: list[float] = []
     pred_next_frame_sim_list: list[float] = []
 
+    # Collect residual-coverage metrics (MaskGIT inference)
+    residual_coverage_accum: list[dict[str, float]] = []
+
+    # Collect action tokens across batches for codebook-usage metrics
+    action_tokens_accum: list[torch.Tensor] = []
+
     eval_dir = f"{save_dir}/eval/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
     logger.info(f"Saving eval results to {eval_dir}")
@@ -105,6 +140,18 @@ def evaluate_model(
                 real_frames_batches.append(real_target_frames.detach().cpu())
                 pred_frames_batches.append(reconstructed_video.detach().cpu())
 
+                # Track action-token usage for codebook metrics
+                action_tokens_accum.append(action_tokens.detach().cpu())
+
+                # Δt PSNR controllability metric (inferred vs. random actions)
+                psnr_inferred, psnr_random, delta_psnr = compute_delta_psnr(
+                    model.action_model, video_batch, device
+                )
+                if math.isfinite(psnr_inferred) and math.isfinite(psnr_random):
+                    psnr_inferred_list.append(psnr_inferred)
+                    psnr_random_list.append(psnr_random)
+                    delta_psnr_list.append(delta_psnr)
+
                 # Pixel similarity between the last two frames (t-2 vs t-1)
                 # for both ground truth and predicted videos.
                 if real_target_frames.shape[1] >= 2:
@@ -117,6 +164,17 @@ def evaluate_model(
                     pred_next_frame_sim_list.append(
                         compute_frame_pixel_similarity(
                             reconstructed_video[:, -2], reconstructed_video[:, -1]
+                        )
+                    )
+
+                # Residual coverage via MaskGIT inference
+                if video_batch.shape[1] >= 2:
+                    pred_video_maskgit = maskgit_predict_last_frame(model, video_batch)
+                    residual_coverage_accum.append(
+                        compute_residual_coverage(
+                            gt_frame=video_batch[:, -1],
+                            pred_frame=pred_video_maskgit[:, -1],
+                            prev_frame=video_batch[:, -2],
                         )
                     )
 
@@ -207,6 +265,39 @@ def evaluate_model(
             pred_next_frame_sim_list
         ) / len(pred_next_frame_sim_list)
 
+    # Action codebook usage across all eval batches.
+    codebook_metrics: dict[str, float] = {}
+    if action_tokens_accum:
+        all_action_tokens = torch.cat(
+            [t.reshape(-1) for t in action_tokens_accum], dim=0
+        )
+        usage = compute_codebook_usage(
+            all_action_tokens, model.action_model.action_vocab_size
+        )
+        codebook_metrics = {f"eval/action_codebook_{k}": v for k, v in usage.items()}
+        logger.info(
+            f"Action codebook usage: "
+            f"unique={int(usage['num_unique'])}/{model.action_model.action_vocab_size} "
+            f"({usage['usage_fraction']:.2%}), "
+            f"perplexity={usage['perplexity']:.2f}, "
+            f"norm_entropy={usage['normalized_entropy']:.4f}"
+        )
+
+    # Aggregate residual-coverage metrics across batches.
+    residual_metrics: dict[str, float] = {}
+    if residual_coverage_accum:
+        keys = residual_coverage_accum[0].keys()
+        residual_metrics = {
+            f"eval/{k}": sum(d[k] for d in residual_coverage_accum) / len(residual_coverage_accum)
+            for k in keys
+        }
+        logger.info(
+            f"Residual coverage: R²={residual_metrics['eval/residual_r2']:.4f}, "
+            f"cosine={residual_metrics['eval/residual_cosine']:.4f}, "
+            f"changed_px_mse={residual_metrics['eval/changed_pixel_mse']:.6f}, "
+            f"changed_frac={residual_metrics['eval/changed_pixel_fraction']:.4f}"
+        )
+
     # Build log string with available metrics
     log_parts = [f"token_loss={avg_token_loss:.6f}", f"action_loss={avg_action_loss:.6f}"]
     if frechet_metrics:
@@ -220,6 +311,15 @@ def evaluate_model(
         )
         log_parts.append(
             f"pred_sim={frame_sim_metrics.get('eval/predicted_next_frame_sim', float('nan')):.4f}"
+        )
+    if residual_metrics:
+        log_parts.append(f"residual_R²={residual_metrics.get('eval/residual_r2', float('nan')):.4f}")
+    if codebook_metrics:
+        log_parts.append(
+            f"codebook_use={codebook_metrics.get('eval/action_codebook_usage_fraction', float('nan')):.2%}"
+        )
+        log_parts.append(
+            f"codebook_ppl={codebook_metrics.get('eval/action_codebook_perplexity', float('nan')):.2f}"
         )
     log_parts.append(f"saved {len(saved_image_paths)} images")
     
@@ -235,6 +335,8 @@ def evaluate_model(
             **frechet_metrics,
             **psnr_metrics,
             **frame_sim_metrics,
+            **residual_metrics,
+            **codebook_metrics,
         }
         wandb_logger.log(log_dict, step=global_step)
 
@@ -252,11 +354,123 @@ def evaluate_model(
     return avg_token_loss, avg_action_loss
 
 
+def evaluate_model_rollout(
+    model: DynamicsModel,
+    rollout_dataloader: VideoWindowLoader,
+    device: torch.device,
+    epoch: int,
+    global_step: int,
+    config: DynamicsModelTrainingConfig,
+    wandb_logger=None,
+    save_dir: str = "dynamics_model_results",
+) -> None:
+    """Run a teacher-forced rollout eval using the dynamics model.
+
+    Expects ``rollout_dataloader`` to yield clips of length
+    ``2 * config.num_images_in_video`` (2T). For each clip the function:
+
+    1. Extracts GT actions for the full 2T clip via the action model.
+    2. Teacher-forces T calls to ``model.inference``, each with a
+       T-frame GT context window and the GT-derived action for that step.
+    3. Saves a comparison grid: GT row vs Predicted row (context + rollout).
+    """
+    model.eval()
+    T = config.num_images_in_video
+    saved_image_paths: list[str] = []
+
+    eval_dir = f"{save_dir}/eval_rollout/epoch_{epoch}"
+    os.makedirs(eval_dir, exist_ok=True)
+    logger.info(f"Running rollout eval ({config.rollout_eval_batches} batches) → {eval_dir}")
+
+    with torch.no_grad():
+        for batch_idx, video_batch in enumerate(rollout_dataloader):
+            if batch_idx >= config.rollout_eval_batches:
+                break
+
+            try:
+                video_batch = video_batch.to(device)  # (B, 2T, C, H, W)
+
+                # Extract GT actions for the full 2T clip
+                action_encoded, _ = model.action_model.encode(video_batch)
+                actions_full = model.action_model.get_action_sequence(
+                    action_encoded
+                )  # (B, 2T-1)
+
+                predicted_last_frames: list[torch.Tensor] = []
+                for i in range(T):
+                    context = video_batch[:, i : T + i]  # (B, T, C, H, W)
+                    step_action = actions_full[:, T + i - 1]  # (B,)
+                    decoded_full = model.inference(
+                        context, step_action, max_steps=config.rollout_max_steps
+                    )  # (B, T+1, C, H, W)
+                    predicted_last_frames.append(decoded_full[:, -1])
+
+                # (B, T, C, H, W)
+                predicted_rollout = torch.stack(predicted_last_frames, dim=1)
+
+                # Build the full predicted sequence: context GT + rollout predictions
+                context_gt = video_batch[:, :T]  # (B, T, C, H, W)
+                predicted_full = torch.cat(
+                    [context_gt, predicted_rollout], dim=1
+                )  # (B, 2T, C, H, W)
+
+                gt_images = convert_video_to_images(video_batch)
+                pred_images = convert_video_to_images(predicted_full)
+                rollout_actions = (
+                    actions_full[:, T - 1 :]
+                    .squeeze(-1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                )
+
+                batch_dir = f"{eval_dir}/batch_{batch_idx}"
+                os.makedirs(batch_dir, exist_ok=True)
+                save_rollout_comparison_grid(
+                    gt_videos=gt_images,
+                    predicted_videos=pred_images,
+                    predicted_actions=rollout_actions,
+                    output_dir=batch_dir,
+                    context_len=T,
+                )
+
+                image_path = f"{batch_dir}/rollout_comparison_grid.png"
+                saved_image_paths.append(image_path)
+
+                if wandb_logger:
+                    wandb_logger.log(
+                        {f"eval_rollout/comparison_{batch_idx}": wandb.Image(image_path)},
+                        step=global_step,
+                    )
+
+                logger.debug(f"Saved rollout comparison to {image_path}")
+
+            except Exception as e:
+                traceback.print_exc()
+                logger.warning(f"Error in rollout eval batch {batch_idx}: {e}")
+                continue
+
+    logger.info(f"Rollout eval complete: saved {len(saved_image_paths)} grids")
+
+    if wandb_logger and saved_image_paths:
+        log_image_batches(
+            wandb_logger,
+            key_prefix="eval_rollout/comparison",
+            image_paths=saved_image_paths,
+            batch_size=5,
+            step=global_step,
+        )
+
+    model.train()
+
+
 def train_epoch(
     dynamics_model: DynamicsModel,
     action_model: LatentActionVQVAE,
     train_dataloader: VideoWindowLoader,
     test_dataloader: VideoWindowLoader,
+    rollout_dataloader: VideoWindowLoader | None,
     dynamics_optimizer: optim.Optimizer,
     dynamics_scheduler: optim.lr_scheduler.LRScheduler,
     action_optimizer: optim.Optimizer,
@@ -377,6 +591,37 @@ def train_epoch(
                     f"Eval - Token Loss: {eval_token_loss:.6f}, Action Loss: {eval_action_loss:.6f}"
                 )
 
+                if rollout_dataloader is not None:
+                    evaluate_model_rollout(
+                        dynamics_model,
+                        rollout_dataloader,
+                        device,
+                        epoch,
+                        global_step,
+                        config,
+                        wandb_logger=wandb_logger,
+                        save_dir=config.save_dir,
+                    )
+
+                # Residual coverage on the current train batch
+                if video_batch.shape[1] >= 2:
+                    dynamics_model.eval()
+                    train_coverage = compute_residual_coverage(
+                        gt_frame=video_batch[:, -1],
+                        pred_frame=maskgit_predict_last_frame(dynamics_model, video_batch)[:, -1],
+                        prev_frame=video_batch[:, -2],
+                    )
+                    dynamics_model.train()
+                    logger.info(
+                        f"Train residual coverage: R²={train_coverage['residual_r2']:.4f}, "
+                        f"cosine={train_coverage['residual_cosine']:.4f}"
+                    )
+                    if wandb_logger:
+                        wandb_logger.log(
+                            {f"train/{k}": v for k, v in train_coverage.items()},
+                            step=global_step,
+                        )
+
                 save_checkpoint(
                     dynamics_model,
                     dynamics_optimizer,
@@ -387,6 +632,9 @@ def train_epoch(
                     config,
                     best_loss,
                     dataloader_state,
+                    action_model=action_model,
+                    action_optimizer=action_optimizer,
+                    action_scheduler=action_scheduler,
                 )
 
             # Increment global step
@@ -509,6 +757,24 @@ def main(config: DynamicsModelTrainingConfig):
         seed=config.seed,
     )
 
+    # Build a 2T-frame eval dataset for rollout evaluation
+    rollout_window = 2 * config.num_images_in_video
+    logger.info(f"Building rollout eval dataset with window={rollout_window}...")
+    try:
+        rollout_dataset = build_rollout_eval_dataset(config, local_cache, rollout_window)
+        rollout_dataloader: VideoWindowLoader | None = VideoWindowLoader(
+            dataset=rollout_dataset,
+            batch_size=config.batch_size,
+            image_size=config.image_size,
+            shuffle=True,
+            num_workers=4,
+            seed=config.seed,
+        )
+        logger.info(f"Rollout eval dataset: {len(rollout_dataset)} samples")
+    except Exception as e:
+        logger.warning(f"Could not build rollout eval dataset (skipping rollout eval): {e}")
+        rollout_dataloader = None
+
     # Print dataset info
     train_info = train_dataloader.get_dataset_info()
     test_info = test_dataloader.get_dataset_info()
@@ -614,14 +880,14 @@ def main(config: DynamicsModelTrainingConfig):
     start_batch = 0
     best_loss = float("inf")
 
-    # if config.resume_from:
-    #     model, optimizer, scheduler, checkpoint = load_checkpoint(
-    #         config.resume_from, model, optimizer, scheduler, device
-    #     )
-    #     start_epoch = checkpoint["epoch"]
-    #     start_batch = checkpoint.get("batch_idx", 0)
-    #     best_loss = checkpoint.get("best_loss", float("inf"))
-    #     logger.info(f"Resumed from epoch {start_epoch}, batch {start_batch}")
+    if config.dynamics_model_checkpoint_path:
+        model, optimizer, scheduler, checkpoint = load_checkpoint(
+            config.dynamics_model_checkpoint_path, model, optimizer, scheduler, device
+        )
+        start_epoch = checkpoint["epoch"]
+        start_batch = checkpoint.get("batch_idx", 0)
+        best_loss = checkpoint.get("best_loss", float("inf"))
+        logger.info(f"Resumed from epoch {start_epoch}, batch {start_batch}")
 
     # Initial evaluation
     logger.info("Running initial evaluation...")
@@ -639,6 +905,18 @@ def main(config: DynamicsModelTrainingConfig):
         f"Initial eval - Token Loss: {eval_token_loss:.6f}, Action Loss: {eval_action_loss:.6f}"
     )
 
+    if rollout_dataloader is not None:
+        evaluate_model_rollout(
+            model,
+            rollout_dataloader,
+            device,
+            epoch=0,
+            global_step=0,
+            config=config,
+            wandb_logger=wandb_logger,
+            save_dir=config.save_dir,
+        )
+
     # Training loop
     logger.info("Starting training loop...")
 
@@ -652,6 +930,7 @@ def main(config: DynamicsModelTrainingConfig):
                 action_model,
                 train_dataloader,
                 test_dataloader,
+                rollout_dataloader,
                 optimizer,
                 scheduler,
                 action_optimizer,
@@ -681,6 +960,18 @@ def main(config: DynamicsModelTrainingConfig):
                 f"Action Loss: {eval_action_loss:.6f}, Total: {eval_loss:.6f}"
             )
 
+            if rollout_dataloader is not None:
+                evaluate_model_rollout(
+                    model,
+                    rollout_dataloader,
+                    device,
+                    epoch,
+                    global_step,
+                    config,
+                    wandb_logger=wandb_logger,
+                    save_dir=config.save_dir,
+                )
+
             if eval_loss < best_loss:
                 best_loss = eval_loss
                 save_checkpoint(
@@ -693,6 +984,9 @@ def main(config: DynamicsModelTrainingConfig):
                     config,
                     best_loss,
                     train_dataloader.get_state(),
+                    action_model=action_model,
+                    action_optimizer=action_optimizer,
+                    action_scheduler=action_scheduler,
                     is_best=True,
                 )
 
@@ -709,6 +1003,9 @@ def main(config: DynamicsModelTrainingConfig):
             config,
             best_loss,
             dataloader_state,
+            action_model=action_model,
+            action_optimizer=action_optimizer,
+            action_scheduler=action_scheduler,
         )
     except Exception as e:
         logging.error(f"Training error: {e}")

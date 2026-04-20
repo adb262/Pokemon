@@ -135,5 +135,18 @@ Pokemon has a lot of issues. For one, it's mostly an animated game. There are su
 ## Pong Experiments
 Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
 ![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
-Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262
+Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262 (fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt)
+```
+CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train \
+  --dataset_type atari_pong \
+  --atari_pong_data_dir data/atari_pong \
+  --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt \
+  --image_size 128 \
+  --patch_size 4 \
+  --num_images_in_video 5 \
+  --batch_size 4 \
+  --save_dir dynamics_model_atari_pong \
+  --checkpoint_dir dynamics_model_atari_pong
+```
 
+Action space collapsed

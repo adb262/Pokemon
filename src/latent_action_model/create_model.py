@@ -1,3 +1,4 @@
+import torch
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.model import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
@@ -46,4 +47,9 @@ def create_action_model_from_dynamics_config(
         quantizer_type="fsq",
         bins=config.action_bins,
     )
+
+    if config.action_model_checkpoint_path:
+        checkpoint = torch.load(config.action_model_checkpoint_path)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
     return model

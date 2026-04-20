@@ -138,11 +138,10 @@ class DynamicsModel(nn.Module):
         return x, token_loss, action_loss
 
     @torch.inference_mode()
-    def inference(self, video: torch.Tensor, action: int, max_steps: int = 10):
+    def inference(self, video: torch.Tensor, action: int | torch.Tensor, max_steps: int = 10):
         # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
-        # input is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
-        # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
-        # And the masked targets
+        # Return our predictions as decoded pixel video
+        # (batch_size, num_images_in_video + 1, channels, image_height, image_width)
 
         # x is of shape (batch_size, num_images_in_video, num_patches)
         with torch.no_grad():
@@ -151,9 +150,23 @@ class DynamicsModel(nn.Module):
                 self.tokenizer.encode(video)
             ).long()
 
-        action_token = torch.tensor([action], dtype=torch.long, device=targets.device)
         batch_size, num_images_in_video, num_patches = targets.shape
-        mask_tensor = torch.full((1, 1, num_patches), self.tokenizer.get_mask_token_idx(), dtype=torch.long, device=targets.device)
+
+        if isinstance(action, torch.Tensor):
+            action_token = action.long().to(targets.device)
+            if action_token.dim() == 1:
+                action_token = action_token.unsqueeze(1)  # (B,) -> (B, 1)
+        else:
+            action_token = torch.full(
+                (batch_size, 1), action, dtype=torch.long, device=targets.device
+            )
+
+        mask_tensor = torch.full(
+            (batch_size, 1, num_patches),
+            self.tokenizer.get_mask_token_idx(),
+            dtype=torch.long,
+            device=targets.device,
+        )
         targets = torch.cat([targets, mask_tensor], dim=1)
 
         # TODO: Should this also use the mask?
@@ -163,9 +176,9 @@ class DynamicsModel(nn.Module):
         action_tokens = self.action_model.get_action_sequence(
             action_video_encoded
         )
-        logger.info(f"action_tokens shape: {action_tokens.shape}")
-        logger.info(f"action_token shape: {action_token.shape}")
-        action_tokens = torch.cat([action_tokens.long(), action_token.unsqueeze(1)], dim=1)
+        logger.debug(f"action_tokens shape: {action_tokens.shape}")
+        logger.debug(f"action_token shape: {action_token.shape}")
+        action_tokens = torch.cat([action_tokens.long(), action_token], dim=1)
 
         # action_tokens is of shape (batch_size, num_images_in_video, num_patches)
         # Produces a sequence of action embeddings of shape (batch_size, num_images_in_video, num_patches, d_model)
@@ -176,8 +189,8 @@ class DynamicsModel(nn.Module):
         mask_locations = torch.full((batch_size, num_patches), True, dtype=torch.bool, device=targets.device)
         while step < max_steps:
             x = self.tokenizer_embedding(targets.long())
-            logger.info(f"action_embeddings shape: {action_embeddings.shape}")
-            logger.info(f"x shape: {x.shape}")
+            logger.debug(f"action_embeddings shape: {action_embeddings.shape}")
+            logger.debug(f"x shape: {x.shape}")
 
             # Unsqueeze to add to each patch in the sequence
             x[:, :-1, :] += action_embeddings.unsqueeze(2)
@@ -224,7 +237,7 @@ class DynamicsModel(nn.Module):
             ).squeeze(-1)
             sampled_scores[samples < 0] = -1
 
-            logger.info(f"tokens_to_update: {tokens_to_update}")
+            logger.debug(f"tokens_to_update: {tokens_to_update}")
 
             if tokens_to_update > 0:
                 _, top_positions = torch.topk(

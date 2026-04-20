@@ -73,3 +73,7 @@ class DynamicsModelTrainingConfig:
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
     dataset_limit: int = 50000
+
+    # Rollout evaluation
+    rollout_max_steps: int = 10
+    rollout_eval_batches: int = 5
