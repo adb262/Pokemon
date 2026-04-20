@@ -66,6 +66,34 @@ def compute_psnr(
     return float(psnr.item())
 
 
+def compute_frame_pixel_similarity(
+    frame_a: torch.Tensor,
+    frame_b: torch.Tensor,
+) -> float:
+    """
+    Compute mean per-sample cosine similarity between two batches of frames.
+
+    Treats each frame as a flattened pixel vector. Bounded in [-1, 1] where 1.0
+    means identical frames (up to scale) and 0.0 means orthogonal.
+
+    Args:
+        frame_a: Tensor of shape [B, C, H, W]
+        frame_b: Tensor of shape [B, C, H, W]
+
+    Returns:
+        Mean cosine similarity across the batch.
+    """
+    if frame_a.shape != frame_b.shape:
+        raise ValueError(
+            f"Shape mismatch: frame_a {frame_a.shape} vs frame_b {frame_b.shape}"
+        )
+
+    a = frame_a.flatten(1).float()
+    b = frame_b.flatten(1).float()
+    sim = torch.nn.functional.cosine_similarity(a, b, dim=1)
+    return float(sim.mean().item())
+
+
 def compute_psnr_per_frame(
     original: torch.Tensor,
     reconstructed: torch.Tensor,

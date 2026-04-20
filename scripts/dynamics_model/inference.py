@@ -9,12 +9,9 @@ import torch
 import torchvision.utils as vutils
 import tyro
 
-from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.data_loaders.factory import build_datasets
+from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
-from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
-from data.datasets.open_world.open_world_running_dataset_creator import (
-    OpenWorldRunningDatasetCreator,
-)
 from dynamics_model.create_model import create_dynamics_model
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
@@ -109,7 +106,7 @@ def _load_dynamics_model(
 
 def _build_test_dataloader(
     config: DynamicsModelTrainingConfig,
-) -> PokemonOpenWorldLoader:
+) -> VideoWindowLoader:
     if config.local_cache_dir is None:
         raise ValueError("local_cache_dir is required for inference dataloader")
 
@@ -118,46 +115,15 @@ def _build_test_dataloader(
         cache_dir=config.local_cache_dir,
     )
 
-    dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
-        num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_50000.json",
-        local_cache=local_cache,
-        limit=50000,
-        image_size=config.image_size,
-        use_s3=config.use_s3,
-    )
+    _train_dataset, test_dataset = build_datasets(config, local_cache)
 
-    if config.dataset_train_key is None:
-        train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
-    else:
-        train_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key)
-        test_dataset = dataset_creator.load_existing_dataset(
-            config.dataset_train_key.replace("train", "test")
-        )
-        if config.sync_from_s3:
-            dataset_creator.ensure_files_exist(train_dataset)
-            dataset_creator.ensure_files_exist(test_dataset)
-
-    test_dataset = OpenWorldRunningDataset(
-        dataset=test_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-        limit=100,
-    )
-
-    test_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    test_dataloader = VideoWindowLoader(
         dataset=test_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=4,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
 
     logger.info("Test dataloader ready with %d videos", len(test_dataset))
@@ -203,7 +169,7 @@ def _save_concatenated_frames(
 
 def _interactive_loop(
     model,
-    test_dataloader: PokemonOpenWorldLoader,
+    test_dataloader: VideoWindowLoader,
     config: DynamicsModelTrainingConfig,
     args: InteractiveInferenceArgs,
     device: torch.device,

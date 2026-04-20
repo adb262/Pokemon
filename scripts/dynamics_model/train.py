@@ -1,4 +1,13 @@
-# python -m scripts.mask_git.train --tokenizer_checkpoint_path checkpoints/tokenizer.pt --frames_dir pokemon --num_images_in_video 4 --batch_size 4
+"""
+python -m scripts.dynamics_model.train \
+  --tokenizer_checkpoint_path fsq_tokenizer_2k_128_4_512_8_heads_4_layers/checkpoint_epoch1_batch2000.pt \
+  --image_size 128 \
+  --patch_size 4 \
+  --num_images_in_video 5 \
+  --batch_size 4 \
+  --frames_dir pokemon_frames
+
+  """
 import logging
 import os
 import time
@@ -11,12 +20,9 @@ import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import wandb
 
-from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.data_loaders.factory import build_datasets
+from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
-from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
-from data.datasets.open_world.open_world_running_dataset_creator import (
-    OpenWorldRunningDatasetCreator,
-)
 from data.s3.s3_utils import default_s3_manager
 from dynamics_model.checkpoints import save_checkpoint
 from dynamics_model.create_model import create_dynamics_model
@@ -25,7 +31,7 @@ from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from latent_action_model.model import LatentActionVQVAE
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
-from monitoring.psnr import compute_delta_psnr
+from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity
 from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame
 from monitoring.wandb_media import log_image_batches
@@ -43,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 def evaluate_model(
     model: DynamicsModel,
-    dataloader: PokemonOpenWorldLoader,
+    dataloader: VideoWindowLoader,
     device: torch.device,
     epoch: int,
     global_step: int,
@@ -66,6 +72,10 @@ def evaluate_model(
     psnr_inferred_list: list[float] = []
     psnr_random_list: list[float] = []
     delta_psnr_list: list[float] = []
+
+    # Collect pixel similarity between last two frames (t-2 vs t-1)
+    gt_next_frame_sim_list: list[float] = []
+    pred_next_frame_sim_list: list[float] = []
 
     eval_dir = f"{save_dir}/eval/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
@@ -94,6 +104,21 @@ def evaluate_model(
                 real_target_frames = video_batch
                 real_frames_batches.append(real_target_frames.detach().cpu())
                 pred_frames_batches.append(reconstructed_video.detach().cpu())
+
+                # Pixel similarity between the last two frames (t-2 vs t-1)
+                # for both ground truth and predicted videos.
+                if real_target_frames.shape[1] >= 2:
+                    gt_next_frame_sim_list.append(
+                        compute_frame_pixel_similarity(
+                            real_target_frames[:, -2], real_target_frames[:, -1]
+                        )
+                    )
+                if reconstructed_video.shape[1] >= 2:
+                    pred_next_frame_sim_list.append(
+                        compute_frame_pixel_similarity(
+                            reconstructed_video[:, -2], reconstructed_video[:, -1]
+                        )
+                    )
 
                 # Save comparison images
                 predicted_videos = convert_video_to_images(reconstructed_video)
@@ -171,6 +196,17 @@ def evaluate_model(
             f"delta={avg_delta_psnr:.4f}"
         )
 
+    # Pixel similarity between the last two frames (t-2 vs t-1).
+    frame_sim_metrics: dict[str, float] = {}
+    if gt_next_frame_sim_list:
+        frame_sim_metrics["eval/ground_truth_next_frame_sim"] = sum(
+            gt_next_frame_sim_list
+        ) / len(gt_next_frame_sim_list)
+    if pred_next_frame_sim_list:
+        frame_sim_metrics["eval/predicted_next_frame_sim"] = sum(
+            pred_next_frame_sim_list
+        ) / len(pred_next_frame_sim_list)
+
     # Build log string with available metrics
     log_parts = [f"token_loss={avg_token_loss:.6f}", f"action_loss={avg_action_loss:.6f}"]
     if frechet_metrics:
@@ -178,6 +214,13 @@ def evaluate_model(
         log_parts.append(f"FVD={frechet_metrics.get('eval/fvd', float('nan')):.4f}")
     if psnr_metrics:
         log_parts.append(f"delta_PSNR={psnr_metrics.get('eval/delta_psnr', float('nan')):.4f}")
+    if frame_sim_metrics:
+        log_parts.append(
+            f"gt_sim={frame_sim_metrics.get('eval/ground_truth_next_frame_sim', float('nan')):.4f}"
+        )
+        log_parts.append(
+            f"pred_sim={frame_sim_metrics.get('eval/predicted_next_frame_sim', float('nan')):.4f}"
+        )
     log_parts.append(f"saved {len(saved_image_paths)} images")
     
     logger.info(f"Eval complete: {', '.join(log_parts)}")
@@ -191,6 +234,7 @@ def evaluate_model(
             "eval/epoch": epoch,
             **frechet_metrics,
             **psnr_metrics,
+            **frame_sim_metrics,
         }
         wandb_logger.log(log_dict, step=global_step)
 
@@ -211,8 +255,8 @@ def evaluate_model(
 def train_epoch(
     dynamics_model: DynamicsModel,
     action_model: LatentActionVQVAE,
-    train_dataloader: PokemonOpenWorldLoader,
-    test_dataloader: PokemonOpenWorldLoader,
+    train_dataloader: VideoWindowLoader,
+    test_dataloader: VideoWindowLoader,
     dynamics_optimizer: optim.Optimizer,
     dynamics_scheduler: optim.lr_scheduler.LRScheduler,
     action_optimizer: optim.Optimizer,
@@ -445,74 +489,24 @@ def main(config: DynamicsModelTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
-        num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_50000.json",
-        local_cache=local_cache,
-        limit=50000,
-        image_size=config.image_size,
-        use_s3=config.use_s3,
-    )
-
-    if config.dataset_train_key is None:
-        logger.info("Setting up dataset...")
-        train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
-    else:
-        logger.info(f"Loading dataset from {config.dataset_train_key}")
-        train_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key)
-        test_dataset = dataset_creator.load_existing_dataset(
-            config.dataset_train_key.replace("train", "test")
-        )
-
-        if config.sync_from_s3:
-            logger.info("Syncing dataset from S3...")
-            dataset_creator.ensure_files_exist(train_dataset)
-            dataset_creator.ensure_files_exist(test_dataset)
-
-    train_dataset = OpenWorldRunningDataset(
-        dataset=train_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-        frame_spacing=config.frame_spacing,
-        num_unique_frames=config.num_unique_frames,
-    )
-
-    test_dataset = OpenWorldRunningDataset(
-        dataset=test_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-        frame_spacing=config.frame_spacing,
-        num_unique_frames=config.num_unique_frames,
-        limit=100,
-    )
+    train_dataset, test_dataset = build_datasets(config, local_cache)
 
     logger.info(f"Creating data loader with {len(train_dataset)} videos...")
-    train_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    train_dataloader = VideoWindowLoader(
         dataset=train_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
-    test_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    test_dataloader = VideoWindowLoader(
         dataset=test_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
 
     # Print dataset info

@@ -14,12 +14,9 @@ import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.data_loaders.factory import build_datasets
+from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
-from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
-from data.datasets.open_world.open_world_running_dataset_creator import (
-    OpenWorldRunningDatasetCreator,
-)
 from data.s3.s3_utils import S3Manager, default_s3_manager
 from latent_action_model.create_model import create_action_model
 from latent_action_model.model import LatentActionVQVAE
@@ -195,7 +192,7 @@ def load_checkpoint(
 
 def evaluate_model(
     model: LatentActionVQVAE,
-    dataloader: PokemonOpenWorldLoader,
+    dataloader: VideoWindowLoader,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     step: int,
@@ -365,8 +362,8 @@ def save_visualizations(
 
 def train_epoch(
     model: LatentActionVQVAE,
-    train_dataloader: PokemonOpenWorldLoader,
-    eval_dataloader: Optional[PokemonOpenWorldLoader],
+    train_dataloader: VideoWindowLoader,
+    eval_dataloader: Optional[VideoWindowLoader],
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.CosineAnnealingLR,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -578,62 +575,24 @@ def main(config: VideoTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
-        num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_100000.json",
-        local_cache=local_cache,
-        limit=1000000,
-        image_size=config.image_size,
-        use_s3=config.use_s3,
-    )
-
-    logger.info("Setting up dataset...")
-    train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
-    logger.info(f"Train dataset length: {len(train_dataset)}")
-    logger.info(f"Test dataset length: {len(test_dataset)}")
-    dataset_creator.show_sample_grid(
-        train_dataset, num_trajectories=20, max_frames_per_trajectory=10
-    )
-
-    train_dataset = OpenWorldRunningDataset(
-        dataset=train_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-    )
-
-    test_dataset = OpenWorldRunningDataset(
-        dataset=test_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-    )
+    train_dataset, test_dataset = build_datasets(config, local_cache)
 
     logger.info("Creating data loaders...")
-    train_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    train_dataloader = VideoWindowLoader(
         dataset=train_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
-    eval_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    eval_dataloader = VideoWindowLoader(
         dataset=test_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
 
     # Print dataset info

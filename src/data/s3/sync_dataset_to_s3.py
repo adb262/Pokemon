@@ -65,6 +65,7 @@ class DatasetS3Syncer:
         region_name: str = "us-east-1",
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        aws_session_token: Optional[str] = None,
     ):
         """
         Initialize the syncer.
@@ -77,6 +78,8 @@ class DatasetS3Syncer:
             region_name: AWS region
             aws_access_key_id: AWS access key (uses env vars if not provided)
             aws_secret_access_key: AWS secret key (uses env vars if not provided)
+            aws_session_token: AWS session token for temporary credentials
+                (uses env vars if not provided)
         """
         self.bucket_name = bucket_name
         self.s3_prefix = s3_prefix.rstrip("/") if s3_prefix else None
@@ -89,6 +92,7 @@ class DatasetS3Syncer:
             region_name=region_name,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
         )
 
         logger.info(

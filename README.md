@@ -8,7 +8,12 @@ Because many pairs of frames are the same, I modified the reconstruction loss to
 
 We can scrape a bunch of youtube videos with the following:
 ```
-python -m src.data.scraping.pokemon_dataset_pipeline --clean --extract --summary --extract --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
+python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
+```
+
+To download from a specific YouTube video or playlist URL:
+```
+python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --video_url "https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5" --game_name "Pokemon Emerald" --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16
 ```
 Our end state is to have groups (starting with "pairs" i.e. group of 2) from which we can learn our latent actions. This means that we need to pair up frame x and frame x+1. Eventually, I will roll out support for larger groups, since the learning dynamics should be smoother.
 
@@ -120,4 +125,15 @@ Genie explores scaling the decoder separately. Since the decoder is essentially 
 ## TODOs
 - [X]: Update data loader to create an n length sequence of frames, where n >> num_images_in_video, split this up into k samples where each len(sample) == num_images_in_video, k = n - (num_images_in_video - 1). This is because each sequence must be of length num_images_in_video, so we cannot use the first (num_images_in_video - 1) frames as training data. Importantly, we must shuffle our dataset post collection, such that we have a reasonable data mixture for our dynamics model.
 - []: Use data from https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5
-- []: Update our MaskGiT implementation
+- [X]: Update our MaskGiT implementationm
+- []: Switch to Zarr arrays
+
+
+## From Pokemon to Pong
+Pokemon has a lot of issues. For one, it's mostly an animated game. There are substantially more frames spent with inaction than there are in open world navigation. For our basic repro, we want the simplest possible environment. We'd love to have just the sprite running around but our data is flooded with cut scenes and dialogue. Initial attempts at algorithmic filtering were crushed by edge cases and variants. The next step would be: either spend money to have the frames labeled by a VLLM (navigable/not navigable), OR train a model on a small set of data. This is extremely feasible, but I'm interested in proving that the pipeline works first. So, Pong is a natural, simple environment. There are still cases of inactivity here, but filtering is quite a bit easier.
+
+## Pong Experiments
+Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
+![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
+Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262
+

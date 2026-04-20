@@ -41,6 +41,7 @@ class OpenWorldRunningDatasetCreator:
         limit: int,
         image_size: int,
         use_s3: bool,
+        frame_spacing: int = 1,
     ):
         self.dataset_dir = dataset_dir
         self.num_frames_in_video = num_frames_in_video
@@ -49,6 +50,7 @@ class OpenWorldRunningDatasetCreator:
         self.limit = limit
         self.image_size = image_size
         self.use_s3 = use_s3
+        self.frame_spacing = frame_spacing
 
     def _get_or_create_dataset(
         self, train_percentage: float = 0.9
@@ -103,7 +105,11 @@ class OpenWorldRunningDatasetCreator:
 
     def _get_dataset_key(self, stage: Literal["train", "test"], split: float) -> str:
         formatted_split = str(split).replace(".", "_")
-        return f"{self.dataset_dir}_{stage}_{formatted_split}_{self.num_frames_in_video}_frames_v2.json"
+        return (
+            f"{self.dataset_dir}_{stage}_{formatted_split}"
+            f"_{self.num_frames_in_video}_frames"
+            f"_spacing_{self.frame_spacing}_v3.json"
+        )
 
     def _filter_to_correct_num_frames(self, dataset: OpenWorldVideoLog) -> OpenWorldVideoLog:
         return OpenWorldVideoLog(video_logs=[video for video in dataset.video_logs if len(video.video_log_paths) >= self.num_frames_in_video])
@@ -120,12 +126,12 @@ class OpenWorldRunningDatasetCreator:
         # Use multithreading to download the files.
         progress_bar = tqdm(total=len([path for video in log.video_logs for path in video.video_log_paths]), desc="Ensuring files exist")
 
-        def _populate_cache_and_progress(s3_manager: S3Manager, local_cache: Cache, path: str) -> None:
-            self._load_image_from_s3(s3_manager, local_cache, path)
+        def _populate_cache_and_progress(s3_manager: S3Manager, local_cache: Cache, image_size: int, path: str) -> None:
+            self._load_image_from_s3(s3_manager, local_cache, image_size, path)
             progress_bar.update(1)
 
         with ThreadPoolExecutor(max_workers=32) as thread_executor:
-            partial_fn = partial(_populate_cache_and_progress, default_s3_manager, self.local_cache)
+            partial_fn = partial(_populate_cache_and_progress, default_s3_manager, self.local_cache, self.image_size)
             thread_executor.map(partial_fn, [path for video in log.video_logs for path in video.video_log_paths])
 
     def _save_dataset(self, dataset: OpenWorldVideoLog, key: str):
@@ -133,28 +139,53 @@ class OpenWorldRunningDatasetCreator:
             f.write(dataset.model_dump_json())
 
     def _load_image_locally(self, frame_path: str) -> Image.Image | None:
-        return self.local_cache.get(frame_path)
+        image = self.local_cache.get(frame_path)
+        if image is None:
+            image = Image.open(frame_path)
+            image = self._resize_to_target(image)
+            self.local_cache.set(frame_path, image)
+            return image.convert("RGB")
+
+        image = self._resize_to_target(image)
+        return image.convert("RGB")
+
+    def _resize_to_target(self, image: Image.Image) -> Image.Image:
+        return OpenWorldRunningDatasetCreator._resize_image(image, self.image_size)
+
+    @staticmethod
+    def _resize_image(image: Image.Image, image_size: int) -> Image.Image:
+        if image.size != (image_size, image_size):
+            image = image.resize((image_size, image_size), Image.Resampling.LANCZOS)
+        return image
 
     def _load_metadata_locally(self, frame_path: str) -> FrameMetadata | None:
-        return FrameMetadata(**json.load(open(frame_path.replace(".png", ".json"))))
+        path = frame_path.replace(".png", ".json")
+        if not os.path.exists(path):
+            logger.warning(f"Metadata file not found for frame: {frame_path}")
+            return None
+
+        return FrameMetadata(**json.load(open(path)))
 
     @staticmethod
     def _load_image_from_s3(
-        s3_manager: S3Manager, local_cache: Cache, s3_key: str
+        s3_manager: S3Manager,
+        local_cache: Cache,
+        image_size: int,
+        s3_key: str,
     ) -> Image.Image | None:
-        """Load image from S3 with local caching"""
+        """Load image from S3 with local caching, resized to `image_size`."""
         try:
             image = local_cache.get(s3_key)
             if image is not None:
+                image = OpenWorldRunningDatasetCreator._resize_image(image, image_size)
                 return image.convert("RGB")
 
-            # Download from S3
             image = s3_manager.download_image(s3_key)
             if image is None:
                 logger.error(f"Failed to download image from S3: {s3_key}")
                 return None
 
-            # Cache the image locally
+            image = OpenWorldRunningDatasetCreator._resize_image(image, image_size)
             local_cache.set(s3_key, image)
             return image.convert("RGB")
         except Exception as e:
@@ -203,26 +234,53 @@ class OpenWorldRunningDatasetCreator:
         progress_bar: tqdm,
         limit: int,
         num_frames_in_video: int,
+        frame_spacing: int,
     ) -> list[OpenWorldVideoLogSingleton]:
+        """Extract sliding windows from a contiguous frame sequence.
+
+        Each emitted `OpenWorldVideoLogSingleton` is one window of exactly
+        `num_frames_in_video` frames, sampled with stride `frame_spacing` from
+        `frame_list`. Windows slide by 1 frame across the sequence. This
+        bakes in the sliding-window extraction at dataset-creation time so
+        downstream datasets can treat each entry as a single training sample.
+        """
+        logger.info(f"Getting valid frame sequences: {len(frame_list)} frames. limit: {limit}")
         if progress_bar.n >= limit:
             return []
 
-        if len(frame_list) < num_frames_in_video:
+        span = (num_frames_in_video - 1) * frame_spacing + 1
+        if len(frame_list) < span:
             return []
 
-        video = OpenWorldVideoLogSingleton(
-            video_log_paths=[frame.path for frame in frame_list],
-            video_id=frame_list[0].metadata.video_id,
+        videos: list[OpenWorldVideoLogSingleton] = []
+        num_windows = len(frame_list) - span + 1
+        for start in range(num_windows):
+            if progress_bar.n >= limit:
+                break
+            window = [
+                frame_list[start + i * frame_spacing]
+                for i in range(num_frames_in_video)
+            ]
+            videos.append(
+                OpenWorldVideoLogSingleton(
+                    video_log_paths=[frame.path for frame in window],
+                    video_id=window[0].metadata.video_id,
+                )
+            )
+            progress_bar.update(1)
+
+        logger.info(
+            f"Added {len(videos)} windows from {len(frame_list)} frames "
+            f"(num_frames_in_video={num_frames_in_video}, frame_spacing={frame_spacing})"
         )
-        logger.info(f"Added 1 video ({len(frame_list)} frames)")
-        progress_bar.update(1)
-        return [video]
+        return videos
 
     def _get_frame_sequences_from_local(
         self,
         frame_paths: list[str],
         limit: int,
         num_frames_in_video: int,
+        frame_spacing: int,
         progress_bar: tqdm,
     ) -> list[OpenWorldVideoLogSingleton]:
         frame_with_paths: list[FrameWithPath] = []
@@ -234,6 +292,7 @@ class OpenWorldRunningDatasetCreator:
                     FrameWithPath(path=path, frame=image, metadata=metadata)
                 )
 
+        logger.info(f"Frame with paths: {len(frame_with_paths)}")
         if not frame_with_paths:
             return []
 
@@ -248,6 +307,7 @@ class OpenWorldRunningDatasetCreator:
                 progress_bar=progress_bar,
                 limit=limit,
                 num_frames_in_video=num_frames_in_video,
+                frame_spacing=frame_spacing,
                 frame_list=frames_with_paths,
             )
             for frames_with_paths in frames_with_paths
@@ -260,7 +320,9 @@ class OpenWorldRunningDatasetCreator:
         chunks: list[S3Frame],
         limit: int,
         num_frames_in_video: int,
+        frame_spacing: int,
         local_cache: Cache,
+        image_size: int,
     ) -> list[OpenWorldVideoLogSingleton]:
         with ThreadPoolExecutor(max_workers=10) as thread_executor:
             frame_paths = [path.obj_key for path in chunks]
@@ -269,6 +331,7 @@ class OpenWorldRunningDatasetCreator:
                 OpenWorldRunningDatasetCreator._load_image_from_s3,
                 default_s3_manager,
                 local_cache,
+                image_size,
             )
             partial_metadata_fn = partial(
                 OpenWorldRunningDatasetCreator._load_metadata_from_s3,
@@ -310,6 +373,7 @@ class OpenWorldRunningDatasetCreator:
                 progress_bar=progress_bar,
                 limit=limit,
                 num_frames_in_video=num_frames_in_video,
+                frame_spacing=frame_spacing,
             )
 
             videos = list(thread_executor.map(partial_fn, frames_with_paths))
@@ -374,6 +438,7 @@ class OpenWorldRunningDatasetCreator:
                         frame_paths=frame_path,
                         limit=self.limit,
                         num_frames_in_video=self.num_frames_in_video,
+                        frame_spacing=self.frame_spacing,
                         progress_bar=progress_bar,
                     )
                 )
@@ -406,7 +471,9 @@ class OpenWorldRunningDatasetCreator:
                     self._get_frame_sequences_from_s3,
                     limit=self.limit,
                     num_frames_in_video=self.num_frames_in_video,
+                    frame_spacing=self.frame_spacing,
                     local_cache=self.local_cache,
+                    image_size=self.image_size,
                 )
                 videos = process_executor.map(partial_fn, chunks)
                 logger.info(f"Found {len(videos)} videos")
@@ -458,7 +525,7 @@ class OpenWorldRunningDatasetCreator:
                 image = self._load_image_locally(frame_path)
                 if image is None:
                     image = self._load_image_from_s3(
-                        default_s3_manager, self.local_cache, frame_path
+                        default_s3_manager, self.local_cache, self.image_size, frame_path
                     )
 
                 if image is None:

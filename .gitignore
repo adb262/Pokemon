@@ -23,3 +23,5 @@ runs/
 wandb/
 .env
 *.json
+
+data
