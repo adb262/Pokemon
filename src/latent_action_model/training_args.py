@@ -2,7 +2,7 @@
 # from beartype.claw import beartype_all
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -50,6 +50,13 @@ class VideoTrainingConfig:
     max_cache_size: int = 100000
     no_wandb: bool = False
     save_dir: str = "latent_action_results"
+    dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
+    atari_pong_data_dir: Optional[str] = None
+    dataset_train_key: Optional[str] = None
+    sync_from_s3: bool = False
+    frame_spacing: int = 1
+    num_unique_frames: Optional[int] = None
+    dataset_limit: int = 50000
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None

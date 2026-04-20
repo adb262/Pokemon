@@ -13,12 +13,9 @@ import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 import wandb
-from data.data_loaders.pokemon_open_world_loader import PokemonOpenWorldLoader
+from data.data_loaders.factory import build_datasets
+from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
-from data.datasets.open_world.open_world_dataset import OpenWorldRunningDataset
-from data.datasets.open_world.open_world_running_dataset_creator import (
-    OpenWorldRunningDatasetCreator,
-)
 from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import reconstruction_loss
 from monitoring.setup_wandb import setup_wandb
@@ -41,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 def train_epoch(
     model: VideoTokenizer,
-    dataloader: PokemonOpenWorldLoader,
-    test_dataloader: PokemonOpenWorldLoader,
+    dataloader: VideoWindowLoader,
+    test_dataloader: VideoWindowLoader,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.LRScheduler,
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
@@ -246,69 +243,24 @@ def main(config: VideoTokenizerTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    dataset_creator = OpenWorldRunningDatasetCreator(
-        dataset_dir=config.frames_dir,
-        num_frames_in_video=config.num_images_in_video,
-        output_log_json_file_name="log_dir_50000.json",
-        local_cache=local_cache,
-        limit=50000,
-        image_size=config.image_size,
-        use_s3=config.use_s3,
-    )
-    if config.dataset_train_key is None:
-        logger.info("Setting up dataset...")
-        train_dataset, test_dataset = dataset_creator.setup(train_percentage=0.9)
-    else:
-        logger.info(f"Loading dataset from {config.dataset_train_key}")
-        train_dataset = dataset_creator.load_existing_dataset(config.dataset_train_key)
-        test_dataset = dataset_creator.load_existing_dataset(
-            config.dataset_train_key.replace("train", "test")
-        )
-
-        if config.sync_from_s3:
-            logger.info("Syncing dataset from S3...")
-            dataset_creator.ensure_files_exist(train_dataset)
-            dataset_creator.ensure_files_exist(test_dataset)
-
-    train_dataset = OpenWorldRunningDataset(
-        dataset=train_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-    )
-
-    test_dataset = OpenWorldRunningDataset(
-        dataset=test_dataset,
-        local_cache=local_cache,
-        image_size=config.image_size,
-        num_images_in_video=config.num_images_in_video,
-        limit=100,
-    )
+    train_dataset, test_dataset = build_datasets(config, local_cache)
 
     logger.info(f"Creating data loader with {len(train_dataset)} videos...")
-    train_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    train_dataloader = VideoWindowLoader(
         dataset=train_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
-    test_dataloader = PokemonOpenWorldLoader(
-        frames_dir=config.frames_dir,
+    test_dataloader = VideoWindowLoader(
         dataset=test_dataset,
         batch_size=config.batch_size,
         image_size=config.image_size,
         shuffle=True,
         num_workers=8,
         seed=config.seed,
-        use_s3=config.use_s3,
-        cache_dir=config.local_cache_dir,
-        max_cache_size=config.max_cache_size,
     )
 
     # Print dataset info

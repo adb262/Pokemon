@@ -70,6 +70,26 @@ wheels = [
 ]
 
 [[package]]
+name = "array-record"
+version = "0.8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "absl-py" },
+    { name = "etils", extra = ["epath"] },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/ff/8238c28f9bfda365ba991fc2b8a566c71847fc5a2d0913158aeadafd4e63/array_record-0.8.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:dada305fa0dfa3fd6f5f263c43ed37546f815e4f33ce30b066175384dead752e", size = 3989102, upload-time = "2025-11-13T16:15:33.845Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/67/4b4cd9891a36aec236e35688b47c44648bb645946e98653a7ad54f890128/array_record-0.8.3-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:718403dc9a364519a5fc440ed9e2784077e965489d5a44c96970d3101101e1cd", size = 4838611, upload-time = "2025-11-13T16:15:35.016Z" },
+    { url = "https://files.pythonhosted.org/packages/50/65/2f60b9ca59e5fce140be36f4136ebcc83385c9e56cd499e2942f9fb4b250/array_record-0.8.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:458f6658de86c9369b23ffe64dcb31393a919b91ae2f15147ee2beb2010b122a", size = 4995925, upload-time = "2025-11-13T16:15:37.091Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/63/fd734c5f2be8017d4f33cff0dd3d3e2f91de3ab988f93755cdc54d67b654/array_record-0.8.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:fa94fa053c1afaecc183a1c31463fd89d1b7b148cc526095bfc50ab58967e47c", size = 3989122, upload-time = "2025-11-13T16:15:38.375Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/b0/9f649781c8e630cbb8724fb56627430b4249b51e8536e6e0a31d6f85f147/array_record-0.8.3-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:adfe6c92918363747539c0caa579f568f75aac079ad7bbd4ebcf7fdb02e5461b", size = 4838733, upload-time = "2025-11-13T16:15:39.767Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/6d/5575a1d64cffecb72de5743b35a1532b1801a0350b9b45f277090d02b3c2/array_record-0.8.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:13df1aec9b38afe98973bf5fe3cf523f83ca904b0423d85319930877145b8f28", size = 4995837, upload-time = "2025-11-13T16:15:40.973Z" },
+    { url = "https://files.pythonhosted.org/packages/99/46/1449f2c36f75e563c5bdd59133146a10110bcf3a3cd53d7d74a535579603/array_record-0.8.3-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:14facb713fc55ea612cf853c0abbc602032ae619eb85037af3aa41dc4e27eed6", size = 3989205, upload-time = "2025-11-13T16:15:42.156Z" },
+    { url = "https://files.pythonhosted.org/packages/35/ef/f85d329ac6cdcc8c3e8af832c30a9a0b719c6719a09191056ef7342a3627/array_record-0.8.3-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:06b17a0a90bc74a80c4ebad0b99f0e039adb01746b673db3d7a5632d8b138ddd", size = 4839320, upload-time = "2025-11-13T16:15:43.617Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/89/510594ff506d456d7dc0e8dfa9095f078e5f98da49d1b8f7be1fd9c0717e/array_record-0.8.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:89d2cf5f4709be3c6c2b30c0d366005223375633ffce66dcb13d927a0bdc5228", size = 4995667, upload-time = "2025-11-13T16:15:45.092Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "25.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -354,6 +374,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/95/af/2a2f83f981e969ae3ec5dc30f9b0cd1a258acabc2ff7b33eb9726e334e55/einx-0.3.0.tar.gz", hash = "sha256:17ff87c6a0f68ab358c1da489f00e95f1de106fd12ff17d0fb3e210aaa1e5f8c", size = 84758, upload-time = "2024-06-11T13:49:37.532Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/90/04/4a730d74fd908daad86d6b313f235cdf8e0cf1c255b392b7174ff63ea81a/einx-0.3.0-py3-none-any.whl", hash = "sha256:367d62bab8dbb8c4937308512abb6f746cc0920990589892ba0d281356d39345", size = 102958, upload-time = "2024-06-11T13:49:36.441Z" },
+]
+
+[[package]]
+name = "etils"
+version = "1.14.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/ce/6e067242fde898841922ac6fc82b0bb2fe35c38e995880bdffdfbe30182a/etils-1.14.0.tar.gz", hash = "sha256:8136e7f4c4173cd0af0ca5481c4475152f0b8686192951eefa60ee8711e1ede4", size = 108127, upload-time = "2026-03-04T17:41:36.291Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5a/3d/589663aeeacd59bb2f3e8596bfd3e81cf0fb18d70bb433199041f469771b/etils-1.14.0-py3-none-any.whl", hash = "sha256:b5df7341f54dbe1405a4450b2741207b4a8c279780402b45f87202b94dfc52b4", size = 172934, upload-time = "2026-03-04T17:41:35.01Z" },
+]
+
+[package.optional-dependencies]
+epath = [
+    { name = "fsspec" },
+    { name = "typing-extensions" },
+    { name = "zipp" },
 ]
 
 [[package]]
@@ -1354,12 +1390,14 @@ name = "pokemon"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "array-record" },
     { name = "beartype" },
     { name = "dataclasses" },
     { name = "dotenv" },
     { name = "einops" },
     { name = "gputil" },
     { name = "httpx" },
+    { name = "huggingface-hub" },
     { name = "matplotlib" },
     { name = "opencv-python" },
     { name = "pillow" },
@@ -1384,12 +1422,14 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "array-record", specifier = ">=0.5.0" },
     { name = "beartype", specifier = ">=0.21.0" },
     { name = "dataclasses", specifier = ">=0.8" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "gputil", specifier = ">=1.4.0" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
     { name = "pillow", specifier = ">=11.2.1" },
@@ -2609,4 +2649,13 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/09/93/695cef32796dc7e76597e68a267a34a1b4e29bef8e12da445fa7c0ad1e55/yt_dlp-2025.5.22.tar.gz", hash = "sha256:ea73854c5dabc124f29a35a8fae9bc5d422ef3231bebeea2bdfa82ac191a9c29", size = 3017654, upload-time = "2025-05-22T09:58:35.694Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/68/4f108193ebce3ee7beb5f9a21daa6bc875e261150b510be468626f151959/yt_dlp-2025.5.22-py3-none-any.whl", hash = "sha256:a49c4b76afeaded6254c3e2b759d8d5a13271aa963d5fccb51fe059d1c313151", size = 3264137, upload-time = "2025-05-22T09:58:32.613Z" },
+]
+
+[[package]]
+name = "zipp"
+version = "3.23.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/21/093488dfc7cc8964ded15ab726fad40f25fd3d788fd741cc1c5a17d78ee8/zipp-3.23.1.tar.gz", hash = "sha256:32120e378d32cd9714ad503c1d024619063ec28aad2248dc6672ad13edfa5110", size = 25965, upload-time = "2026-04-13T23:21:46.6Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/08/8a/0861bec20485572fbddf3dfba2910e38fe249796cb73ecdeb74e07eeb8d3/zipp-3.23.1-py3-none-any.whl", hash = "sha256:0b3596c50a5c700c9cb40ba8d86d9f2cc4807e9bedb06bcdf7fac85633e444dc", size = 10378, upload-time = "2026-04-13T23:21:45.386Z" },
 ]

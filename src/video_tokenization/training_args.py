@@ -3,7 +3,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -56,6 +56,11 @@ class VideoTokenizerTrainingConfig:
     no_wandb: bool = False
     bins: list[int] = field(default_factory=lambda: [8, 8, 6, 5])
     save_dir: str = "tokenization_results"
+    dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
+    atari_pong_data_dir: Optional[str] = None
+    frame_spacing: int = 1
+    num_unique_frames: Optional[int] = None
+    dataset_limit: int = 50000
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None

@@ -127,3 +127,13 @@ Genie explores scaling the decoder separately. Since the decoder is essentially 
 - []: Use data from https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5
 - [X]: Update our MaskGiT implementationm
 - []: Switch to Zarr arrays
+
+
+## From Pokemon to Pong
+Pokemon has a lot of issues. For one, it's mostly an animated game. There are substantially more frames spent with inaction than there are in open world navigation. For our basic repro, we want the simplest possible environment. We'd love to have just the sprite running around but our data is flooded with cut scenes and dialogue. Initial attempts at algorithmic filtering were crushed by edge cases and variants. The next step would be: either spend money to have the frames labeled by a VLLM (navigable/not navigable), OR train a model on a small set of data. This is extremely feasible, but I'm interested in proving that the pipeline works first. So, Pong is a natural, simple environment. There are still cases of inactivity here, but filtering is quite a bit easier.
+
+## Pong Experiments
+Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
+![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
+Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262
+

@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -70,3 +70,6 @@ class DynamicsModelTrainingConfig:
     sync_from_s3: bool = False
     experiment_name: Optional[str] = None
     seed: int = 42
+    dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
+    atari_pong_data_dir: Optional[str] = None
+    dataset_limit: int = 50000

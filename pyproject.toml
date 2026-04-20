@@ -5,11 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "array-record>=0.5.0",
     "beartype>=0.21.0",
     "dataclasses>=0.8",
     "dotenv>=0.9.9",
     "einops>=0.8.1",
     "gputil>=1.4.0",
+    "huggingface-hub>=0.20.0",
     "httpx>=0.28.1",
     "matplotlib>=3.10.3",
     "opencv-python>=4.11.0.86",
