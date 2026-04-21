@@ -17,9 +17,9 @@ class DynamicsModelTrainingConfig:
     num_unique_frames: Optional[int] = None
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
-    num_epochs: int = 20
+    num_epochs: int = 3
     warmup_steps: int = 100
-    min_learning_rate: float = 1e-6
+    min_learning_rate: float = 1e-7
     device: str = (
         "mps"
         if torch.backends.mps.is_available()
@@ -35,7 +35,7 @@ class DynamicsModelTrainingConfig:
     save_dir: str = "dynamics_model_results"
 
     # Action model configuration
-    action_bins: list[int] = field(default_factory=lambda: [8])
+    action_bins: list[int] = field(default_factory=lambda: [6, 3])
     action_d_model: int = 256
     action_num_transformer_layers: int = 4
     action_num_heads: int = 2

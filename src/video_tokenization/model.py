@@ -10,7 +10,7 @@ from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrame
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class VideoTokenizerEncoder(nn.Module):
@@ -55,7 +55,7 @@ class VideoTokenizerEncoder(nn.Module):
         )
 
         self.latent_projection = nn.Linear(d_model, embedding_dim)
-        init_weights(self)
+        self.apply(init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is of shape (batch_size, num_images_in_video, c, h, w)

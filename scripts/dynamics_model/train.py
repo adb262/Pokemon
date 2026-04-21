@@ -58,22 +58,22 @@ def maskgit_predict_last_frame(
 ) -> torch.Tensor:
     """Run MaskGIT inference to predict the last frame of ``video_batch``.
 
-    Uses the action model to infer the action for the final transition, then
-    calls ``model.inference`` on the context frames (all but the last) with
-    that action.
+    ``model.inference`` now treats the last frame of its input as the masked
+    target, so we pass the full ``video_batch`` (not ``video_batch[:, :-1]``)
+    and supply the action describing the transition into the final frame.
 
     Args:
         video_batch: [B, T, C, H, W] full video including the target frame.
         max_steps: number of MaskGIT iterative-decoding steps.
 
     Returns:
-        Predicted video of shape [B, T, C, H, W] (context + predicted frame).
+        Predicted video of shape [B, T, C, H, W] with the last frame
+        replaced by the model's prediction.
     """
-    context = video_batch[:, :-1]
-    action_encoded, patched = model.action_model.encode(video_batch)
+    action_encoded = model.action_model.encode(video_batch)
     action_tokens = model.action_model.get_action_sequence(action_encoded)
     last_action = action_tokens[:, -1]  # (B,)
-    return model.inference(context, last_action, max_steps=max_steps)
+    return model.inference(video_batch, last_action, max_steps=max_steps)
 
 
 def evaluate_model(
@@ -131,9 +131,9 @@ def evaluate_model(
 
                 # Get reconstructed video from action model for FID/FVD
                 # The action model reconstructs frames 1:T from frames 0:T-1
-                action_encoded, patched_video_from_action_embedder = model.action_model.encode(video_batch)
+                action_encoded = model.action_model.encode(video_batch)
                 action_tokens = model.action_model.get_action_sequence(action_encoded)
-                reconstructed_video = model.action_model.decode(action_encoded, patched_video_from_action_embedder)
+                reconstructed_video = model.action_model.decode(video_batch, action_encoded)
 
                 # Real target frames: video[:, 1:, :, :, :]
                 real_target_frames = video_batch
@@ -364,19 +364,21 @@ def evaluate_model_rollout(
     wandb_logger=None,
     save_dir: str = "dynamics_model_results",
 ) -> None:
-    """Run a teacher-forced rollout eval using the dynamics model.
+    """Run teacher-forced and autoregressive rollout evals.
 
     Expects ``rollout_dataloader`` to yield clips of length
     ``2 * config.num_images_in_video`` (2T). For each clip the function:
 
     1. Extracts GT actions for the full 2T clip via the action model.
-    2. Teacher-forces T calls to ``model.inference``, each with a
-       T-frame GT context window and the GT-derived action for that step.
-    3. Saves a comparison grid: GT row vs Predicted row (context + rollout).
+    2. Saves a teacher-forced comparison grid from ``model.inference`` over the
+       entire 2T clip, with predictions beginning at frame ``T - 1``.
+    3. Saves an autoregressive rollout grid from ``model.rollout`` seeded by
+       the first T GT frames, with predictions beginning at frame ``T``.
     """
     model.eval()
     T = config.num_images_in_video
-    saved_image_paths: list[str] = []
+    saved_rollout_image_paths: list[str] = []
+    saved_teacher_forced_image_paths: list[str] = []
 
     eval_dir = f"{save_dir}/eval_rollout/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
@@ -391,73 +393,105 @@ def evaluate_model_rollout(
                 video_batch = video_batch.to(device)  # (B, 2T, C, H, W)
 
                 # Extract GT actions for the full 2T clip
-                action_encoded, _ = model.action_model.encode(video_batch)
+                action_encoded = model.action_model.encode(video_batch)
                 actions_full = model.action_model.get_action_sequence(
                     action_encoded
                 )  # (B, 2T-1)
 
-                predicted_last_frames: list[torch.Tensor] = []
-                for i in range(T):
-                    context = video_batch[:, i : T + i]  # (B, T, C, H, W)
-                    step_action = actions_full[:, T + i - 1]  # (B,)
-                    decoded_full = model.inference(
-                        context, step_action, max_steps=config.rollout_max_steps
-                    )  # (B, T+1, C, H, W)
-                    predicted_last_frames.append(decoded_full[:, -1])
-
-                # (B, T, C, H, W)
-                predicted_rollout = torch.stack(predicted_last_frames, dim=1)
-
-                # Build the full predicted sequence: context GT + rollout predictions
-                context_gt = video_batch[:, :T]  # (B, T, C, H, W)
-                predicted_full = torch.cat(
-                    [context_gt, predicted_rollout], dim=1
-                )  # (B, 2T, C, H, W)
-
                 gt_images = convert_video_to_images(video_batch)
-                pred_images = convert_video_to_images(predicted_full)
+
+                teacher_forced_full = model.inference(
+                    video_batch,
+                    actions_full[:, -1],
+                    max_steps=config.rollout_max_steps,
+                )  # (B, 2T, C, H, W)
+                teacher_forced_images = convert_video_to_images(teacher_forced_full)
+                teacher_forced_actions = (
+                    actions_full[:, T - 2 :].detach().cpu().numpy().tolist()
+                )
+
                 rollout_actions = (
                     actions_full[:, T - 1 :]
-                    .squeeze(-1)
                     .detach()
                     .cpu()
                     .numpy()
                     .tolist()
                 )
+                predicted_full = model.rollout(
+                    video_batch[:, :T],
+                    actions_full[:, T - 1 :],
+                    max_steps=config.rollout_max_steps,
+                )  # (B, 2T, C, H, W)
+                rollout_images = convert_video_to_images(predicted_full)
 
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
                 save_rollout_comparison_grid(
                     gt_videos=gt_images,
-                    predicted_videos=pred_images,
+                    predicted_videos=teacher_forced_images,
+                    predicted_actions=teacher_forced_actions,
+                    output_dir=batch_dir,
+                    prediction_start_idx=T - 1,
+                    file_suffix="teacher_forced_comparison_grid.png",
+                )
+                save_rollout_comparison_grid(
+                    gt_videos=gt_images,
+                    predicted_videos=rollout_images,
                     predicted_actions=rollout_actions,
                     output_dir=batch_dir,
-                    context_len=T,
+                    prediction_start_idx=T,
                 )
 
-                image_path = f"{batch_dir}/rollout_comparison_grid.png"
-                saved_image_paths.append(image_path)
+                rollout_image_path = f"{batch_dir}/rollout_comparison_grid.png"
+                teacher_forced_image_path = (
+                    f"{batch_dir}/teacher_forced_comparison_grid.png"
+                )
+                saved_rollout_image_paths.append(rollout_image_path)
+                saved_teacher_forced_image_paths.append(teacher_forced_image_path)
 
                 if wandb_logger:
                     wandb_logger.log(
-                        {f"eval_rollout/comparison_{batch_idx}": wandb.Image(image_path)},
+                        {
+                            f"eval_rollout/comparison_{batch_idx}": wandb.Image(
+                                rollout_image_path
+                            ),
+                            f"eval_teacher_forced/comparison_{batch_idx}": wandb.Image(
+                                teacher_forced_image_path
+                            ),
+                        },
                         step=global_step,
                     )
 
-                logger.debug(f"Saved rollout comparison to {image_path}")
+                logger.debug(
+                    "Saved rollout comparison to "
+                    f"{rollout_image_path} and teacher-forced comparison to "
+                    f"{teacher_forced_image_path}"
+                )
 
             except Exception as e:
                 traceback.print_exc()
                 logger.warning(f"Error in rollout eval batch {batch_idx}: {e}")
                 continue
 
-    logger.info(f"Rollout eval complete: saved {len(saved_image_paths)} grids")
+    logger.info(
+        "Rollout eval complete: saved "
+        f"{len(saved_rollout_image_paths)} rollout grids and "
+        f"{len(saved_teacher_forced_image_paths)} teacher-forced grids"
+    )
 
-    if wandb_logger and saved_image_paths:
+    if wandb_logger and saved_rollout_image_paths:
         log_image_batches(
             wandb_logger,
             key_prefix="eval_rollout/comparison",
-            image_paths=saved_image_paths,
+            image_paths=saved_rollout_image_paths,
+            batch_size=5,
+            step=global_step,
+        )
+    if wandb_logger and saved_teacher_forced_image_paths:
+        log_image_batches(
+            wandb_logger,
+            key_prefix="eval_teacher_forced/comparison",
+            image_paths=saved_teacher_forced_image_paths,
             batch_size=5,
             step=global_step,
         )
@@ -905,7 +939,8 @@ def main(config: DynamicsModelTrainingConfig):
         f"Initial eval - Token Loss: {eval_token_loss:.6f}, Action Loss: {eval_action_loss:.6f}"
     )
 
-    if rollout_dataloader is not None:
+    # Skip rollout evaluation before any optimizer steps have run.
+    if rollout_dataloader is not None and global_step > 0:
         evaluate_model_rollout(
             model,
             rollout_dataloader,

@@ -65,7 +65,7 @@ def next_frame_reconstruction_loss(
 
     Args:
         video: Video [B, num_images_in_video, C, H, W]
-        decoded: Reconstructed frame [B, C, H, W]
+        decoded: Reconstructed frame [B, num_images_in_video - 1, C, H, W]
 
     Returns:
         Weighted reconstruction loss (scalar)

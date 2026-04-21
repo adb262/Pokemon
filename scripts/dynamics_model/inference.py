@@ -233,8 +233,11 @@ def _interactive_loop(
 
         with torch.no_grad():
             try:
+                action_tensor = torch.tensor(
+                    [action_id], dtype=torch.long, device=device
+                )
                 # inference returns the predicted next frame(s)
-                result = model.inference(current_video, action_id)
+                result = model.inference(current_video, action_tensor)
             except NotImplementedError:
                 logger.warning(
                     "DynamicsModel.inference is a stub and must be implemented before use."

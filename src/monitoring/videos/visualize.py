@@ -163,17 +163,17 @@ def save_rollout_comparison_grid(
     predicted_videos: list[list[Image.Image]],
     predicted_actions: list[list[int]],
     output_dir: str,
-    context_len: int,
+    prediction_start_idx: int,
     file_suffix: str = "rollout_comparison_grid.png",
 ):
     """Save a comparison grid for a dynamics-model rollout eval.
 
-    Each sample produces 2 rows × 2T columns:
-      Row 0 (GT):        gt[0..2T-1]
-      Row 1 (Predicted): gt[0..T-1] then pred_0..pred_{T-1}
+    Each sample produces 2 rows × N columns:
+      Row 0 (GT):        gt[0..N-1]
+      Row 1 (Predicted): GT frames up to ``prediction_start_idx - 1`` followed
+                         by model predictions from ``prediction_start_idx`` on.
 
-    A vertical divider is drawn between the context region (cols 0..T-1)
-    and the rollout region (cols T..2T-1).
+    A vertical divider is drawn at the boundary where predictions begin.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -220,26 +220,26 @@ def save_rollout_comparison_grid(
                 axs[row_offset + 1, col].set_ylabel("Predicted", fontsize=10)
 
             # Column titles on top row of each sample
-            if col < context_len:
+            if col < prediction_start_idx:
                 title = f"t={col}"
             else:
-                action_idx = col - context_len
+                action_idx = col - prediction_start_idx
                 action_val = actions[action_idx] if action_idx < len(actions) else "?"
                 title = f"t={col}  a={action_val}"
             axs[row_offset, col].set_title(title, fontsize=9)
 
-        # Draw vertical divider at the context/rollout boundary
+        # Draw vertical divider at the GT/prediction boundary.
         for row in range(2):
             r = row_offset + row
-            if context_len - 1 < total_cols:
-                ax_left = axs[r, context_len - 1]
+            if 0 < prediction_start_idx <= total_cols:
+                ax_left = axs[r, prediction_start_idx - 1]
                 for spine in ax_left.spines.values():
                     spine.set_visible(False)
                 ax_left.spines["right"].set_visible(True)
                 ax_left.spines["right"].set_color("red")
                 ax_left.spines["right"].set_linewidth(3)
-            if context_len < total_cols:
-                ax_right = axs[r, context_len]
+            if prediction_start_idx < total_cols:
+                ax_right = axs[r, prediction_start_idx]
                 for spine in ax_right.spines.values():
                     spine.set_visible(False)
                 ax_right.spines["left"].set_visible(True)
