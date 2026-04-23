@@ -29,8 +29,6 @@ def save_checkpoint(
     best_loss: float,
     dataloader_state: dict,
     action_model: LatentActionVQVAE,
-    action_optimizer: optim.Optimizer,
-    action_scheduler: optim.lr_scheduler.LRScheduler,
     is_best: bool = False,
 ):
     """Save comprehensive model checkpoint.
@@ -85,8 +83,6 @@ def save_checkpoint(
         "epoch": epoch,
         "batch_idx": batch_idx,
         "model_state_dict": action_model.state_dict(),
-        "optimizer_state_dict": action_optimizer.state_dict(),
-        "scheduler_state_dict": action_scheduler.state_dict(),
         "loss": loss,
         "best_loss": best_loss,
         "config": config.__dict__,
@@ -119,8 +115,30 @@ def load_checkpoint(
     """Load model checkpoint"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    optimizer_state_loaded = False
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        optimizer_state_loaded = True
+    except ValueError as exc:
+        logger.warning(
+            "Skipping optimizer state load from %s due to parameter-group mismatch: %s",
+            checkpoint_path,
+            exc,
+        )
+
+    if optimizer_state_loaded:
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        except ValueError as exc:
+            logger.warning(
+                "Skipping scheduler state load from %s due to state mismatch: %s",
+                checkpoint_path,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Using freshly initialized scheduler because optimizer state was not restored."
+        )
 
     logger.info(f"Loaded checkpoint: {checkpoint_path}")
     return model, optimizer, scheduler, checkpoint

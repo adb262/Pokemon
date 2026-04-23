@@ -46,8 +46,8 @@ class DynamicsModelTrainingConfig:
     dynamics_num_transformer_layers: int = 12
     dynamics_num_heads: int = 8
 
-    action_learning_rate: float = 1e-4
-    dynamics_learning_rate: float = 1e-4
+    action_learning_rate: float = 3e-5
+    dynamics_learning_rate: float = 3e-5
 
     # Pretrained tokenizer
     tokenizer_checkpoint_path: str = ""
@@ -72,7 +72,7 @@ class DynamicsModelTrainingConfig:
     seed: int = 42
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
-    dataset_limit: int = 50000
+    dataset_limit: int = 500000
 
     # Rollout evaluation
     rollout_max_steps: int = 10

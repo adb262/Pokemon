@@ -93,6 +93,22 @@ def next_frame_reconstruction_loss(
     return (mse_loss * weight_mask).mean()
 
 
+def next_frame_reconstruction_loss_l1(
+    video: torch.Tensor, decoded: torch.Tensor
+) -> torch.Tensor:
+    """
+    Reconstruction loss that gives higher weight to pixels that changed between frames.
+
+    Args:
+        video: Video [B, num_images_in_video, C, H, W]
+        decoded: Reconstructed frame [B, num_images_in_video - 1, C, H, W]
+
+    Returns:
+        Weighted reconstruction loss (scalar)
+    """
+    return F.l1_loss(decoded, video[:, 1:, :, :, :], reduction="mean")
+
+
 def changed_patch_weighted_token_cross_entropy_loss(
     predicted_tokens: torch.Tensor,
     target_tokens: torch.Tensor,

@@ -507,8 +507,6 @@ def train_epoch(
     rollout_dataloader: VideoWindowLoader | None,
     dynamics_optimizer: optim.Optimizer,
     dynamics_scheduler: optim.lr_scheduler.LRScheduler,
-    action_optimizer: optim.Optimizer,
-    action_scheduler: optim.lr_scheduler.LRScheduler,
     device: torch.device,
     epoch: int,
     config: DynamicsModelTrainingConfig,
@@ -534,7 +532,6 @@ def train_epoch(
     epoch_start_time = time.time()
     action_loss_acc, token_loss_acc = [], []
     dynamics_optimizer.zero_grad()
-    action_optimizer.zero_grad()
 
     for batch_idx, video_batch in enumerate(train_dataloader):
         # Skip batches if resuming
@@ -553,8 +550,8 @@ def train_epoch(
         # accumulated gradient matches the corresponding large-batch mean.
         remaining_batches = num_batches - batch_idx
         current_window_size = min(accumulation_steps, remaining_batches)
-        (token_loss / current_window_size).backward()
-        (action_loss / current_window_size).backward()
+        combined_loss = (token_loss + action_loss) / current_window_size
+        combined_loss.backward()
         token_loss_acc.append(token_loss.item())
         action_loss_acc.append(action_loss.item())
 
@@ -565,18 +562,10 @@ def train_epoch(
                 torch.nn.utils.clip_grad_norm_(
                     dynamics_model.parameters(), max_norm=config.gradient_clipping
                 )
-                torch.nn.utils.clip_grad_norm_(
-                    action_model.parameters(), max_norm=config.gradient_clipping
-                )
 
             dynamics_optimizer.step()
-            action_optimizer.step()
-
             dynamics_scheduler.step()
-            action_scheduler.step()
-
             dynamics_optimizer.zero_grad()
-            action_optimizer.zero_grad()
 
             avg_token_loss = sum(token_loss_acc) / len(token_loss_acc)
             avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
@@ -587,11 +576,14 @@ def train_epoch(
 
             # Log to wandb
             if wandb_logger:
+                current_lrs = dynamics_scheduler.get_last_lr()
                 wandb_metrics = {
                     "train/loss": total_loss,
                     "train/token_loss": avg_token_loss,
                     "train/action_loss": avg_action_loss,
-                    "train/learning_rate": dynamics_scheduler.get_last_lr()[0],
+                    "train/learning_rate": current_lrs[0],
+                    "train/dynamics_learning_rate": current_lrs[0],
+                    "train/action_learning_rate": current_lrs[1],
                     "train/batch_time": batch_time,
                     "train/epoch": epoch,
                     "train/batch": batch_idx,
@@ -600,11 +592,12 @@ def train_epoch(
 
             # Log progress
             if (batch_idx // accumulation_steps) % config.log_interval == 0:
-                current_lr = dynamics_scheduler.get_last_lr()[0]
+                current_lrs = dynamics_scheduler.get_last_lr()
                 logger.info(
                     f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
                     f"Loss: {total_loss:.6f} (token: {avg_token_loss:.6f}, action: {avg_action_loss:.6f}), "
-                    f"LR: {current_lr:.2e}, Time: {batch_time:.2f}s"
+                    f"LRs: dynamics={current_lrs[0]:.2e}, action={current_lrs[1]:.2e}, "
+                    f"Time: {batch_time:.2f}s"
                 )
 
             action_loss_acc, token_loss_acc = [], []
@@ -674,8 +667,6 @@ def train_epoch(
                     best_loss,
                     dataloader_state,
                     action_model=action_model,
-                    action_optimizer=action_optimizer,
-                    action_scheduler=action_scheduler,
                 )
 
             # Increment global step
@@ -851,14 +842,26 @@ def main(config: DynamicsModelTrainingConfig):
         wandb_logger.watch(model, log="all", log_freq=config.log_interval * 10)
 
     # Create optimizer and scheduler
+    action_params = [
+        parameter for parameter in action_model.parameters() if parameter.requires_grad
+    ]
+    action_param_ids = {id(parameter) for parameter in action_params}
+    dynamics_params = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in action_param_ids
+    ]
     optimizer = optim.AdamW(
-        model.parameters(), lr=config.dynamics_learning_rate, weight_decay=1e-4
-    )
-    action_optimizer = optim.AdamW(
-        action_model.parameters(), lr=config.action_learning_rate, weight_decay=1e-4
+        [
+            {"params": dynamics_params, "lr": config.dynamics_learning_rate},
+            {"params": action_params, "lr": config.action_learning_rate},
+        ],
+        weight_decay=1e-4,
     )
     logger.info(
-        f"Optimizer created with learning rate: {config.dynamics_learning_rate}"
+        "Optimizer created with parameter groups: "
+        f"dynamics_lr={config.dynamics_learning_rate}, "
+        f"action_lr={config.action_learning_rate}"
     )
 
     # Cosine annealing scheduler with warmup
@@ -875,29 +878,11 @@ def main(config: DynamicsModelTrainingConfig):
         end_factor=1.0,
         total_iters=warmup_steps,
     )
-    action_warmup_scheduler = LinearLR(
-        action_optimizer,
-        start_factor=1e-8,
-        end_factor=1.0,
-        total_iters=warmup_steps,
-    )
-
     # Cosine annealing for the remaining steps
     cosine_scheduler = CosineAnnealingLR(
         optimizer,
         T_max=total_steps - warmup_steps,
         eta_min=config.min_learning_rate,
-    )
-    action_cosine_scheduler = CosineAnnealingLR(
-        action_optimizer,
-        T_max=total_steps - warmup_steps,
-        eta_min=config.min_learning_rate,
-    )
-
-    action_scheduler = SequentialLR(
-        action_optimizer,
-        schedulers=[action_warmup_scheduler, action_cosine_scheduler],
-        milestones=[warmup_steps],
     )
 
     # Combine warmup + cosine annealing
@@ -931,6 +916,13 @@ def main(config: DynamicsModelTrainingConfig):
         start_epoch = checkpoint["epoch"]
         start_batch = checkpoint.get("batch_idx", 0)
         best_loss = checkpoint.get("best_loss", float("inf"))
+
+        # End-of-epoch checkpoints store the last seen batch index, so advance to
+        # the next epoch instead of re-entering a completed one.
+        if start_batch >= len(train_dataloader):
+            start_epoch += 1
+            start_batch = 0
+
         logger.info(f"Resumed from epoch {start_epoch}, batch {start_batch}")
 
     # Initial evaluation
@@ -978,8 +970,6 @@ def main(config: DynamicsModelTrainingConfig):
                 rollout_dataloader,
                 optimizer,
                 scheduler,
-                action_optimizer,
-                action_scheduler,
                 device,
                 epoch,
                 config,
@@ -1030,8 +1020,6 @@ def main(config: DynamicsModelTrainingConfig):
                     best_loss,
                     train_dataloader.get_state(),
                     action_model=action_model,
-                    action_optimizer=action_optimizer,
-                    action_scheduler=action_scheduler,
                     is_best=True,
                 )
 
@@ -1049,8 +1037,6 @@ def main(config: DynamicsModelTrainingConfig):
             best_loss,
             dataloader_state,
             action_model=action_model,
-            action_optimizer=action_optimizer,
-            action_scheduler=action_scheduler,
         )
     except Exception as e:
         logging.error(f"Training error: {e}")
