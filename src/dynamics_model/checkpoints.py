@@ -7,6 +7,7 @@ import torch.optim as optim
 
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from dynamics_model.model import DynamicsModel
+from latent_action_model.model import LatentActionVQVAE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,9 +28,24 @@ def save_checkpoint(
     config: DynamicsModelTrainingConfig,
     best_loss: float,
     dataloader_state: dict,
+    action_model: LatentActionVQVAE,
+    action_optimizer: optim.Optimizer,
+    action_scheduler: optim.lr_scheduler.LRScheduler,
     is_best: bool = False,
 ):
-    """Save comprehensive model checkpoint"""
+    """Save comprehensive model checkpoint.
+
+    Writes two files:
+      - ``{checkpoint_dir}/checkpoint_epoch{E}_batch{B}.pt`` for the dynamics
+        model (also mirrored to ``checkpoint_latest.pt`` and, if ``is_best``,
+        ``checkpoint_best.pt``).
+      - ``{checkpoint_dir}/action_model/checkpoint_epoch{E}_batch{B}.pt`` for
+        the co-trained latent action model, in the same format consumed by
+        ``create_action_model_from_dynamics_config`` (key ``model_state_dict``
+        at the top level).
+    """
+    timestamp = datetime.now().isoformat()
+
     checkpoint = {
         "epoch": epoch,
         "batch_idx": batch_idx,
@@ -40,7 +56,7 @@ def save_checkpoint(
         "best_loss": best_loss,
         "config": config.__dict__,
         "dataloader_state": dataloader_state,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": timestamp,
     }
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -60,6 +76,35 @@ def save_checkpoint(
         best_path = os.path.join(config.checkpoint_dir, "checkpoint_best.pt")
         torch.save(checkpoint, best_path)
         logger.info(f"New best checkpoint saved: {best_path}")
+
+    # Also save the co-trained action model separately so it can be loaded
+    # standalone via ``action_model_checkpoint_path``.
+    action_checkpoint_dir = os.path.join(config.checkpoint_dir, "action_model")
+    os.makedirs(action_checkpoint_dir, exist_ok=True)
+    action_checkpoint = {
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "model_state_dict": action_model.state_dict(),
+        "optimizer_state_dict": action_optimizer.state_dict(),
+        "scheduler_state_dict": action_scheduler.state_dict(),
+        "loss": loss,
+        "best_loss": best_loss,
+        "config": config.__dict__,
+        "timestamp": timestamp,
+    }
+    action_checkpoint_path = os.path.join(
+        action_checkpoint_dir, f"checkpoint_epoch{epoch}_batch{batch_idx}.pt"
+    )
+    torch.save(action_checkpoint, action_checkpoint_path)
+    torch.save(
+        action_checkpoint, os.path.join(action_checkpoint_dir, "checkpoint_latest.pt")
+    )
+    if is_best:
+        torch.save(
+            action_checkpoint,
+            os.path.join(action_checkpoint_dir, "checkpoint_best.pt"),
+        )
+    logger.info(f"Saved action model checkpoint: {action_checkpoint_path}")
 
     return checkpoint_path
 

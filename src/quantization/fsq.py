@@ -11,7 +11,6 @@ from quantization.base import BaseQuantizer
 
 logger = logging.getLogger(__name__)
 
-
 def round_ste(z):
     """Round with straight through gradients."""
     zhat = torch.round(z)
@@ -52,9 +51,9 @@ class FiniteScalarQuantizer(BaseQuantizer):
         self.mask_token_idx = self.codebook_size
         self.mask_token_embedding = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
-        nn.init.xavier_uniform_(self.project_in.weight)
-        if self.project_in.bias is not None:
-            nn.init.zeros_(self.project_in.bias)
+        # nn.init.xavier_uniform_(self.project_in.weight)
+        # if self.project_in.bias is not None:
+        #     nn.init.zeros_(self.project_in.bias)
 
     def bound(self, z):
         """Bound ‘z‘, an array of shape (..., d)."""
@@ -71,13 +70,21 @@ class FiniteScalarQuantizer(BaseQuantizer):
             f"Devices: {z.device}, {self.project_in.weight.device}, {self._levels_np.device}"
         )
         logger.debug(f"z shape before project_in: {z.shape}")
-        z = self.project_in(z)
+        # TODO[adb262]: This is a hack for backwards compatibility with the old tokenizer
+        # In the future, we should remove the linear layer and go directly to len(bins)
+        if z.shape[-1] != len(self._levels):
+            logger.warning(f"z shape: {z.shape} does not match levels: {len(self._levels)}")
+            z = self.project_in(z)
+
         logger.debug(f"z shape after project_in: {z.shape}")
         quantized = round_ste(self.bound(z))
         half_width = self._levels_np.to(z.device) // 2  # type: ignore[operator]
         # Renormalize to [-1, 1]. return quantized / half_width
         logger.debug(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
-        return quantized / half_width
+        zhat_normalized = quantized / half_width
+        codes = self.quantized_value_to_codes(zhat_normalized)
+        logger.debug(f"Codebook indices: {codes}. z: {z}")
+        return zhat_normalized
 
     def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:
         levels = self._levels_np
@@ -91,7 +98,7 @@ class FiniteScalarQuantizer(BaseQuantizer):
 
     def quantized_value_to_codes(self, zhat: torch.Tensor) -> torch.Tensor:
         """Converts a ‘code‘ to an index in the codebook."""
-        logger.info(f"zhat shape: {zhat.shape}, levels: {self._levels}")
+        logger.debug(f"zhat shape: {zhat.shape}, levels: {self._levels}")
         assert zhat.shape[-1] == len(self._levels)
         zhat = self._scale_and_shift(zhat)  # type: ignore[arg-type]
         # Round to nearest integer and clamp to valid range to avoid floating point precision issues

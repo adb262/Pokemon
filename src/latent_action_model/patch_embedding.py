@@ -1,5 +1,6 @@
 import logging
 
+from einops import rearrange
 import torch
 import torch.nn as nn
 from einops.layers.torch import Rearrange
@@ -67,6 +68,7 @@ class PatchEmbeddingConv(nn.Module):
             kernel_size=patch_size,
             stride=patch_size,
         )
+        self.patch_size = patch_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, num_frames, c, h, w)
@@ -80,16 +82,5 @@ class PatchEmbeddingConv(nn.Module):
         # Output: (b*t, d_model, h/patch, w/patch)
         x = self.proj(x)
 
-        # 3. Flatten spatial dimensions to get tokens
-        # Output: (b*t, d_model, num_patches)
-        x = x.flatten(2)
-
-        # 4. Swap dimensions for Transformer (usually expects: Batch, Time, Sequence, Dim)
-        # Output: (b*t, num_patches, d_model)
-        x = x.transpose(1, 2)
-
-        # 5. Restore Batch and Time dimensions
-        # Output: (b, t, num_patches, d_model)
-        x = x.reshape(b, t, -1, x.shape[-1])
-
-        return x
+        # Rearrange to (b, t, num_patches, d_model)
+        return rearrange(x, "(b t) d h w -> b t (h w) d", b=b, t=t, h=h//self.patch_size, w=w//self.patch_size)

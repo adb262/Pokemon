@@ -6,7 +6,7 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-action_weight = 50
+action_weight = 5
 
 
 def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
@@ -65,7 +65,7 @@ def next_frame_reconstruction_loss(
 
     Args:
         video: Video [B, num_images_in_video, C, H, W]
-        decoded: Reconstructed frame [B, C, H, W]
+        decoded: Reconstructed frame [B, num_images_in_video - 1, C, H, W]
 
     Returns:
         Weighted reconstruction loss (scalar)
@@ -91,3 +91,29 @@ def next_frame_reconstruction_loss(
     )  # [B, Num_images_in_video - 1, C, H, W]
 
     return (mse_loss * weight_mask).mean()
+
+
+def changed_patch_weighted_token_cross_entropy_loss(
+    predicted_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    previous_frame_tokens: torch.Tensor,
+    current_frame_tokens: torch.Tensor,
+    changed_patch_loss_weight: float = 30.0,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    per_patch_token_loss = F.cross_entropy(
+        predicted_tokens.transpose(1, 2),
+        target_tokens,
+        ignore_index=ignore_index,
+        reduction="none",
+    )
+    valid_targets = target_tokens != ignore_index
+    changed_patches = previous_frame_tokens != current_frame_tokens
+    patch_weights = torch.ones_like(per_patch_token_loss)
+    patch_weights = patch_weights.masked_fill(
+        changed_patches & valid_targets, changed_patch_loss_weight
+    )
+    normalized_weights = patch_weights.masked_fill(~valid_targets, 0)
+    return (per_patch_token_loss * patch_weights).sum() / normalized_weights.sum().clamp_min(
+        1.0
+    )

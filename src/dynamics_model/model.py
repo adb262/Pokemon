@@ -4,11 +4,15 @@ import torch.nn as nn
 from torch.distributions import uniform
 
 from latent_action_model.model import LatentActionVQVAE
-from loss.loss_fns import reconstruction_loss
+from loss.loss_fns import (
+    changed_patch_weighted_token_cross_entropy_loss,
+    next_frame_reconstruction_loss,
+)
 from torch_utilities.initialize import init_weights
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 from video_tokenization.model import VideoTokenizer
 import logging
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -30,6 +34,7 @@ class DynamicsModel(nn.Module):
         super(DynamicsModel, self).__init__()
         self.mask_ratio_lower_bound = mask_ratio_lower_bound
         self.mask_ratio_upper_bound = mask_ratio_upper_bound
+        self.num_images_in_video = num_images_in_video
         self.d_model = d_model
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model))
         self.mask_ratio_distribution = uniform.Uniform(
@@ -41,6 +46,7 @@ class DynamicsModel(nn.Module):
 
         self.tokenizer = tokenizer
         self.action_model = action_model
+        self._ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
         # python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 16 --save_dir dynamics_model_base --bins 8 8 6 5 --use_s3 --dataset_train_key pokemon_emerald_train_0_9_5_frames.json --checkpoint_dir dynamics_model_base --patch_size 4 --image_size 128 --num_epochs 20 --gradient_clipping 1.0 --tokenizer_checkpoint_path fsq_tokenizer_2k_128_4_512_8_heads_4_layers
 
@@ -62,10 +68,19 @@ class DynamicsModel(nn.Module):
             nn.Linear(d_model * 4, self.tokenizer.get_vocab_size()),
         )
         self.softmax = nn.Softmax(dim=-1)
-        self.token_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-        self.action_loss_fn = reconstruction_loss
+        self.changed_patch_loss_weight = 30.0
+        self.action_loss_fn = next_frame_reconstruction_loss
 
-        init_weights(self)
+        # Only initialize the newly-created submodules. ``self.apply`` would
+        # recurse into ``self.tokenizer`` and ``self.action_model`` and wipe
+        # their pretrained / co-trained weights.
+        for module in (
+            self.tokenizer_embedding,
+            self.action_embedding,
+            self.decoder,
+            self.vocab_head,
+        ):
+            module.apply(init_weights)
 
     @staticmethod
     def cosine_scheduler(max_steps: int, current_step: int, device: torch.device):
@@ -78,6 +93,7 @@ class DynamicsModel(nn.Module):
         # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
         # And the masked targets
 
+        logger.debug(f"video shape: {video.shape}")
         # x is of shape (batch_size, num_images_in_video, num_patches)
         with torch.no_grad():
             # x is of shape (batch_size, num_images_in_video, num_patches)
@@ -90,19 +106,19 @@ class DynamicsModel(nn.Module):
             self.mask_ratio_lower_bound, self.mask_ratio_upper_bound
         )
         mask = (
-            torch.rand(batch_size, 1, num_patches, device=targets.device) < mask_ratio
+            torch.rand(batch_size, self.num_images_in_video - 1, num_patches, device=targets.device) < mask_ratio
         )  # Boolean mask over only the target frame
 
         # Save original targets for loss computation before masking
         original_targets = targets.clone()
 
-        targets[:, -1:, :] = self.tokenizer.mask_codebook_tokens(
-            targets[:, -1:, :].long(), mask
+        targets[:, 1:, :] = self.tokenizer.mask_codebook_tokens(
+            targets[:, 1:, :].long(), mask
         )
 
         # TODO: Should this also use the mask?
         # (batch_size, num_images_in_video - 1, num_patches, d_model)
-        action_video_encoded, patched_video_from_action_embedder = self.action_model.encode(video)
+        action_video_encoded = self.action_model.encode(video)
 
         action_tokens = self.action_model.get_action_sequence(
             action_video_encoded
@@ -120,64 +136,92 @@ class DynamicsModel(nn.Module):
         x = self.decoder(x)
         x = self.vocab_head(x)
 
-        reconstructed_action_video = self.action_model.decode(action_video_encoded, patched_video_from_action_embedder)
-        action_loss = self.action_loss_fn(
-            video[:, 1:, :, :], reconstructed_action_video
-        )
+        reconstructed_action_video = self.action_model.decode(video, action_video_encoded)
+        action_loss = self.action_loss_fn(video, reconstructed_action_video)
 
         # Only compute token loss on masked positions of the final frame.
-        target_frame = original_targets[:, -1:, :].masked_fill(~mask, -100)
+        target_frame = original_targets[:, 1:, :].masked_fill(~mask, -100)
 
         # View both as 3d tensors for the loss function
         logger.debug(f"x shape: {x.shape}, targets shape: {targets.shape}")
-        predicted_tokens = rearrange(x[:, -1:, :, :], "b t p d -> b (t p) d")
+        # predicted_tokens = rearrange(x[:, -1:, :, :], "b t p d -> b (t p) d")
+        # target_tokens = rearrange(target_frame, "b t p -> b (t p)")
+        # logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
+        predicted_tokens = rearrange(x[:, 1:, :, :], "b t p d -> b (t p) d")
         target_tokens = rearrange(target_frame, "b t p -> b (t p)")
-        logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
-        token_loss = self.token_loss_fn(predicted_tokens.transpose(1, 2), target_tokens)
+        # previous_frame_tokens = rearrange(
+        #     original_targets[:, -2:-1, :], "b t p -> b (t p)"
+        # )
+        # current_frame_tokens = rearrange(
+        #     original_targets[:, -1:, :], "b t p -> b (t p)"
+        # )
+        # token_loss = changed_patch_weighted_token_cross_entropy_loss(
+        #     predicted_tokens=predicted_tokens,
+        #     target_tokens=target_tokens,
+        #     previous_frame_tokens=previous_frame_tokens,
+        #     current_frame_tokens=current_frame_tokens,
+        #     changed_patch_loss_weight=self.changed_patch_loss_weight,
+        # )
+        token_loss = self._ce_loss_fn(
+            predicted_tokens.transpose(1, 2), target_tokens
+        )
 
         return x, token_loss, action_loss
 
     @torch.inference_mode()
-    def inference(self, video: torch.Tensor, action: int, max_steps: int = 10):
-        # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
-        # input is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
-        # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
-        # And the masked targets
+    def _inference_window(
+        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 25
+    ) -> torch.Tensor:
+        # video: (B, T, C, H, W). The last frame is treated as MASKED and
+        # its tokens are iteratively filled in by MaskGIT. The first T-1
+        # frames are the observed context.
+        # Return: (B, T, C, H, W) pixel video. Frames 0..T-2 are the
+        # tokenizer's reconstruction of the observed context; frame T-1 is
+        # the prediction.
+        assert video.shape[1] == self.num_images_in_video, (
+            f"_inference_window expects {self.num_images_in_video} frames, "
+            f"got {video.shape[1]}"
+        )
 
-        # x is of shape (batch_size, num_images_in_video, num_patches)
         with torch.no_grad():
-            # x is of shape (batch_size, num_images_in_video, num_patches)
+            # (B, T, P) codebook indices; last frame's entries will be masked below.
             targets = self.tokenizer.quantized_value_to_codes(
                 self.tokenizer.encode(video)
             ).long()
 
-        action_token = torch.tensor([action], dtype=torch.long, device=targets.device)
-        batch_size, num_images_in_video, num_patches = targets.shape
-        mask_tensor = torch.full((1, 1, num_patches), self.tokenizer.get_mask_token_idx(), dtype=torch.long, device=targets.device)
-        targets = torch.cat([targets, mask_tensor], dim=1)
+        batch_size, _, num_patches = targets.shape
 
-        # TODO: Should this also use the mask?
-        # (batch_size, num_images_in_video - 1, num_patches, d_model)
-        action_video_encoded, patched_video_from_action_embedder = self.action_model.encode(video)
+        action_token = action.long().to(targets.device)
+        if action_token.dim() == 1:
+            action_token = action_token.unsqueeze(1)  # (B,) -> (B, 1)
+
+        # Mask the last frame's tokens in place (the frame we will predict).
+        targets[:, -1, :] = self.tokenizer.get_mask_token_idx()
+
+        # Derive the T-2 observed actions from the first T-1 frames only;
+        # we must not peek at the target frame. The final action slot is
+        # filled by the user-supplied ``action`` (the transition into the
+        # masked frame).
+        action_video_encoded = self.action_model.encode(video[:, :-1])
 
         action_tokens = self.action_model.get_action_sequence(
             action_video_encoded
         )
-        logger.info(f"action_tokens shape: {action_tokens.shape}")
-        logger.info(f"action_token shape: {action_token.shape}")
-        action_tokens = torch.cat([action_tokens.long(), action_token.unsqueeze(1)], dim=1)
+        logger.debug(f"action_tokens shape: {action_tokens.shape}")
+        logger.debug(f"action_token shape: {action_token.shape}")
+        action_tokens = torch.cat([action_tokens.long(), action_token], dim=1)
 
-        # action_tokens is of shape (batch_size, num_images_in_video, num_patches)
-        # Produces a sequence of action embeddings of shape (batch_size, num_images_in_video, num_patches, d_model)
+        # (B, T-1, d_model): one action embedding per observed frame; added
+        # to x[:, :-1] below so positions 0..T-2 carry the action taking
+        # them to the next frame (the last of which is the masked target).
         action_embeddings = self.action_embedding(action_tokens.long())
 
-        # targets is of shape (batch_size, num_images_in_video, num_patches)
         step = 0
         mask_locations = torch.full((batch_size, num_patches), True, dtype=torch.bool, device=targets.device)
         while step < max_steps:
             x = self.tokenizer_embedding(targets.long())
-            logger.info(f"action_embeddings shape: {action_embeddings.shape}")
-            logger.info(f"x shape: {x.shape}")
+            logger.debug(f"action_embeddings shape: {action_embeddings.shape}")
+            logger.debug(f"x shape: {x.shape}")
 
             # Unsqueeze to add to each patch in the sequence
             x[:, :-1, :] += action_embeddings.unsqueeze(2)
@@ -224,7 +268,7 @@ class DynamicsModel(nn.Module):
             ).squeeze(-1)
             sampled_scores[samples < 0] = -1
 
-            logger.info(f"tokens_to_update: {tokens_to_update}")
+            logger.debug(f"tokens_to_update: {tokens_to_update}")
 
             if tokens_to_update > 0:
                 _, top_positions = torch.topk(
@@ -245,4 +289,147 @@ class DynamicsModel(nn.Module):
             step += 1
 
         return self.tokenizer.decode_from_codes(targets.float())
+
+    @torch.inference_mode()
+    def inference(
+        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 25
+    ) -> torch.Tensor:
+        """Predict the ``T``-th (last) frame of each ``T``-frame sliding window.
+
+        For input of shape ``(B, N, C, H, W)`` with ``N >= T``:
+
+        * Each sliding window ``video[:, k : k+T]`` predicts its own last
+          frame (original index ``k + T - 1``) via MaskGIT, matching the
+          training-time setup where the model predicts the final frame of a
+          ``T``-frame clip.
+        * The first ``N - T`` windows derive the transition into their
+          target frame from the observed ``video`` (since the true next
+          frame is present). The final window uses the user-provided
+          ``action``.
+
+        Returns ``(B, N, C, H, W)`` where frames ``0..T-2`` are copied from
+        ``video`` and frames ``T-1..N-1`` are each the corresponding
+        window's predicted last frame.
+        """
+        num_frames = video.shape[1]
+        window_size = self.num_images_in_video
+        if num_frames < window_size:
+            raise ValueError(
+                f"inference requires at least {window_size} frames, got {num_frames}"
+            )
+
+        batch_size = video.shape[0]
+        num_windows = num_frames - window_size + 1
+
+        # Stack sliding T-frame windows into the batch dimension.
+        windows = torch.stack(
+            [
+                video[:, start : start + window_size]
+                for start in range(num_windows)
+            ],
+            dim=1,
+        )
+        windows = windows.reshape(
+            batch_size * num_windows, window_size, *video.shape[2:]
+        )
+
+        action_token = action.long().to(video.device)
+        if action_token.dim() == 1:
+            action_token = action_token.unsqueeze(1)  # (B,) -> (B, 1)
+
+        if num_windows == 1:
+            batched_actions = action_token.reshape(batch_size * num_windows)
+        else:
+            # Observed actions for windows 0..num_windows-2: the transition
+            # into window k's target frame is action_{k+T-2 -> k+T-1}, i.e.
+            # full_action_tokens[:, k + T - 2]. We encode the full video
+            # once and slice the relevant range.
+            full_action_encoded = self.action_model.encode(video)
+            full_action_tokens = self.action_model.get_action_sequence(
+                full_action_encoded
+            )  # (B, N-1); index k == action from frame k to frame k+1.
+
+            observed_action_tokens = full_action_tokens[
+                :, window_size - 2 : window_size - 2 + (num_windows - 1)
+            ]  # (B, num_windows - 1)
+
+            batched_actions = torch.cat(
+                [observed_action_tokens.long(), action_token], dim=1
+            )  # (B, num_windows)
+            batched_actions = batched_actions.reshape(batch_size * num_windows)
+
+        decoded_windows = self._inference_window(
+            windows, batched_actions, max_steps=max_steps
+        )  # (B * num_windows, T, C, H, W)
+
+        predicted_last = decoded_windows[:, -1].reshape(
+            batch_size, num_windows, *video.shape[2:]
+        )
+
+        context = video[:, : window_size - 1]  # (B, T-1, C, H, W)
+        return torch.cat([context, predicted_last], dim=1)
+
+    @torch.inference_mode()
+    def predict_next_frame(
+        self, context: torch.Tensor, action: torch.Tensor, max_steps: int = 10
+    ) -> torch.Tensor:
+        """Predict the next frame after the observed context."""
+        required_context = self.num_images_in_video - 1
+        num_frames = context.shape[1]
+        if num_frames < required_context:
+            raise ValueError(
+                "predict_next_frame requires at least "
+                f"{required_context} context frames, got {num_frames}"
+            )
+
+        context_window = context[:, -required_context:]
+        # ``_inference_window`` masks the final slot before decoding, so this
+        # placeholder frame is only used to satisfy the tokenizer's fixed T.
+        placeholder = context_window[:, -1:].clone()
+        inference_window = torch.cat([context_window, placeholder], dim=1)
+        decoded_window = self._inference_window(
+            inference_window, action, max_steps=max_steps
+        )
+        return decoded_window[:, -1]
+
+    @torch.inference_mode()
+    def rollout(
+        self, video: torch.Tensor, actions: torch.Tensor, max_steps: int = 10
+    ) -> torch.Tensor:
+        """Generate future frames autoregressively from an initial context."""
+        required_context = self.num_images_in_video - 1
+        num_frames = video.shape[1]
+        if num_frames < required_context:
+            raise ValueError(
+                f"rollout requires at least {required_context} frames, got {num_frames}"
+            )
+
+        action_sequence = actions.long().to(video.device)
+        if action_sequence.dim() == 1:
+            if video.shape[0] != 1:
+                raise ValueError(
+                    "rollout expects actions with shape (B, K); got a 1D tensor "
+                    f"for batch size {video.shape[0]}"
+                )
+            action_sequence = action_sequence.unsqueeze(0)
+        if action_sequence.dim() != 2:
+            raise ValueError(
+                "rollout expects actions with shape (B, K); got tensor with "
+                f"shape {tuple(action_sequence.shape)}"
+            )
+        if action_sequence.shape[0] != video.shape[0]:
+            raise ValueError(
+                "rollout actions batch dimension must match video batch size: "
+                f"{action_sequence.shape[0]} vs {video.shape[0]}"
+            )
+
+        generated = video
+        num_rollout_steps = action_sequence.shape[1]
+        for step in range(num_rollout_steps):
+            next_frame = self.predict_next_frame(
+                generated, action_sequence[:, step], max_steps=max_steps
+            )
+            generated = torch.cat([generated, next_frame.unsqueeze(1)], dim=1)
+
+        return generated
 

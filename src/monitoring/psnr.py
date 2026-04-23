@@ -13,12 +13,34 @@ A higher Δt PSNR indicates better controllability (inferred actions produce
 better reconstructions than random ones).
 """
 
+import json
 import logging
 import math
+import time
 
 import torch
 
 from latent_action_model.model import LatentActionVQVAE
+
+# #region agent log
+_DEBUG_LOG_PATH = "/scratch/Pokemon/.cursor/debug-5292d8.log"
+
+
+def _dbg(location: str, hypothesis_id: str, message: str, data: dict) -> None:
+    try:
+        payload = {
+            "sessionId": "5292d8",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 logger = logging.getLogger(__name__)
 
@@ -149,31 +171,66 @@ def compute_delta_psnr(
     video_batch = video_batch.to(device)
 
     # 1. Encode video to get inferred actions and patch embeddings
-    quantized_inferred, patched_video = action_model.encode(video_batch)
+    quantized_inferred = action_model.encode(video_batch)
 
     # 2. Decode with inferred actions → x̂_t
-    reconstructed_inferred = action_model.decode(quantized_inferred, patched_video)
+    reconstructed_inferred = action_model.decode(video_batch, quantized_inferred)
 
     # 3. Generate random actions
     # quantized_inferred shape: (B, T-1, num_quantization_dims) for FSQ
     batch_size = quantized_inferred.shape[0]
     num_frames = quantized_inferred.shape[1]
 
-    # Sample random indices from [0, action_vocab_size)
+    # Sample random indices from [0, action_vocab_size). Shape (B, T-1), long —
+    # indexes_to_codes will internally add the trailing dim and broadcast against
+    # basis to return (B, T-1, len(levels)), matching quantized_inferred.
     random_indices = torch.randint(
         0,
         action_model.action_vocab_size,
-        (batch_size, num_frames, 1),
+        (batch_size, num_frames),
         device=device,
-    ).float()
+        dtype=torch.long,
+    )
 
-    # Convert indices to quantized values using the quantizer
-    # indexes_to_codes expects indices of shape (...) and returns (..., num_levels)
-    random_quantized = action_model.quantizer.quantized_value_to_codes(random_indices).float()
+    # #region agent log
+    _dbg(
+        "psnr.py:pre_call",
+        "post-fix",
+        "random_indices before quantizer call",
+        {
+            "random_indices_shape": list(random_indices.shape),
+            "random_indices_dtype": str(random_indices.dtype),
+            "action_vocab_size": int(action_model.action_vocab_size),
+            "quantizer_levels": list(action_model.quantizer._levels),
+            "quantized_inferred_shape": list(quantized_inferred.shape),
+            "quantized_inferred_dtype": str(quantized_inferred.dtype),
+        },
+    )
+    # #endregion
+
+    random_quantized = action_model.quantizer.indexes_to_codes(random_indices).float()
     random_quantized = random_quantized.to(device)
 
+    # #region agent log
+    _dbg(
+        "psnr.py:post_call",
+        "post-fix",
+        "random_quantized after quantizer call",
+        {"random_quantized_shape": list(random_quantized.shape)},
+    )
+    # #endregion
+
     # 4. Decode with random actions → x̂'_t
-    reconstructed_random = action_model.decode(random_quantized.unsqueeze(2), patched_video)
+    reconstructed_random = action_model.decode(video_batch, random_quantized)
+
+    # #region agent log
+    _dbg(
+        "psnr.py:post_decode",
+        "post-fix",
+        "decode with random actions succeeded",
+        {"reconstructed_random_shape": list(reconstructed_random.shape)},
+    )
+    # #endregion
 
     # 5. Compute PSNRs
     # Ground-truth target frames are video[:, 1:, :, :, :] (predicting t+1 from t)

@@ -135,5 +135,26 @@ Pokemon has a lot of issues. For one, it's mostly an animated game. There are su
 ## Pong Experiments
 Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
 ![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
-Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262
+Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262 (fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt)
+```
+CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train \
+  --dataset_type atari_pong \
+  --atari_pong_data_dir data/atari_pong \
+  --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt \
+  --image_size 128 \
+  --patch_size 4 \
+  --num_images_in_video 5 \
+  --batch_size 4 \
+  --save_dir dynamics_model_atari_pong \
+  --checkpoint_dir dynamics_model_atari_pong
+```
 
+Action space collapses consistently. This can be mitigated by ensuring that any pooling of our action encoder features happens after we take the residual. Otherwise, we're looking at frame level movement.
+
+How can we improve?
+- Running ablations on batch size
+- Predicting action chunks instead of singletons. We learn both a chunk action and a sequence of frames that follows it.
+  - Why? This improves our IID assumption.
+- Using latent prediction for our action model. Instead of pixel space movement, can we predict how the semantics of the frames change?
+  - Could even just use a JEPA as the base model
+- I want to stick to unlabeled data as much as possible. I think labels are helpful but cut off our ability to look at any video and translate it.

@@ -9,7 +9,7 @@ import torch
 class DynamicsModelTrainingConfig:
     mask_ratio_lower_bound: float = 0.5
     mask_ratio_upper_bound: float = 1.0
-    gradient_clipping: float | None = None
+    gradient_clipping: float | None = 1.0
     image_size: int = 128
     patch_size: int = 4
     num_images_in_video: int = 5
@@ -17,9 +17,9 @@ class DynamicsModelTrainingConfig:
     num_unique_frames: Optional[int] = None
     batch_size: int = 4
     gradient_accumulation_steps: int = 1
-    num_epochs: int = 20
+    num_epochs: int = 3
     warmup_steps: int = 100
-    min_learning_rate: float = 1e-6
+    min_learning_rate: float = 1e-7
     device: str = (
         "mps"
         if torch.backends.mps.is_available()
@@ -35,7 +35,7 @@ class DynamicsModelTrainingConfig:
     save_dir: str = "dynamics_model_results"
 
     # Action model configuration
-    action_bins: list[int] = field(default_factory=lambda: [8])
+    action_bins: list[int] = field(default_factory=lambda: [6, 3])
     action_d_model: int = 256
     action_num_transformer_layers: int = 4
     action_num_heads: int = 2
@@ -73,3 +73,7 @@ class DynamicsModelTrainingConfig:
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
     dataset_limit: int = 50000
+
+    # Rollout evaluation
+    rollout_max_steps: int = 10
+    rollout_eval_batches: int = 5
