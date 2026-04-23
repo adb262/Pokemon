@@ -4,11 +4,15 @@ import torch.nn as nn
 from torch.distributions import uniform
 
 from latent_action_model.model import LatentActionVQVAE
-from loss.loss_fns import next_frame_reconstruction_loss
+from loss.loss_fns import (
+    changed_patch_weighted_token_cross_entropy_loss,
+    next_frame_reconstruction_loss,
+)
 from torch_utilities.initialize import init_weights
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 from video_tokenization.model import VideoTokenizer
 import logging
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -42,6 +46,7 @@ class DynamicsModel(nn.Module):
 
         self.tokenizer = tokenizer
         self.action_model = action_model
+        self._ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
         # python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 16 --save_dir dynamics_model_base --bins 8 8 6 5 --use_s3 --dataset_train_key pokemon_emerald_train_0_9_5_frames.json --checkpoint_dir dynamics_model_base --patch_size 4 --image_size 128 --num_epochs 20 --gradient_clipping 1.0 --tokenizer_checkpoint_path fsq_tokenizer_2k_128_4_512_8_heads_4_layers
 
@@ -63,7 +68,7 @@ class DynamicsModel(nn.Module):
             nn.Linear(d_model * 4, self.tokenizer.get_vocab_size()),
         )
         self.softmax = nn.Softmax(dim=-1)
-        self.token_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.changed_patch_loss_weight = 30.0
         self.action_loss_fn = next_frame_reconstruction_loss
 
         # Only initialize the newly-created submodules. ``self.apply`` would
@@ -101,14 +106,14 @@ class DynamicsModel(nn.Module):
             self.mask_ratio_lower_bound, self.mask_ratio_upper_bound
         )
         mask = (
-            torch.rand(batch_size, 1, num_patches, device=targets.device) < mask_ratio
+            torch.rand(batch_size, self.num_images_in_video - 1, num_patches, device=targets.device) < mask_ratio
         )  # Boolean mask over only the target frame
 
         # Save original targets for loss computation before masking
         original_targets = targets.clone()
 
-        targets[:, -1:, :] = self.tokenizer.mask_codebook_tokens(
-            targets[:, -1:, :].long(), mask
+        targets[:, 1:, :] = self.tokenizer.mask_codebook_tokens(
+            targets[:, 1:, :].long(), mask
         )
 
         # TODO: Should this also use the mask?
@@ -135,20 +140,37 @@ class DynamicsModel(nn.Module):
         action_loss = self.action_loss_fn(video, reconstructed_action_video)
 
         # Only compute token loss on masked positions of the final frame.
-        target_frame = original_targets[:, -1:, :].masked_fill(~mask, -100)
+        target_frame = original_targets[:, 1:, :].masked_fill(~mask, -100)
 
         # View both as 3d tensors for the loss function
         logger.debug(f"x shape: {x.shape}, targets shape: {targets.shape}")
-        predicted_tokens = rearrange(x[:, -1:, :, :], "b t p d -> b (t p) d")
+        # predicted_tokens = rearrange(x[:, -1:, :, :], "b t p d -> b (t p) d")
+        # target_tokens = rearrange(target_frame, "b t p -> b (t p)")
+        # logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
+        predicted_tokens = rearrange(x[:, 1:, :, :], "b t p d -> b (t p) d")
         target_tokens = rearrange(target_frame, "b t p -> b (t p)")
-        logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
-        token_loss = self.token_loss_fn(predicted_tokens.transpose(1, 2), target_tokens)
+        # previous_frame_tokens = rearrange(
+        #     original_targets[:, -2:-1, :], "b t p -> b (t p)"
+        # )
+        # current_frame_tokens = rearrange(
+        #     original_targets[:, -1:, :], "b t p -> b (t p)"
+        # )
+        # token_loss = changed_patch_weighted_token_cross_entropy_loss(
+        #     predicted_tokens=predicted_tokens,
+        #     target_tokens=target_tokens,
+        #     previous_frame_tokens=previous_frame_tokens,
+        #     current_frame_tokens=current_frame_tokens,
+        #     changed_patch_loss_weight=self.changed_patch_loss_weight,
+        # )
+        token_loss = self._ce_loss_fn(
+            predicted_tokens.transpose(1, 2), target_tokens
+        )
 
         return x, token_loss, action_loss
 
     @torch.inference_mode()
     def _inference_window(
-        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 10
+        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 25
     ) -> torch.Tensor:
         # video: (B, T, C, H, W). The last frame is treated as MASKED and
         # its tokens are iteratively filled in by MaskGIT. The first T-1
@@ -270,7 +292,7 @@ class DynamicsModel(nn.Module):
 
     @torch.inference_mode()
     def inference(
-        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 10
+        self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 25
     ) -> torch.Tensor:
         """Predict the ``T``-th (last) frame of each ``T``-frame sliding window.
 

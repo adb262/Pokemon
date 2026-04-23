@@ -9,7 +9,7 @@ import torch
 class DynamicsModelTrainingConfig:
     mask_ratio_lower_bound: float = 0.5
     mask_ratio_upper_bound: float = 1.0
-    gradient_clipping: float | None = None
+    gradient_clipping: float | None = 1.0
     image_size: int = 128
     patch_size: int = 4
     num_images_in_video: int = 5

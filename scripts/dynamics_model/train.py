@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 def maskgit_predict_last_frame(
     model: DynamicsModel,
     video_batch: torch.Tensor,
-    max_steps: int = 10,
+    max_steps: int = 25,
 ) -> torch.Tensor:
     """Run MaskGIT inference to predict the last frame of ``video_batch``.
 
@@ -519,6 +519,7 @@ def train_epoch(
 ):
     """Train for one epoch"""
     total_loss = 0.0
+    total_optimizer_step_loss = 0.0
     num_batches = len(train_dataloader)
     best_loss = float("inf")
     accumulation_steps = config.gradient_accumulation_steps
@@ -532,6 +533,8 @@ def train_epoch(
 
     epoch_start_time = time.time()
     action_loss_acc, token_loss_acc = [], []
+    dynamics_optimizer.zero_grad()
+    action_optimizer.zero_grad()
 
     for batch_idx, video_batch in enumerate(train_dataloader):
         # Skip batches if resuming
@@ -546,9 +549,12 @@ def train_epoch(
         # Forward pass - MaskGIT returns (predictions, token_loss, action_loss)
         decoded, token_loss, action_loss = dynamics_model(video_batch)
 
-        # Backward pass (accumulate gradients)
-        token_loss.backward()
-        action_loss.backward()
+        # Scale each microbatch by the size of its accumulation window so the
+        # accumulated gradient matches the corresponding large-batch mean.
+        remaining_batches = num_batches - batch_idx
+        current_window_size = min(accumulation_steps, remaining_batches)
+        (token_loss / current_window_size).backward()
+        (action_loss / current_window_size).backward()
         token_loss_acc.append(token_loss.item())
         action_loss_acc.append(action_loss.item())
 
@@ -575,6 +581,7 @@ def train_epoch(
             avg_token_loss = sum(token_loss_acc) / len(token_loss_acc)
             avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
             total_loss = avg_token_loss + avg_action_loss
+            total_optimizer_step_loss += total_loss
 
             batch_time = time.time() - batch_start_time
 
@@ -675,8 +682,9 @@ def train_epoch(
             global_step += 1
 
     # Calculate average loss over optimizer steps
-    num_optimizer_steps = num_batches // accumulation_steps
-    avg_loss = total_loss / max(num_optimizer_steps, 1)
+    num_batches_processed = max(num_batches - start_batch, 0)
+    num_optimizer_steps = math.ceil(num_batches_processed / accumulation_steps)
+    avg_loss = total_optimizer_step_loss / max(num_optimizer_steps, 1)
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch summary
@@ -854,7 +862,9 @@ def main(config: DynamicsModelTrainingConfig):
     )
 
     # Cosine annealing scheduler with warmup
-    steps_per_epoch = len(train_dataloader) // config.gradient_accumulation_steps
+    steps_per_epoch = math.ceil(
+        len(train_dataloader) / config.gradient_accumulation_steps
+    )
     total_steps = config.num_epochs * steps_per_epoch
     warmup_steps = config.warmup_steps
 

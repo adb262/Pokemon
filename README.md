@@ -149,4 +149,12 @@ CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train \
   --checkpoint_dir dynamics_model_atari_pong
 ```
 
-Action space collapsed
+Action space collapses consistently. This can be mitigated by ensuring that any pooling of our action encoder features happens after we take the residual. Otherwise, we're looking at frame level movement.
+
+How can we improve?
+- Running ablations on batch size
+- Predicting action chunks instead of singletons. We learn both a chunk action and a sequence of frames that follows it.
+  - Why? This improves our IID assumption.
+- Using latent prediction for our action model. Instead of pixel space movement, can we predict how the semantics of the frames change?
+  - Could even just use a JEPA as the base model
+- I want to stick to unlabeled data as much as possible. I think labels are helpful but cut off our ability to look at any video and translate it.

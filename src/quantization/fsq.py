@@ -10,7 +10,6 @@ import torch.nn as nn
 from quantization.base import BaseQuantizer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 def round_ste(z):
     """Round with straight through gradients."""
