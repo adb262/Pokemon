@@ -72,6 +72,8 @@ class DynamicsModelTrainingConfig:
     seed: int = 42
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
+    atari_pong_crop_scoreboard: bool = False
+    atari_pong_require_full_gameplay: bool = False
     dataset_limit: int = 500000
 
     # Rollout evaluation

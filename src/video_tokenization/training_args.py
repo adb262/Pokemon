@@ -58,6 +58,8 @@ class VideoTokenizerTrainingConfig:
     save_dir: str = "tokenization_results"
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
+    atari_pong_crop_scoreboard: bool = False
+    atari_pong_require_full_gameplay: bool = False
     frame_spacing: int = 1
     num_unique_frames: Optional[int] = None
     dataset_limit: int = 50000
