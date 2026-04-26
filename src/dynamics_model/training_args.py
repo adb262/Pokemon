@@ -51,6 +51,10 @@ class DynamicsModelTrainingConfig:
     # ``prev + residual``). When False, the decoder output is treated as the
     # next frames directly and residual-specific plots/metrics are skipped.
     predict_action_residuals: bool = True
+    action_decoder_loss: Literal["l2", "clipped_l2"] = "l2"
+    action_l2_clip_c: float = 10.0
+    dynamics_token_loss: Literal["ce", "clipped_ce"] = "ce"
+    dynamics_ce_clip_c: float = 0.03
 
     action_learning_rate: float = 5e-5
     dynamics_learning_rate: float = 5e-5

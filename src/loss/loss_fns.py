@@ -46,81 +46,75 @@ def next_frame_reconstruction_residual_loss(
     video: torch.Tensor, decoded: torch.Tensor
 ) -> torch.Tensor:
     """
-    Reconstruction loss for residual prediction that gives higher weight to pixels that changed between frames.
+    Naive residual reconstruction loss over all pixels.
 
     Args:
         video: Input video tensor [B, num_images_in_video, C, H, W]
         decoded: Predicted residuals [B, num_images_in_video - 1, C, H, W]
 
     Returns:
-        Weighted reconstruction loss (scalar)
+        Reconstruction loss (scalar)
     """
-    # Calculate ground truth residuals between consecutive frames
-    # [B, num_images_in_video, C, H, W] -> [B, num_images_in_video - 1, C, H, W]
     target_residuals = compute_target_residuals(video)
-
-    # Calculate element-wise MSE loss between predicted and target residuals
     logger.debug(f"decoded shape: {decoded.shape}")
     logger.debug(f"target_residuals shape: {target_residuals.shape}")
-    mse_loss = F.mse_loss(
-        decoded, target_residuals, reduction="none"
-    )  # [B, num_images_in_video - 1, C, H, W]
-
-    # Detect pixels that changed between frames (with small threshold for numerical stability)
-    changed_pixels = compute_changed_pixel_mask(
-        target_residuals,
-        0.005
-    )  # [B, num_images_in_video - 1, C, H, W]
-
-    # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = build_weight_mask(
-        changed_pixels,
-        changed_weight=action_weight,
-        unchanged_weight=0,
-    )  # [B, num_images_in_video - 1, C, H, W]
-
-    # Apply weights and reduce to scalar
-    weighted_loss = (mse_loss * weight_mask).mean()
-
-    return weighted_loss
+    return F.mse_loss(decoded, target_residuals, reduction="mean")
 
 
 def next_frame_reconstruction_loss(
     video: torch.Tensor, decoded: torch.Tensor
 ) -> torch.Tensor:
     """
-    Reconstruction loss that gives higher weight to pixels that changed between frames.
+    Naive next-frame reconstruction loss over all pixels.
 
     Args:
         video: Video [B, num_images_in_video, C, H, W]
         decoded: Reconstructed frame [B, num_images_in_video - 1, C, H, W]
 
     Returns:
-        Weighted reconstruction loss (scalar)
+        Reconstruction loss (scalar)
     """
-    # Calculate element-wise MSE loss (no reduction)
     target_frames = video[:, 1:, :, :, :]
-    previous_frames = video[:, :-1, :, :, :]
+    return F.mse_loss(decoded, target_frames, reduction="mean")
 
-    # Detect pixels that changed between frames (with small threshold for numerical stability)
-    changed_pixels = compute_changed_pixel_mask(
-        target_frames - previous_frames,
-        0.005
-    )  # [B, Num_images_in_video - 1, C, H, W]
 
-    # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = build_weight_mask(
-        changed_pixels,
-        changed_weight=action_weight,
-        unchanged_weight=0.0,
-    )  # [B, Num_images_in_video - 1, C, H, W]
+def clipped_l2_reconstruction_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    min_l2_distance_pixels: float = 10.0,
+) -> torch.Tensor:
+    """Train only on pixels whose 0-255 error is larger than the threshold."""
+    per_pixel_loss = F.mse_loss(predicted, target, reduction="none")
+    pixel_distance = (predicted - target).abs() * 255.0
+    keep = pixel_distance > min_l2_distance_pixels
+    keep_float = keep.float()
+    return (per_pixel_loss * keep_float).sum() / keep_float.sum().clamp_min(1.0)
 
-    # Apply weights and reduce to scalar
-    mse_loss = F.mse_loss(
-        decoded, target_frames, reduction="none"
-    )  # [B, Num_images_in_video - 1, C, H, W]
 
-    return (mse_loss * weight_mask).mean()
+def clipped_next_frame_reconstruction_loss(
+    video: torch.Tensor,
+    decoded: torch.Tensor,
+    min_l2_distance_pixels: float = 10.0,
+) -> torch.Tensor:
+    target_frames = video[:, 1:, :, :, :]
+    return clipped_l2_reconstruction_loss(
+        decoded,
+        target_frames,
+        min_l2_distance_pixels=min_l2_distance_pixels,
+    )
+
+
+def clipped_next_frame_reconstruction_residual_loss(
+    video: torch.Tensor,
+    decoded: torch.Tensor,
+    min_l2_distance_pixels: float = 10.0,
+) -> torch.Tensor:
+    target_residuals = compute_target_residuals(video)
+    return clipped_l2_reconstruction_loss(
+        decoded,
+        target_residuals,
+        min_l2_distance_pixels=min_l2_distance_pixels,
+    )
 
 
 def next_frame_reconstruction_loss_l1(
@@ -187,22 +181,13 @@ def clipped_cross_entropy_loss(
     return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)
 
 
-def clippeßd_l2_loss(
-    predicted_tokens: torch.Tensor,
-    target_tokens: torch.Tensor,
-    ignore_index: int = -100,
+def clipped_l2_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
     min_l2_distance_pixels: float = 10,
 ) -> torch.Tensor:
-    per_position_loss = F.mse_loss(
-        predicted_tokens, target_tokens, reduction="none"
+    return clipped_l2_reconstruction_loss(
+        predicted,
+        target,
+        min_l2_distance_pixels=min_l2_distance_pixels,
     )
-
-    # Drop predictions that are already close to the target in 0-255 pixel space
-    # (inputs are assumed to be normalized to [0, 1]). Only train on the pixels
-    # we're still meaningfully wrong about.
-    pixel_distance = (predicted_tokens - target_tokens).abs() * 255.0
-    far_off = pixel_distance > min_l2_distance_pixels
-    valid = target_tokens != ignore_index
-    keep = valid & far_off
-
-    return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)

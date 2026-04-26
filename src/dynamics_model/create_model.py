@@ -31,5 +31,9 @@ def create_dynamics_model(
         tokenizer=tokenizer,
         action_model=action_model,
         predict_action_residuals=config.predict_action_residuals,
+        action_decoder_loss=config.action_decoder_loss,
+        action_l2_clip_c=config.action_l2_clip_c,
+        dynamics_token_loss=config.dynamics_token_loss,
+        dynamics_ce_clip_c=config.dynamics_ce_clip_c,
     )
     return model

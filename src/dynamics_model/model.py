@@ -1,3 +1,5 @@
+from typing import Literal
+
 from einops.einops import rearrange
 import torch
 import torch.nn as nn
@@ -5,17 +7,16 @@ from torch.distributions import uniform
 
 from latent_action_model.model import LatentActionVQVAE
 from loss.loss_fns import (
-    changed_patch_weighted_token_cross_entropy_loss,
-    compute_target_residuals,
+    clipped_cross_entropy_loss,
+    clipped_next_frame_reconstruction_loss,
+    clipped_next_frame_reconstruction_residual_loss,
     next_frame_reconstruction_loss,
-    next_frame_reconstruction_loss_l1,
     next_frame_reconstruction_residual_loss,
 )
 from torch_utilities.initialize import init_weights
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 from video_tokenization.model import VideoTokenizer
 import logging
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -34,6 +35,10 @@ class DynamicsModel(nn.Module):
         tokenizer: VideoTokenizer,
         action_model: LatentActionVQVAE,
         predict_action_residuals: bool,
+        action_decoder_loss: Literal["l2", "clipped_l2"],
+        action_l2_clip_c: float,
+        dynamics_token_loss: Literal["ce", "clipped_ce"],
+        dynamics_ce_clip_c: float,
     ):
         super(DynamicsModel, self).__init__()
         self.mask_ratio_lower_bound = mask_ratio_lower_bound
@@ -52,6 +57,8 @@ class DynamicsModel(nn.Module):
         self.tokenizer = tokenizer
         self.action_model = action_model
         self._ce_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+        self.dynamics_token_loss = dynamics_token_loss
+        self.dynamics_ce_clip_c = dynamics_ce_clip_c
 
         # python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 16 --save_dir dynamics_model_base --bins 8 8 6 5 --use_s3 --dataset_train_key pokemon_emerald_train_0_9_5_frames.json --checkpoint_dir dynamics_model_base --patch_size 4 --image_size 128 --num_epochs 20 --gradient_clipping 1.0 --tokenizer_checkpoint_path fsq_tokenizer_2k_128_4_512_8_heads_4_layers
 
@@ -74,10 +81,10 @@ class DynamicsModel(nn.Module):
         )
         self.softmax = nn.Softmax(dim=-1)
         self.changed_patch_loss_weight = 30.0
-        self.action_loss_fn = (
-            next_frame_reconstruction_residual_loss
-            if predict_action_residuals
-            else next_frame_reconstruction_loss
+        self.action_loss_fn = self._build_action_loss_fn(
+            predict_action_residuals=predict_action_residuals,
+            action_decoder_loss=action_decoder_loss,
+            action_l2_clip_c=action_l2_clip_c,
         )
 
         # Only initialize the newly-created submodules. ``self.apply`` would
@@ -90,6 +97,36 @@ class DynamicsModel(nn.Module):
             self.vocab_head,
         ):
             module.apply(init_weights)
+
+    @staticmethod
+    def _build_action_loss_fn(
+        *,
+        predict_action_residuals: bool,
+        action_decoder_loss: Literal["l2", "clipped_l2"],
+        action_l2_clip_c: float,
+    ):
+        if action_decoder_loss == "l2":
+            return (
+                next_frame_reconstruction_residual_loss
+                if predict_action_residuals
+                else next_frame_reconstruction_loss
+            )
+        if action_decoder_loss == "clipped_l2":
+            clipped_loss_fn = (
+                clipped_next_frame_reconstruction_residual_loss
+                if predict_action_residuals
+                else clipped_next_frame_reconstruction_loss
+            )
+
+            def action_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
+                return clipped_loss_fn(
+                    video,
+                    decoded,
+                    min_l2_distance_pixels=action_l2_clip_c,
+                )
+
+            return action_loss
+        raise ValueError(f"Unknown action_decoder_loss: {action_decoder_loss!r}")
 
     @staticmethod
     def cosine_scheduler(max_steps: int, current_step: int, device: torch.device):
@@ -159,22 +196,18 @@ class DynamicsModel(nn.Module):
         # logger.debug(f"predicted_tokens shape: {predicted_tokens.shape}, target_tokens shape: {target_tokens.shape}")
         predicted_tokens = rearrange(x[:, 1:, :, :], "b t p d -> b (t p) d")
         target_tokens = rearrange(target_frame, "b t p -> b (t p)")
-        # previous_frame_tokens = rearrange(
-        #     original_targets[:, -2:-1, :], "b t p -> b (t p)"
-        # )
-        # current_frame_tokens = rearrange(
-        #     original_targets[:, -1:, :], "b t p -> b (t p)"
-        # ) python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 10 --save_dir dynamics_model_atari_pong_action_103m_5_frames_l1_ --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_l1 --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64
-        # token_loss = changed_patch_weighted_token_cross_entropy_loss(
-        #     predicted_tokens=predicted_tokens,
-        #     target_tokens=target_tokens,
-        #     previous_frame_tokens=previous_frame_tokens,
-        #     current_frame_tokens=current_frame_tokens,
-        #     changed_patch_loss_weight=self.changed_patch_loss_weight,
-        # )
-        token_loss = self._ce_loss_fn(
-            predicted_tokens.transpose(1, 2), target_tokens
-        )
+        if self.dynamics_token_loss == "ce":
+            token_loss = self._ce_loss_fn(
+                predicted_tokens.transpose(1, 2), target_tokens
+            )
+        elif self.dynamics_token_loss == "clipped_ce":
+            token_loss = clipped_cross_entropy_loss(
+                predicted_tokens=predicted_tokens,
+                target_tokens=target_tokens,
+                max_confidence=1.0 - self.dynamics_ce_clip_c,
+            )
+        else:
+            raise ValueError(f"Unknown dynamics_token_loss: {self.dynamics_token_loss!r}")
 
         return x, token_loss, action_loss, action_tokens
 

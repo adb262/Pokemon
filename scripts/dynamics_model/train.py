@@ -615,6 +615,8 @@ def train_epoch(
 
     epoch_start_time = time.time()
     action_loss_acc, token_loss_acc = [], []
+    total_optimizer_step_action_loss = 0.0
+    total_optimizer_step_token_loss = 0.0
     logged_action_tokens: list[torch.Tensor] = []
     dynamics_optimizer.zero_grad()
 
@@ -660,6 +662,8 @@ def train_epoch(
             avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
             total_loss = avg_token_loss + avg_action_loss
             total_optimizer_step_loss += total_loss
+            total_optimizer_step_action_loss += avg_action_loss
+            total_optimizer_step_token_loss += avg_token_loss
             action_token_window = (
                 torch.cat([tokens.reshape(-1) for tokens in logged_action_tokens], dim=0)
                 if logged_action_tokens
@@ -802,19 +806,25 @@ def train_epoch(
     num_batches_processed = max(num_batches - start_batch, 0)
     num_optimizer_steps = math.ceil(num_batches_processed / accumulation_steps)
     avg_loss = total_optimizer_step_loss / max(num_optimizer_steps, 1)
+    avg_action_loss = total_optimizer_step_action_loss / max(num_optimizer_steps, 1)
+    avg_token_loss = total_optimizer_step_token_loss / max(num_optimizer_steps, 1)
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch summary
     if experiment_logger:
         epoch_metrics = {
             "train/epoch_loss": avg_loss,
+            "train/epoch_token_loss": avg_token_loss,
+            "train/epoch_action_loss": avg_action_loss,
             "train/epoch_time": epoch_time,
             "train/epoch": epoch,
         }
         experiment_logger.log(epoch_metrics, step=global_step)
 
     logger.info(
-        f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
+        f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f} "
+        f"(token: {avg_token_loss:.6f}, action: {avg_action_loss:.6f}), "
+        f"Time: {epoch_time:.2f}s"
     )
     return avg_loss, global_step
 
