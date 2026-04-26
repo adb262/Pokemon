@@ -164,3 +164,45 @@ def changed_patch_weighted_token_cross_entropy_loss(
         1.0
     )
 
+
+def clipped_cross_entropy_loss(
+    predicted_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    ignore_index: int = -100,
+    max_confidence: float = 0.97,
+) -> torch.Tensor:
+    per_position_loss = F.cross_entropy(
+        predicted_tokens.transpose(1, 2),
+        target_tokens,
+        ignore_index=ignore_index,
+        reduction="none",
+    )
+
+    # Drop positions where the model is already very confident on any vocab entry.
+    max_probs = predicted_tokens.softmax(dim=-1).max(dim=-1).values
+    overconfident = max_probs > max_confidence
+    valid = target_tokens != ignore_index
+    keep = valid & ~overconfident
+
+    return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)
+
+
+def clipped_l2_loss(
+    predicted_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    ignore_index: int = -100,
+    min_l2_distance_pixels: float = 10,
+) -> torch.Tensor:
+    per_position_loss = F.mse_loss(
+        predicted_tokens, target_tokens, reduction="none"
+    )
+
+    # Drop predictions that are already close to the target in 0-255 pixel space
+    # (inputs are assumed to be normalized to [0, 1]). Only train on the pixels
+    # we're still meaningfully wrong about.
+    pixel_distance = (predicted_tokens - target_tokens).abs() * 255.0
+    far_off = pixel_distance > min_l2_distance_pixels
+    valid = target_tokens != ignore_index
+    keep = valid & far_off
+
+    return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)
