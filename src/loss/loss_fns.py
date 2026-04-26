@@ -187,7 +187,7 @@ def clipped_cross_entropy_loss(
     return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)
 
 
-def clipped_l2_loss(
+def clippeßd_l2_loss(
     predicted_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
     ignore_index: int = -100,

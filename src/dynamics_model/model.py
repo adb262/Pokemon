@@ -33,12 +33,14 @@ class DynamicsModel(nn.Module):
         d_model: int,
         tokenizer: VideoTokenizer,
         action_model: LatentActionVQVAE,
+        predict_action_residuals: bool,
     ):
         super(DynamicsModel, self).__init__()
         self.mask_ratio_lower_bound = mask_ratio_lower_bound
         self.mask_ratio_upper_bound = mask_ratio_upper_bound
         self.num_images_in_video = num_images_in_video
         self.d_model = d_model
+        self.predict_action_residuals = predict_action_residuals
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model))
         self.mask_ratio_distribution = uniform.Uniform(
             self.mask_ratio_lower_bound, self.mask_ratio_upper_bound
@@ -72,7 +74,11 @@ class DynamicsModel(nn.Module):
         )
         self.softmax = nn.Softmax(dim=-1)
         self.changed_patch_loss_weight = 30.0
-        self.action_loss_fn = next_frame_reconstruction_residual_loss
+        self.action_loss_fn = (
+            next_frame_reconstruction_residual_loss
+            if predict_action_residuals
+            else next_frame_reconstruction_loss
+        )
 
         # Only initialize the newly-created submodules. ``self.apply`` would
         # recurse into ``self.tokenizer`` and ``self.action_model`` and wipe
