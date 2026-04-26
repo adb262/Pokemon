@@ -159,3 +159,8 @@ How can we improve?
   - Could even just use a JEPA as the base model
 - I want to stick to unlabeled data as much as possible. I think labels are helpful but cut off our ability to look at any video and translate it.
 - Could programmatically boost the importance of the ball prediction
+- LPIPS
+
+CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 10 --save_dir dynamics_model_atari_pong_action_103m_5_frames_l1_residual_ --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_l1_residual_ --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay
+
+I am fairly confident that the action model is just learning simple training signals. I want to try predicting purely on the residuals ![loss mask visualized](public/loss_mask_visualization_pong.png).

@@ -35,7 +35,7 @@ class DynamicsModelTrainingConfig:
     save_dir: str = "dynamics_model_results"
 
     # Action model configuration
-    action_bins: list[int] = field(default_factory=lambda: [6, 3])
+    action_bins: list[int] = field(default_factory=lambda: [6])
     action_d_model: int = 256
     action_num_transformer_layers: int = 4
     action_num_heads: int = 2
@@ -46,14 +46,16 @@ class DynamicsModelTrainingConfig:
     dynamics_num_transformer_layers: int = 12
     dynamics_num_heads: int = 8
 
-    action_learning_rate: float = 3e-5
-    dynamics_learning_rate: float = 3e-5
+    action_learning_rate: float = 5e-5
+    dynamics_learning_rate: float = 5e-5
 
     # Pretrained tokenizer
     tokenizer_checkpoint_path: str = ""
 
     # Wandb Configuration
     use_wandb: bool = True
+    logging_backend: Literal["wandb", "tensorboard", "none"] = "wandb"
+    tensorboard_dir: str = "runs"
     wandb_project: str = "pokemon-dynamics-model"
     wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None

@@ -19,7 +19,6 @@ import torch
 import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import wandb
 
 from data.data_loaders.factory import build_datasets, build_rollout_eval_dataset
 from data.data_loaders.video_window_loader import VideoWindowLoader
@@ -31,13 +30,13 @@ from dynamics_model.model import DynamicsModel
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from latent_action_model.model import LatentActionVQVAE
+from monitoring.action_code_counts import format_top_code_counts, get_top_code_counts
 from monitoring.codebook_usage import compute_codebook_usage
+from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
 from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity
 from monitoring.residual_coverage import compute_residual_coverage
-from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images_next_frame, save_rollout_comparison_grid
-from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_model_from_checkpoint
 from video_tokenization.model import VideoTokenizer
 
@@ -51,28 +50,15 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def get_top_code_counts(
-    action_tokens: torch.Tensor, vocab_size: int, top_k: int = 10
-) -> list[tuple[int, int]]:
-    """Return the most frequently used action-code ids and their counts."""
-    flat_tokens = action_tokens.reshape(-1).long().cpu()
-    if flat_tokens.numel() == 0 or vocab_size <= 0:
-        return []
-
-    counts = torch.bincount(flat_tokens, minlength=vocab_size)
-    top_counts, top_indices = torch.topk(counts, k=min(top_k, vocab_size))
-    return [
-        (int(code_idx), int(code_count))
-        for code_idx, code_count in zip(top_indices.tolist(), top_counts.tolist())
-        if code_count > 0
-    ]
-
-
-def format_top_code_counts(top_code_counts: list[tuple[int, int]]) -> str:
-    """Format top code-count pairs for compact logging."""
-    if not top_code_counts:
-        return "none"
-    return ", ".join(f"{code_idx}:{code_count}" for code_idx, code_count in top_code_counts)
+def reconstruct_predicted_frames_from_residuals(
+    video_batch: torch.Tensor, predicted_residuals: torch.Tensor
+) -> torch.Tensor:
+    """Convert residual predictions [B, T-1, C, H, W] into next-frame predictions."""
+    return torch.clamp(
+        video_batch[:, :-1, :, :, :] + predicted_residuals,
+        0.0,
+        1.0,
+    )
 
 
 @torch.no_grad()
@@ -107,7 +93,7 @@ def evaluate_model(
     device: torch.device,
     epoch: int,
     global_step: int,
-    wandb_logger=None,
+    experiment_logger: ExperimentLogger | None = None,
     save_dir: str = "dynamics_model_results",
     num_batches: int = 10,
 ) -> tuple[float, float]:
@@ -116,7 +102,8 @@ def evaluate_model(
     total_token_loss = 0.0
     total_action_loss = 0.0
     total_samples = 0
-    saved_image_paths: list[str] = []
+    saved_residual_image_paths: list[str] = []
+    saved_reconstructed_image_paths: list[str] = []
 
     # Collect real and reconstructed frames for FID/FVD computation
     real_frames_batches: list[torch.Tensor] = []
@@ -154,15 +141,19 @@ def evaluate_model(
                 total_action_loss += action_loss.item() * video_batch.size(0)
                 total_samples += video_batch.size(0)
 
-                # Get reconstructed video from action model for FID/FVD
-                # The action model reconstructs frames 1:T from frames 0:T-1
+                # The action model predicts residuals for frames 1:T from frames 0:T-1.
                 action_encoded = model.action_model.encode(video_batch)
-                reconstructed_video = model.action_model.decode(video_batch, action_encoded)
+                reconstructed_residuals = model.action_model.decode(
+                    video_batch, action_encoded
+                )
+                reconstructed_next_frames = reconstruct_predicted_frames_from_residuals(
+                    video_batch, reconstructed_residuals
+                )
 
-                # Real target frames: video[:, 1:, :, :, :]
-                real_target_frames = video_batch
+                # Real target frames correspond to the action-model predictions for frames 1:T.
+                real_target_frames = video_batch[:, 1:, :, :, :]
                 real_frames_batches.append(real_target_frames.detach().cpu())
-                pred_frames_batches.append(reconstructed_video.detach().cpu())
+                pred_frames_batches.append(reconstructed_next_frames.detach().cpu())
 
                 # Track action-token usage for codebook metrics
                 action_tokens_accum.append(action_tokens.detach().cpu())
@@ -184,10 +175,11 @@ def evaluate_model(
                             real_target_frames[:, -2], real_target_frames[:, -1]
                         )
                     )
-                if reconstructed_video.shape[1] >= 2:
+                if reconstructed_next_frames.shape[1] >= 2:
                     pred_next_frame_sim_list.append(
                         compute_frame_pixel_similarity(
-                            reconstructed_video[:, -2], reconstructed_video[:, -1]
+                            reconstructed_next_frames[:, -2],
+                            reconstructed_next_frames[:, -1],
                         )
                     )
 
@@ -202,12 +194,23 @@ def evaluate_model(
                         )
                     )
 
-                # Save comparison images
-                predicted_videos = convert_video_to_images(reconstructed_video)
-                expected_videos = convert_video_to_images(real_target_frames)
+                # Save comparison images for both residuals and reconstructed next frames.
+                predicted_residual_videos = convert_video_to_images(
+                    reconstructed_residuals
+                )
+                predicted_videos = convert_video_to_images(reconstructed_next_frames)
+                expected_videos = convert_video_to_images(video_batch)
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
+                residual_image_path = f"{batch_dir}/residual_comparison_grid.png"
                 image_path = f"{batch_dir}/next_frame_comparison_grid.png"
+                save_comparison_images_next_frame(
+                    predicted_residual_videos,
+                    action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
+                    expected_videos,
+                    batch_dir,
+                    file_suffix="residual_comparison_grid.png",
+                )
                 save_comparison_images_next_frame(
                     predicted_videos,
                     action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
@@ -216,13 +219,23 @@ def evaluate_model(
                 )
 
                 # Log comparison image to wandb
-                if wandb_logger:
-                    wandb_logger.log(
-                        {f"eval/comparison_{batch_idx}": wandb.Image(image_path)},
+                if experiment_logger:
+                    experiment_logger.log_image(
+                        f"eval/residual_comparison_{batch_idx}",
+                        residual_image_path,
                         step=global_step,
                     )
-                saved_image_paths.append(image_path)
-                logger.debug(f"Saved comparison image to {image_path}")
+                    experiment_logger.log_image(
+                        f"eval/comparison_{batch_idx}",
+                        image_path,
+                        step=global_step,
+                    )
+                saved_residual_image_paths.append(residual_image_path)
+                saved_reconstructed_image_paths.append(image_path)
+                logger.debug(
+                    "Saved comparison images to "
+                    f"{residual_image_path} and {image_path}"
+                )
 
             except Exception as e:
                 traceback.print_exc()
@@ -345,12 +358,16 @@ def evaluate_model(
         log_parts.append(
             f"codebook_ppl={codebook_metrics.get('eval/action_codebook_perplexity', float('nan')):.2f}"
         )
-    log_parts.append(f"saved {len(saved_image_paths)} images")
+    log_parts.append(
+        "saved "
+        f"{len(saved_residual_image_paths)} residual and "
+        f"{len(saved_reconstructed_image_paths)} reconstructed images"
+    )
     
     logger.info(f"Eval complete: {', '.join(log_parts)}")
 
     # Log to wandb if available
-    if wandb_logger and global_step is not None:
+    if experiment_logger and global_step is not None:
         log_dict = {
             "eval/token_loss": avg_token_loss,
             "eval/action_loss": avg_action_loss,
@@ -362,14 +379,20 @@ def evaluate_model(
             **residual_metrics,
             **codebook_metrics,
         }
-        wandb_logger.log(log_dict, step=global_step)
+        experiment_logger.log(log_dict, step=global_step)
 
         # Log comparison images in batches of 5, stacked vertically
-        if saved_image_paths:
-            log_image_batches(
-                wandb_logger,
+        if saved_residual_image_paths:
+            experiment_logger.log_image_batches(
+                key_prefix="eval/residual_comparison",
+                image_paths=saved_residual_image_paths,
+                batch_size=5,
+                step=global_step,
+            )
+        if saved_reconstructed_image_paths:
+            experiment_logger.log_image_batches(
                 key_prefix="eval/comparison",
-                image_paths=saved_image_paths,
+                image_paths=saved_reconstructed_image_paths,
                 batch_size=5,
                 step=global_step,
             )
@@ -385,7 +408,7 @@ def evaluate_model_rollout(
     epoch: int,
     global_step: int,
     config: DynamicsModelTrainingConfig,
-    wandb_logger=None,
+    experiment_logger: ExperimentLogger | None = None,
     save_dir: str = "dynamics_model_results",
 ) -> None:
     """Run teacher-forced and autoregressive rollout evals.
@@ -473,16 +496,15 @@ def evaluate_model_rollout(
                 saved_rollout_image_paths.append(rollout_image_path)
                 saved_teacher_forced_image_paths.append(teacher_forced_image_path)
 
-                if wandb_logger:
-                    wandb_logger.log(
-                        {
-                            f"eval_rollout/comparison_{batch_idx}": wandb.Image(
-                                rollout_image_path
-                            ),
-                            f"eval_teacher_forced/comparison_{batch_idx}": wandb.Image(
-                                teacher_forced_image_path
-                            ),
-                        },
+                if experiment_logger:
+                    experiment_logger.log_image(
+                        f"eval_rollout/comparison_{batch_idx}",
+                        rollout_image_path,
+                        step=global_step,
+                    )
+                    experiment_logger.log_image(
+                        f"eval_teacher_forced/comparison_{batch_idx}",
+                        teacher_forced_image_path,
                         step=global_step,
                     )
 
@@ -503,17 +525,15 @@ def evaluate_model_rollout(
         f"{len(saved_teacher_forced_image_paths)} teacher-forced grids"
     )
 
-    if wandb_logger and saved_rollout_image_paths:
-        log_image_batches(
-            wandb_logger,
+    if experiment_logger and saved_rollout_image_paths:
+        experiment_logger.log_image_batches(
             key_prefix="eval_rollout/comparison",
             image_paths=saved_rollout_image_paths,
             batch_size=5,
             step=global_step,
         )
-    if wandb_logger and saved_teacher_forced_image_paths:
-        log_image_batches(
-            wandb_logger,
+    if experiment_logger and saved_teacher_forced_image_paths:
+        experiment_logger.log_image_batches(
             key_prefix="eval_teacher_forced/comparison",
             image_paths=saved_teacher_forced_image_paths,
             batch_size=5,
@@ -534,7 +554,7 @@ def train_epoch(
     device: torch.device,
     epoch: int,
     config: DynamicsModelTrainingConfig,
-    wandb_logger,
+    experiment_logger: ExperimentLogger | None,
     global_step: int,
     start_batch: int = 0,
     save_dir: str = "dynamics_model_results",
@@ -612,9 +632,9 @@ def train_epoch(
             batch_time = time.time() - batch_start_time
 
             # Log to wandb
-            if wandb_logger:
+            if experiment_logger:
                 current_lrs = dynamics_scheduler.get_last_lr()
-                wandb_metrics = {
+                training_metrics = {
                     "train/loss": total_loss,
                     "train/token_loss": avg_token_loss,
                     "train/action_loss": avg_action_loss,
@@ -632,7 +652,7 @@ def train_epoch(
                     "train/action_codebook_num_unique": action_codebook_usage["num_unique"],
                     "train/action_codebook_num_tokens": action_codebook_usage["num_tokens"],
                 }
-                wandb_logger.log(wandb_metrics, step=global_step)
+                experiment_logger.log(training_metrics, step=global_step)
 
             # Log progress
             if (batch_idx // accumulation_steps) % config.log_interval == 0:
@@ -666,7 +686,7 @@ def train_epoch(
                     device,
                     epoch,
                     global_step,
-                    wandb_logger=wandb_logger,
+                    experiment_logger=experiment_logger,
                     save_dir=config.save_dir,
                 )
 
@@ -682,7 +702,7 @@ def train_epoch(
                         epoch,
                         global_step,
                         config,
-                        wandb_logger=wandb_logger,
+                        experiment_logger=experiment_logger,
                         save_dir=config.save_dir,
                     )
 
@@ -699,8 +719,8 @@ def train_epoch(
                         f"Train residual coverage: R²={train_coverage['residual_r2']:.4f}, "
                         f"cosine={train_coverage['residual_cosine']:.4f}"
                     )
-                    if wandb_logger:
-                        wandb_logger.log(
+                    if experiment_logger:
+                        experiment_logger.log(
                             {f"train/{k}": v for k, v in train_coverage.items()},
                             step=global_step,
                         )
@@ -728,13 +748,13 @@ def train_epoch(
     epoch_time = time.time() - epoch_start_time
 
     # Log epoch summary
-    if wandb_logger:
+    if experiment_logger:
         epoch_metrics = {
             "train/epoch_loss": avg_loss,
             "train/epoch_time": epoch_time,
             "train/epoch": epoch,
         }
-        wandb_logger.log(epoch_metrics, step=global_step)
+        experiment_logger.log(epoch_metrics, step=global_step)
 
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
@@ -756,20 +776,27 @@ def main(config: DynamicsModelTrainingConfig):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         config.experiment_name = f"maskgit_{timestamp}"
 
-    # Setup wandb
-    wandb_logger = setup_wandb(
-        project=config.wandb_project,
+    logging_backend = resolve_logging_backend(
+        logging_backend=config.logging_backend,
+        use_wandb=config.use_wandb,
+    )
+    experiment_logger = ExperimentLogger(
+        backend=logging_backend,
+        run_name=config.experiment_name,
+        config_summary=config.__dict__,
         group="mask-git-training",
-        entity=config.wandb_entity,
-        name=config.experiment_name,
-        tags=config.wandb_tags or [],
-        notes=config.wandb_notes or "",
-        config=config.__dict__,
+        wandb_project=config.wandb_project,
+        wandb_entity=config.wandb_entity,
+        wandb_tags=config.wandb_tags,
+        wandb_notes=config.wandb_notes,
+        tensorboard_dir=config.tensorboard_dir,
     )
 
     logger.info(f"Starting MaskGIT training - Experiment: {config.experiment_name}")
     logger.info(f"Using S3: {config.use_s3}")
-    logger.info(f"Using Wandb: {config.use_wandb}")
+    logger.info(f"Logging backend: {logging_backend}")
+    if experiment_logger and experiment_logger.tensorboard_log_dir is not None:
+        logger.info(f"TensorBoard log dir: {experiment_logger.tensorboard_log_dir}")
 
     # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
@@ -868,16 +895,16 @@ def main(config: DynamicsModelTrainingConfig):
         logger.info(f"  {key}: {value}")
 
     # Log dataset info to wandb
-    if wandb_logger:
-        wandb_logger.log(
+    if experiment_logger:
+        experiment_logger.log(
             {f"dataset/{key}": value for key, value in train_info.items()},
             commit=False,
         )
-        wandb_logger.log(
+        experiment_logger.log(
             {f"test_dataset/{key}": value for key, value in test_info.items()},
             commit=False,
         )
-        wandb_logger.log(
+        experiment_logger.log(
             {
                 "config/effective_batch_size": config.batch_size
                 * config.gradient_accumulation_steps,
@@ -887,8 +914,8 @@ def main(config: DynamicsModelTrainingConfig):
         )
 
     # Watch model with wandb
-    if wandb_logger:
-        wandb_logger.watch(model, log="all", log_freq=config.log_interval * 10)
+    if experiment_logger:
+        experiment_logger.watch(model, log="all", log_freq=config.log_interval * 10)
 
     # Create optimizer and scheduler
     action_params = [
@@ -983,7 +1010,7 @@ def main(config: DynamicsModelTrainingConfig):
         device,
         epoch=0,
         global_step=0,
-        wandb_logger=wandb_logger,
+        experiment_logger=experiment_logger,
         save_dir=config.save_dir,
     )
     logger.info(
@@ -999,7 +1026,7 @@ def main(config: DynamicsModelTrainingConfig):
             epoch=0,
             global_step=0,
             config=config,
-            wandb_logger=wandb_logger,
+            experiment_logger=experiment_logger,
             save_dir=config.save_dir,
         )
 
@@ -1022,7 +1049,7 @@ def main(config: DynamicsModelTrainingConfig):
                 device,
                 epoch,
                 config,
-                wandb_logger,
+                experiment_logger,
                 global_step,
                 epoch_start_batch,
                 config.save_dir,
@@ -1035,7 +1062,7 @@ def main(config: DynamicsModelTrainingConfig):
                 device,
                 epoch,
                 global_step,
-                wandb_logger=wandb_logger,
+                experiment_logger=experiment_logger,
                 save_dir=config.save_dir,
             )
             eval_loss = eval_token_loss + eval_action_loss
@@ -1052,7 +1079,7 @@ def main(config: DynamicsModelTrainingConfig):
                     epoch,
                     global_step,
                     config,
-                    wandb_logger=wandb_logger,
+                    experiment_logger=experiment_logger,
                     save_dir=config.save_dir,
                 )
 
@@ -1091,8 +1118,8 @@ def main(config: DynamicsModelTrainingConfig):
         logging.error(f"Training error: {e}")
         raise
     finally:
-        if wandb_logger:
-            wandb_logger.finish()
+        if experiment_logger:
+            experiment_logger.finish()
 
     logger.info("Training completed!")
     logger.info(f"Best loss achieved: {best_loss:.6f}")
@@ -1102,8 +1129,13 @@ def main(config: DynamicsModelTrainingConfig):
     else:
         logger.info(f"Checkpoints saved to: {config.checkpoint_dir}")
 
-    if config.use_wandb:
+    if logging_backend == "wandb":
         logger.info(f"Training metrics logged to Wandb project: {config.wandb_project}")
+    elif logging_backend == "tensorboard" and experiment_logger is not None:
+        logger.info(
+            "Training metrics logged to TensorBoard dir: "
+            f"{experiment_logger.tensorboard_log_dir}"
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,33 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-action_weight = 5
+action_weight = 1
+
+
+def compute_target_residuals(video: torch.Tensor) -> torch.Tensor:
+    """Return frame-to-frame residual targets with shape [B, T-1, C, H, W]."""
+    return video[:, 1:, :, :, :] - video[:, :-1, :, :, :]
+
+
+def compute_changed_pixel_mask(
+    frame_delta: torch.Tensor, threshold: float = 1e-3
+) -> torch.Tensor:
+    """Mark pixels whose absolute change exceeds the threshold."""
+    return (torch.abs(frame_delta) > threshold).float()
+
+
+def build_weight_mask(
+    changed_pixels: torch.Tensor,
+    *,
+    changed_weight: float,
+    unchanged_weight: float,
+) -> torch.Tensor:
+    """Create a dense weight mask from a binary change map."""
+    return torch.where(
+        changed_pixels > 0,
+        torch.full_like(changed_pixels, changed_weight),
+        torch.full_like(changed_pixels, unchanged_weight),
+    )
 
 
 def reconstruction_loss(video: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
@@ -31,7 +57,7 @@ def next_frame_reconstruction_residual_loss(
     """
     # Calculate ground truth residuals between consecutive frames
     # [B, num_images_in_video, C, H, W] -> [B, num_images_in_video - 1, C, H, W]
-    target_residuals = video[:, 1:, :, :, :] - video[:, :-1, :, :, :]
+    target_residuals = compute_target_residuals(video)
 
     # Calculate element-wise MSE loss between predicted and target residuals
     logger.debug(f"decoded shape: {decoded.shape}")
@@ -41,14 +67,16 @@ def next_frame_reconstruction_residual_loss(
     )  # [B, num_images_in_video - 1, C, H, W]
 
     # Detect pixels that changed between frames (with small threshold for numerical stability)
-    threshold = 1e-3
-    changed_pixels = (
-        torch.abs(target_residuals) > threshold
-    ).float()  # [B, num_images_in_video - 1, C, H, W]
+    changed_pixels = compute_changed_pixel_mask(
+        target_residuals,
+        0.005
+    )  # [B, num_images_in_video - 1, C, H, W]
 
     # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = torch.where(
-        changed_pixels > 0, action_weight, 1.0
+    weight_mask = build_weight_mask(
+        changed_pixels,
+        changed_weight=action_weight,
+        unchanged_weight=0,
     )  # [B, num_images_in_video - 1, C, H, W]
 
     # Apply weights and reduce to scalar
@@ -75,14 +103,16 @@ def next_frame_reconstruction_loss(
     previous_frames = video[:, :-1, :, :, :]
 
     # Detect pixels that changed between frames (with small threshold for numerical stability)
-    threshold = 1e-3
-    changed_pixels = (
-        torch.abs(target_frames - previous_frames) > threshold
-    ).float()  # [B, Num_images_in_video - 1, C, H, W]
+    changed_pixels = compute_changed_pixel_mask(
+        target_frames - previous_frames,
+        0.005
+    )  # [B, Num_images_in_video - 1, C, H, W]
 
     # Create weight mask: higher weight for changed pixels, normal weight for unchanged
-    weight_mask = torch.where(
-        changed_pixels > 0, action_weight, 1.0
+    weight_mask = build_weight_mask(
+        changed_pixels,
+        changed_weight=action_weight,
+        unchanged_weight=0.0,
     )  # [B, Num_images_in_video - 1, C, H, W]
 
     # Apply weights and reduce to scalar
@@ -106,7 +136,7 @@ def next_frame_reconstruction_loss_l1(
     Returns:
         Weighted reconstruction loss (scalar)
     """
-    return F.l1_loss(decoded, video[:, 1:, :, :, :], reduction="mean")
+    return F.l1_loss(decoded, video, reduction="mean")
 
 
 def changed_patch_weighted_token_cross_entropy_loss(
@@ -133,3 +163,4 @@ def changed_patch_weighted_token_cross_entropy_loss(
     return (per_patch_token_loss * patch_weights).sum() / normalized_weights.sum().clamp_min(
         1.0
     )
+
