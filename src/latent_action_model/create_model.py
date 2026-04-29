@@ -46,6 +46,8 @@ def create_action_model_from_dynamics_config(
         use_spatial_transformer=True,
         quantizer_type="fsq",
         bins=config.action_bins,
+        # zero_init_output_head=config.predict_action_residuals,
+        zero_init_output_head=False,
     )
 
     if config.action_model_checkpoint_path:

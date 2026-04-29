@@ -2,6 +2,7 @@
 
 import logging
 import os
+from typing import Literal
 
 import torch
 from PIL import Image
@@ -10,10 +11,24 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]]:
+def convert_video_to_images(
+    input_video: torch.Tensor,
+    *,
+    value_mode: Literal["image", "signed_residual", "magnitude"] = "image",
+    residual_scale: float = 5.0,
+) -> list[list[Image.Image]]:
     """
     Converts a batch of videos in torch.Tensor format (B, T, C, H, W) or (B, T, H, W, C)
     into a nested list of PIL Images. Handles normalization and dtype conversion.
+
+    Args:
+        input_video: Batch of videos.
+        value_mode:
+            - "image": treat float tensors as images in [0, 1].
+            - "signed_residual": visualize signed residuals with zero as gray,
+              negative values darker, and positive values brighter.
+            - "magnitude": visualize absolute residual magnitude.
+        residual_scale: Multiplier used by residual visualization modes.
 
     Returns:
         images: list of list of PIL Images, shape [batch][time]
@@ -39,9 +54,17 @@ def convert_video_to_images(input_video: torch.Tensor) -> list[list[Image.Image]
             f"Expected 5D input [B, T, C, H, W] or [B, T, H, W, C], got {video_tensor.shape}"
         )
 
-    # If the tensor is float, assume [0,1] and convert to uint8
+    # If the tensor is float, normalize according to its semantic range.
     if video_tensor.dtype in [torch.float, torch.float32, torch.float64]:
-        video_tensor = torch.clamp(video_tensor, 0, 1)  # clamp out-of-range values
+        if value_mode == "image":
+            video_tensor = torch.clamp(video_tensor, 0, 1)
+        elif value_mode == "signed_residual":
+            video_tensor = torch.clamp(video_tensor * residual_scale, -1, 1)
+            video_tensor = (video_tensor + 1) / 2
+        elif value_mode == "magnitude":
+            video_tensor = torch.clamp(video_tensor.abs() * residual_scale, 0, 1)
+        else:
+            raise ValueError(f"Unknown value_mode: {value_mode!r}")
         video_tensor = (video_tensor * 255).to(torch.uint8)
     else:
         video_tensor = video_tensor.to(torch.uint8)
@@ -75,6 +98,7 @@ def save_comparison_images_next_frame(
     expected_videos: list[list[Image.Image]],
     file_prefix: str,
     file_suffix: str = "next_frame_comparison_grid.png",
+    predicted_label: str = "Predicted Next",
 ):
     """
     Save a comparison grid showing original frame, expected next frame, and predicted next frame.
@@ -146,9 +170,101 @@ def save_comparison_images_next_frame(
             axs[row_offset + 2, col].imshow(predicted_image)
             axs[row_offset + 2, col].axis("off")
             if col == 0:
-                axs[row_offset + 2, col].set_ylabel("Predicted Next", fontsize=10)
+                axs[row_offset + 2, col].set_ylabel(predicted_label, fontsize=10)
 
             # Set the title for the top row of the sample (original frame)
+            axs[row_offset + 0, col].set_title(
+                f"t={col}  action={actions[col]}", fontsize=9
+            )
+
+    plt.tight_layout()
+    plt.savefig(f"{file_prefix}/{file_suffix}")
+    plt.close(fig)
+
+
+def save_residual_comparison_images(
+    predicted_residuals: list[list[Image.Image]],
+    ground_truth_residuals: list[list[Image.Image]],
+    predicted_actions: list[list[float]],
+    expected_videos: list[list[Image.Image]],
+    file_prefix: str,
+    file_suffix: str = "residual_comparison_grid.png",
+):
+    """
+    Save a residual comparison grid.
+
+    Each sample gets 4 rows: original frame, expected next frame,
+    ground-truth residual, and predicted residual.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    os.makedirs(file_prefix, exist_ok=True)
+
+    num_samples = len(predicted_residuals)
+    if num_samples == 0:
+        return
+
+    num_frames = len(predicted_residuals[0])
+
+    for i in range(num_samples):
+        if len(expected_videos[i]) - num_frames != 1:
+            raise ValueError(
+                f"Sample {i}: Expected {len(expected_videos[i])} frames, got {num_frames}"
+            )
+        if len(ground_truth_residuals[i]) != num_frames:
+            raise ValueError(
+                f"Sample {i}: Ground-truth residuals has "
+                f"{len(ground_truth_residuals[i])} frames, got {num_frames}"
+            )
+
+    total_rows = num_samples * 4
+    fig, axs = plt.subplots(
+        total_rows,
+        num_frames,
+        figsize=(max(8, num_frames * 2.2), total_rows * 2.0),
+    )
+
+    if total_rows == 1:
+        axs = np.expand_dims(axs, axis=0)
+    if num_frames == 1:
+        axs = np.expand_dims(axs, axis=1)
+
+    for sample_idx in range(num_samples):
+        predicted_residual_video = predicted_residuals[sample_idx]
+        ground_truth_residual_video = ground_truth_residuals[sample_idx]
+        expected_video = expected_videos[sample_idx]
+        actions = predicted_actions[sample_idx]
+        row_offset = sample_idx * 4
+
+        for col in range(num_frames):
+            original_image = expected_video[col]
+            expected_image = expected_video[col + 1]
+            ground_truth_residual_image = ground_truth_residual_video[col]
+            predicted_residual_image = predicted_residual_video[col]
+
+            axs[row_offset + 0, col].imshow(original_image)
+            axs[row_offset + 0, col].axis("off")
+            if col == 0:
+                axs[row_offset + 0, col].set_ylabel(
+                    f"Sample {sample_idx}\nOriginal", fontsize=10
+                )
+
+            axs[row_offset + 1, col].imshow(expected_image)
+            axs[row_offset + 1, col].axis("off")
+            if col == 0:
+                axs[row_offset + 1, col].set_ylabel("Expected Next", fontsize=10)
+
+            axs[row_offset + 2, col].imshow(ground_truth_residual_image)
+            axs[row_offset + 2, col].axis("off")
+            if col == 0:
+                axs[row_offset + 2, col].set_ylabel("GT Residual", fontsize=10)
+
+            axs[row_offset + 3, col].imshow(predicted_residual_image)
+            axs[row_offset + 3, col].axis("off")
+            if col == 0:
+                axs[row_offset + 3, col].set_ylabel("Predicted Residual", fontsize=10)
+
             axs[row_offset + 0, col].set_title(
                 f"t={col}  action={actions[col]}", fontsize=9
             )

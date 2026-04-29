@@ -1,5 +1,4 @@
-"""
-PSNR (Peak Signal-to-Noise Ratio) and Δt PSNR controllability metrics.
+"""PSNR (Peak Signal-to-Noise Ratio) and Δt PSNR controllability metrics.
 
 The Δt PSNR metric is from the Genie paper and measures controllability:
     Δt_PSNR = PSNR(x_t, x̂_t) - PSNR(x_t, x̂'_t)
@@ -10,37 +9,15 @@ Where:
     - x̂'_t: frame generated from randomly sampled latent actions
 
 A higher Δt PSNR indicates better controllability (inferred actions produce
-better reconstructions than random ones).
+better generations than random ones).
 """
 
-import json
 import logging
 import math
-import time
 
 import torch
 
-from latent_action_model.model import LatentActionVQVAE
-
-# #region agent log
-_DEBUG_LOG_PATH = "/scratch/Pokemon/.cursor/debug-5292d8.log"
-
-
-def _dbg(location: str, hypothesis_id: str, message: str, data: dict) -> None:
-    try:
-        payload = {
-            "sessionId": "5292d8",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_DEBUG_LOG_PATH, "a") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception:
-        pass
-# #endregion
+from dynamics_model.model import DynamicsModel
 
 logger = logging.getLogger(__name__)
 
@@ -145,10 +122,12 @@ def compute_psnr_per_frame(
     return psnr_per_frame
 
 
+@torch.no_grad()
 def compute_delta_psnr(
-    action_model: LatentActionVQVAE,
+    model: DynamicsModel,
     video_batch: torch.Tensor,
     device: torch.device,
+    max_steps: int = 25,
 ) -> tuple[float, float, float]:
     """
     Compute the Δt PSNR controllability metric from the Genie paper.
@@ -158,9 +137,10 @@ def compute_delta_psnr(
     distribution.
 
     Args:
-        action_model: The LatentActionVQVAE model
+        model: The dynamics model with a latent-action model attached.
         video_batch: Input video tensor [B, T, C, H, W]
         device: Device to run computation on
+        max_steps: Number of MaskGIT decoding steps for each generated frame.
 
     Returns:
         tuple of (psnr_inferred, psnr_random, delta_psnr)
@@ -170,91 +150,63 @@ def compute_delta_psnr(
     """
     video_batch = video_batch.to(device)
 
-    # 1. Encode video to get inferred actions and patch embeddings
-    quantized_inferred = action_model.encode(video_batch)
+    # Use the inferred action for the transition into the held-out final frame.
+    quantized_inferred = model.action_model.encode(video_batch)
+    inferred_actions = model.action_model.get_action_sequence(quantized_inferred)
+    inferred_last_action = inferred_actions[:, -1]
 
-    # 2. Decode with inferred actions → x̂_t
-    reconstructed_inferred = action_model.decode(video_batch, quantized_inferred)
-
-    # 3. Generate random actions
-    # quantized_inferred shape: (B, T-1, num_quantization_dims) for FSQ
-    batch_size = quantized_inferred.shape[0]
-    num_frames = quantized_inferred.shape[1]
-
-    # Sample random indices from [0, action_vocab_size). Shape (B, T-1), long —
-    # indexes_to_codes will internally add the trailing dim and broadcast against
-    # basis to return (B, T-1, len(levels)), matching quantized_inferred.
-    random_indices = torch.randint(
+    action_vocab_size = model.action_model.action_vocab_size
+    random_last_action = torch.randint(
         0,
-        action_model.action_vocab_size,
-        (batch_size, num_frames),
+        action_vocab_size,
+        (video_batch.shape[0],),
         device=device,
         dtype=torch.long,
     )
+    if action_vocab_size > 1:
+        random_last_action = torch.where(
+            random_last_action == inferred_last_action,
+            (random_last_action + 1) % action_vocab_size,
+            random_last_action,
+        )
 
-    # #region agent log
-    _dbg(
-        "psnr.py:pre_call",
-        "post-fix",
-        "random_indices before quantizer call",
-        {
-            "random_indices_shape": list(random_indices.shape),
-            "random_indices_dtype": str(random_indices.dtype),
-            "action_vocab_size": int(action_model.action_vocab_size),
-            "quantizer_levels": list(action_model.quantizer._levels),
-            "quantized_inferred_shape": list(quantized_inferred.shape),
-            "quantized_inferred_dtype": str(quantized_inferred.dtype),
-        },
+    reconstructed_inferred = model.inference(
+        video_batch,
+        inferred_last_action,
+        max_steps=max_steps,
     )
-    # #endregion
-
-    random_quantized = action_model.quantizer.indexes_to_codes(random_indices).float()
-    random_quantized = random_quantized.to(device)
-
-    # #region agent log
-    _dbg(
-        "psnr.py:post_call",
-        "post-fix",
-        "random_quantized after quantizer call",
-        {"random_quantized_shape": list(random_quantized.shape)},
+    reconstructed_random = model.inference(
+        video_batch,
+        random_last_action,
+        max_steps=max_steps,
     )
-    # #endregion
 
-    # 4. Decode with random actions → x̂'_t
-    reconstructed_random = action_model.decode(video_batch, random_quantized)
+    real_target = video_batch[:, -1]
+    inferred_target = reconstructed_inferred[:, -1]
+    random_target = reconstructed_random[:, -1]
 
-    # #region agent log
-    _dbg(
-        "psnr.py:post_decode",
-        "post-fix",
-        "decode with random actions succeeded",
-        {"reconstructed_random_shape": list(reconstructed_random.shape)},
-    )
-    # #endregion
-
-    # 5. Compute PSNRs
-    # Ground-truth target frames are video[:, 1:, :, :, :] (predicting t+1 from t)
-    real_target = video_batch[:, 1:, :, :, :]
-
-    psnr_inferred = compute_psnr(real_target, reconstructed_inferred)
-    psnr_random = compute_psnr(real_target, reconstructed_random)
+    psnr_inferred = compute_psnr(real_target, inferred_target)
+    psnr_random = compute_psnr(real_target, random_target)
     delta_psnr = psnr_inferred - psnr_random
 
     return psnr_inferred, psnr_random, delta_psnr
 
 
+@torch.no_grad()
 def compute_delta_psnr_batched(
-    action_model: LatentActionVQVAE,
+    model: DynamicsModel,
     video_batches: list[torch.Tensor],
     device: torch.device,
+    max_steps: int = 25,
 ) -> dict[str, float]:
     """
     Compute Δt PSNR metrics over multiple batches.
 
     Args:
-        action_model: The LatentActionVQVAE model
+        model: The dynamics model with a latent-action model attached.
         video_batches: List of video batch tensors
         device: Device to run computation on
+        max_steps: Number of MaskGIT decoding steps for each generated frame.
 
     Returns:
         Dictionary with averaged metrics:
@@ -275,7 +227,10 @@ def compute_delta_psnr_batched(
 
     for video_batch in video_batches:
         psnr_inf, psnr_rand, delta = compute_delta_psnr(
-            action_model, video_batch, device
+            model,
+            video_batch,
+            device,
+            max_steps=max_steps,
         )
         # Skip infinite values
         if math.isfinite(psnr_inf) and math.isfinite(psnr_rand):

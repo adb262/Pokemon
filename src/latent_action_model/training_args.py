@@ -11,11 +11,20 @@ import torch
 class VideoTrainingConfig:
     image_size: int = 128
     patch_size: int = 4
-    batch_size: int = 1
+    batch_size: int = 4
     learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-6
+    min_learning_rate: float = 1e-7
+    gradient_clipping: float | None = 1.0
+    gradient_accumulation_steps: int = 1
+    warmup_steps: int = 100
     num_epochs: int = 5
-    device: str = "mps" if torch.backends.mps.is_available() else "cuda"
+    device: str = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
     frames_dir: str = "pokemon_frames"
     log_interval: int = 10
     save_interval: int = 500
@@ -23,7 +32,7 @@ class VideoTrainingConfig:
     checkpoint_dir: str = "checkpoints"
     tensorboard_dir: str = "runs"
     seed: int = 42
-    num_images_in_video: int = 2
+    num_images_in_video: int = 5
     d_model: int = 256
     num_transformer_layers: int = 4
     latent_dim: int = 64
@@ -32,9 +41,13 @@ class VideoTrainingConfig:
     resume_from: Optional[str] = None
     experiment_name: Optional[str] = None
     seed_cache: bool = False
-    bins: list[int] = field(default_factory=lambda: [8])
+    bins: list[int] = field(default_factory=lambda: [6, 3])
+    predict_action_residuals: bool = False
+    action_decoder_loss: Literal["l2", "clipped_l2"] = "l2"
+    action_l2_clip_c: float = 10.0
     # Wandb Configuration
     use_wandb: bool = True
+    logging_backend: Literal["wandb", "tensorboard", "none"] = "wandb"
     wandb_project: str = "pokemon-action-vqvae"
     wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None
@@ -58,7 +71,7 @@ class VideoTrainingConfig:
     sync_from_s3: bool = False
     frame_spacing: int = 1
     num_unique_frames: Optional[int] = None
-    dataset_limit: int = 50000
+    dataset_limit: int = 500000
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None

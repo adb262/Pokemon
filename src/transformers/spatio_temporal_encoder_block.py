@@ -39,7 +39,7 @@ class SpatioTemporalEncoderBlock(nn.Module):
                 embed_dim=d_model, num_heads=num_heads, batch_first=True
             )
 
-        logger.info(
+        logger.debug(
             f"Creating spatial and temporal transformer attention layers. Using {d_model} as the dimension."
         )
         self.norm1 = nn.LayerNorm(d_model)
