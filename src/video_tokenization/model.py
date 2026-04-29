@@ -3,14 +3,15 @@ import logging
 import torch
 import torch.nn as nn
 
+from activations.swiglu import SwiGLU
 from latent_action_model.patch_embedding import PatchEmbedding
 from quantization.fsq import FiniteScalarQuantizer
 from torch_utilities.initialize import init_weights
-from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead
+from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead, UpsampleConvFrameHead
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class VideoTokenizerEncoder(nn.Module):
@@ -54,18 +55,20 @@ class VideoTokenizerEncoder(nn.Module):
             use_temporal_transformer=True,
         )
 
-        self.latent_projection = nn.Linear(d_model, embedding_dim)
-        self.apply(init_weights)
+        self.projection = nn.Linear(d_model, embedding_dim)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is of shape (batch_size, num_images_in_video, c, h, w)
         logger.debug(f"x shape before embed_image_patches: {x.shape}")
         x = self.embed_image_patches(x)
         logger.debug(f"x shape after embed_image_patches: {x.shape}")
+
+        # Handles residual stream under the hood
         x = self.encoder(x)
         logger.debug(f"x shape after encoder: {x.shape}")
-        x = self.latent_projection(x)
-        logger.debug(f"x shape after latent_projection: {x.shape}")
+        x = self.projection(x)
+        logger.debug(f"x shape after projection: {x.shape}")
         return x
 
 
@@ -93,7 +96,12 @@ class VideoTokenizerDecoder(nn.Module):
         self.patch_width = patch_width
         self.d_model = d_model
 
-        self.latent_projection = nn.Linear(embedding_dim, d_model)
+        self.latent_projection = nn.Sequential(
+            # No layer norm here. We don't want to normalize the latent tokens.
+            nn.Linear(embedding_dim, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
 
         self.encoder = SpatioTemporalTransformer(
             num_images_in_video=num_images_in_video,
@@ -104,8 +112,11 @@ class VideoTokenizerDecoder(nn.Module):
             use_temporal_transformer=True,
         )
 
-        self.patch_to_pixels = PixelShuffleFrameHead(
+        self.pre_projection_norm = nn.RMSNorm(d_model)
+
+        self.patch_to_pixels = UpsampleConvFrameHead(
             embed_dim=d_model,
+            hidden_dim=min(128, max(channels * 16, d_model // 4)),
             patch_size=patch_height,
             channels=channels,
             H=image_height,
@@ -117,6 +128,8 @@ class VideoTokenizerDecoder(nn.Module):
         logger.debug(f"x shape before latent_projection in decoder: {x.shape}")
         x = self.latent_projection(x)
         logger.debug(f"x shape before encoder in decoder: {x.shape}")
+
+        # Handles residual stream under the hood
         x = self.encoder(x)
         logger.debug(f"x shape after latent_projection in decoder: {x.shape}")
 
@@ -140,8 +153,10 @@ class VideoTokenizer(nn.Module):
         num_layers: int,
         embedding_dim: int,
         bins: list[int],
+        device: torch.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"),
     ):
         super(VideoTokenizer, self).__init__()
+
         self.encoder = VideoTokenizerEncoder(
             num_images_in_video=num_images_in_video,
             image_height=image_height,
@@ -152,15 +167,8 @@ class VideoTokenizer(nn.Module):
             d_model=d_model,
             num_heads=num_heads,
             num_layers=num_layers,
-            embedding_dim=embedding_dim,
+            embedding_dim=len(bins),
         )
-
-        device = torch.device("cpu")
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
 
         self.fsq = FiniteScalarQuantizer(
             levels=bins,

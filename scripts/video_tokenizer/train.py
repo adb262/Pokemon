@@ -12,20 +12,19 @@ import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-import wandb
 from data.data_loaders.factory import build_datasets
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
 from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import reconstruction_loss
-from monitoring.setup_wandb import setup_wandb
+from monitoring.codebook_usage import compute_codebook_usage
+from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.videos import convert_video_to_images, save_comparison_images
 from scripts.video_tokenizer.eval import eval_model
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
-from wandb.wandb_run import Run
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +45,7 @@ def train_epoch(
     device: torch.device,
     epoch: int,
     config: VideoTokenizerTrainingConfig,
-    wandb_logger: Run,
+    experiment_logger: ExperimentLogger,
     start_batch: int = 0,
     save_dir: str = "tokenization_results",
 ):
@@ -65,6 +64,7 @@ def train_epoch(
     epoch_start_time = time.time()
     batch_start_time = time.time()
     accumulated_loss = 0.0
+    logged_codebook_tokens: list[torch.Tensor] = []
 
     for batch_idx, video_batch in enumerate(dataloader):
         # Skip batches if resuming
@@ -76,9 +76,12 @@ def train_epoch(
         # Move to device
         video_batch = video_batch.to(device)
 
-        # Forward pass with decoder
-        # Outputs a tensor of shape (batch_size, num_images_in_video, channels, image_height, image_width)
-        decoded = model(video_batch)
+        # Forward pass with decoder.
+        # Outputs a tensor of shape (batch_size, num_images_in_video, channels, image_height, image_width).
+        quantized = model.encode(video_batch)
+        decoded = model.decode(quantized)
+        codebook_tokens = model.quantized_value_to_codes(quantized.detach())
+        logged_codebook_tokens.append(codebook_tokens.detach().cpu())
 
         # Calculate loss (reconstruction loss)
         # Scale loss by accumulation steps for correct gradient averaging
@@ -104,6 +107,14 @@ def train_epoch(
                 accumulation_steps, (batch_idx % accumulation_steps) + 1
             )
             total_loss += avg_accumulated_loss
+            codebook_token_window = (
+                torch.cat([tokens.reshape(-1) for tokens in logged_codebook_tokens], dim=0)
+                if logged_codebook_tokens
+                else torch.empty(0, dtype=torch.long)
+            )
+            codebook_usage = compute_codebook_usage(
+                codebook_token_window, model.get_vocab_size()
+            )
             batch_time = time.time() - batch_start_time
 
             # Calculate global step (counts optimizer steps, not batches)
@@ -111,16 +122,22 @@ def train_epoch(
                 batch_idx // accumulation_steps
             )
 
-            # Log to wandb with system metrics
-            wandb_metrics = {
+            # Log training metrics with system metrics.
+            training_metrics = {
                 "train/loss": avg_accumulated_loss,
                 "train/learning_rate": scheduler.get_last_lr()[0],
                 "train/batch_time": batch_time,
                 "train/epoch": epoch,
                 "train/batch": batch_idx,
             }
+            training_metrics.update(
+                {
+                    f"train/codebook_{key}": value
+                    for key, value in codebook_usage.items()
+                }
+            )
 
-            wandb_logger.log(wandb_metrics, step=global_step)
+            experiment_logger.log(training_metrics, step=global_step)
 
             # Log progress
             if (batch_idx // accumulation_steps) % config.log_interval == 0:
@@ -128,11 +145,15 @@ def train_epoch(
                 logger.info(
                     f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
                     f"Loss: {avg_accumulated_loss:.6f}, LR: {current_lr:.2e}, "
+                    f"Codebook: unique={int(codebook_usage['num_unique'])}/{model.get_vocab_size()} "
+                    f"({codebook_usage['usage_fraction']:.2%}), "
+                    f"ppl={codebook_usage['perplexity']:.2f}, "
                     f"Time: {batch_time:.2f}s"
                 )
 
             # Reset accumulated loss
             accumulated_loss = 0.0
+            logged_codebook_tokens = []
 
             # Save checkpoint periodically (based on optimizer steps)
             optimizer_step = batch_idx // accumulation_steps
@@ -149,9 +170,9 @@ def train_epoch(
                     predicted_videos, expected_videos, comparison_path
                 )
 
-                # Log comparison image to wandb
-                wandb_logger.log(
-                    {"train/comparison": wandb.Image(comparison_path)},
+                experiment_logger.log_image(
+                    "train/comparison",
+                    comparison_path,
                     step=global_step,
                 )
 
@@ -161,7 +182,7 @@ def train_epoch(
                     criterion,
                     device,
                     epoch,
-                    wandb_logger=wandb_logger,
+                    wandb_logger=experiment_logger,
                     save_dir=config.save_dir,
                     global_step=global_step,
                 )
@@ -183,16 +204,15 @@ def train_epoch(
     avg_loss = total_loss / max(num_optimizer_steps, 1)
     epoch_time = time.time() - epoch_start_time
 
-    # Log epoch metrics
-    # Log epoch summary to wandb
-    if wandb_logger:
+    # Log epoch metrics.
+    if experiment_logger:
         epoch_metrics = {
             "train/epoch_loss": avg_loss,
             "train/epoch_time": epoch_time,
             "train/epoch": epoch,
         }
 
-        wandb_logger.log(epoch_metrics, step=epoch * num_batches)
+        experiment_logger.log(epoch_metrics, step=epoch * num_batches)
 
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
@@ -208,22 +228,29 @@ def main(config: VideoTokenizerTrainingConfig):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         config.experiment_name = f"pokemon_vqvae_{timestamp}"
 
-    # Setup wandb
-    wandb_logger = setup_wandb(
-        project=config.wandb_project,
+    logging_backend = resolve_logging_backend(
+        logging_backend=config.logging_backend,
+        use_wandb=config.use_wandb,
+    )
+    experiment_logger = ExperimentLogger(
+        backend=logging_backend,
+        run_name=config.experiment_name,
+        config_summary=config.__dict__,
         group="video-tokenizer-test",
-        entity=config.wandb_entity,
-        name=config.experiment_name,
-        tags=config.wandb_tags or [],
-        notes=config.wandb_notes or "",
-        config=config.__dict__,
+        wandb_project=config.wandb_project,
+        wandb_entity=config.wandb_entity,
+        wandb_tags=config.wandb_tags or [],
+        wandb_notes=config.wandb_notes or "",
+        tensorboard_dir=config.tensorboard_dir,
     )
 
     logger.info(
         f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}"
     )
     logger.info(f"Using S3: {config.use_s3}")
-    logger.info(f"Using Wandb: {config.use_wandb}")
+    logger.info(f"Logging backend: {logging_backend}")
+    if experiment_logger and experiment_logger.tensorboard_log_dir is not None:
+        logger.info(f"TensorBoard log dir: {experiment_logger.tensorboard_log_dir}")
 
     # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
@@ -273,17 +300,17 @@ def main(config: VideoTokenizerTrainingConfig):
     for key, value in test_info.items():
         logger.info(f"  {key}: {value}")
 
-    # Log dataset info to wandb (use commit=False to not advance step counter)
-    if wandb_logger:
-        wandb_logger.log(
+    # Log dataset info without advancing the step counter when supported.
+    if experiment_logger:
+        experiment_logger.log(
             {f"dataset/{key}": value for key, value in train_info.items()},
             commit=False,
         )
-        wandb_logger.log(
+        experiment_logger.log(
             {f"test_dataset/{key}": value for key, value in test_info.items()},
             commit=False,
         )
-        wandb_logger.log(
+        experiment_logger.log(
             {
                 "config/effective_batch_size": config.batch_size
                 * config.gradient_accumulation_steps,
@@ -301,9 +328,8 @@ def main(config: VideoTokenizerTrainingConfig):
         f"Num params: {sum(p.numel() for p in model.parameters())} on device {device}"
     )
 
-    # Watch model with wandb
-    if wandb_logger:
-        wandb_logger.watch(model, log="all", log_freq=config.log_interval * 10)
+    if experiment_logger:
+        experiment_logger.watch(model, log="all", log_freq=config.log_interval * 10)
 
     # Create optimizer and scheduler
     optimizer = optim.AdamW(
@@ -366,7 +392,7 @@ def main(config: VideoTokenizerTrainingConfig):
         criterion,
         device,
         epoch=0,
-        wandb_logger=wandb_logger,
+        wandb_logger=experiment_logger,
         save_dir=config.save_dir,
         global_step=0,
     )
@@ -387,7 +413,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 device,
                 epoch,
                 config,
-                wandb_logger,
+                experiment_logger,
                 epoch_start_batch,
                 config.save_dir,
             )
@@ -398,7 +424,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 criterion,
                 device,
                 epoch,
-                wandb_logger=wandb_logger,
+                wandb_logger=experiment_logger,
                 save_dir=config.save_dir,
                 global_step=global_step,
             )
@@ -438,9 +464,8 @@ def main(config: VideoTokenizerTrainingConfig):
         logging.error(f"Training error: {e}")
         raise
     finally:
-        # Finish wandb run
-        if wandb_logger:
-            wandb_logger.finish()
+        if experiment_logger:
+            experiment_logger.finish()
 
         # Cleanup temporary directories
         if config._temp_log_file and os.path.exists(config._temp_log_file):
@@ -464,8 +489,15 @@ def main(config: VideoTokenizerTrainingConfig):
             f"Tensorboard logs saved to: {os.path.join(config.tensorboard_dir, config.experiment_name or 'default')}"
         )
 
-    if config.use_wandb:
+    if logging_backend == "wandb":
         logger.info(f"Training metrics logged to Wandb project: {config.wandb_project}")
+    elif (
+        logging_backend == "tensorboard"
+        and experiment_logger.tensorboard_log_dir is not None
+    ):
+        logger.info(
+            f"Training metrics logged to TensorBoard: {experiment_logger.tensorboard_log_dir}"
+        )
 
 
 if __name__ == "__main__":

@@ -45,9 +45,6 @@ class FiniteScalarQuantizer(BaseQuantizer):
         )
         self.register_buffer("_implicit_codebook", implicit_codebook, persistent=True)
 
-        # levels_tensor is 1D LongTensor, so len(levels) is a plain int
-        self.project_in = nn.Linear(embedding_dim, len(self._levels))
-
         self.mask_token_idx = self.codebook_size
         self.mask_token_embedding = nn.Parameter(torch.randn(1, 1, embedding_dim))
 
@@ -67,14 +64,8 @@ class FiniteScalarQuantizer(BaseQuantizer):
     def quantize(self, z):
         """Quanitzes z, returns quantized zhat, same shape as z."""
         logger.debug(
-            f"Devices: {z.device}, {self.project_in.weight.device}, {self._levels_np.device}"
+            f"Devices: {z.device}, {self._levels_np.device}"
         )
-        logger.debug(f"z shape before project_in: {z.shape}")
-        # TODO[adb262]: This is a hack for backwards compatibility with the old tokenizer
-        # In the future, we should remove the linear layer and go directly to len(bins)
-        if z.shape[-1] != len(self._levels):
-            logger.warning(f"z shape: {z.shape} does not match levels: {len(self._levels)}")
-            z = self.project_in(z)
 
         logger.debug(f"z shape after project_in: {z.shape}")
         quantized = round_ste(self.bound(z))

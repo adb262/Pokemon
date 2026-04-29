@@ -11,15 +11,14 @@ from data.data_loaders.factory import build_datasets
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
 from loss.loss_fns import next_frame_reconstruction_loss
+from monitoring.codebook_usage import compute_codebook_usage
+from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
-from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import convert_video_to_images, save_comparison_images
-from monitoring.wandb_media import log_image_batches
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
-from wandb.wandb_run import Run
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -31,7 +30,7 @@ def eval_model(
     criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
     epoch: int | str,
-    wandb_logger: Run,
+    wandb_logger: ExperimentLogger,
     save_dir: str = "tokenization_results",
     global_step: int | None = None,
 ):
@@ -43,6 +42,7 @@ def eval_model(
     # Collect real and predicted next frames across the eval set
     real_next_frames_batches: list[torch.Tensor] = []
     pred_next_frames_batches: list[torch.Tensor] = []
+    logged_codebook_tokens: list[torch.Tensor] = []
 
     eval_dir = f"{save_dir}/eval/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
@@ -52,7 +52,10 @@ def eval_model(
         for batch_idx, video_batch in enumerate(dataloader):
             video_batch = video_batch.to(device)
 
-            decoded: torch.Tensor = model(video_batch)
+            quantized = model.encode(video_batch)
+            decoded: torch.Tensor = model.decode(quantized)
+            codebook_tokens = model.quantized_value_to_codes(quantized)
+            logged_codebook_tokens.append(codebook_tokens.detach().cpu())
             loss = criterion(video_batch, decoded)
 
             # Predicting full frames. Video VQVAE is not looking ahead.
@@ -74,8 +77,20 @@ def eval_model(
             total_samples += video_batch.size(0)
 
     avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+    codebook_token_window = (
+        torch.cat([tokens.reshape(-1) for tokens in logged_codebook_tokens], dim=0)
+        if logged_codebook_tokens
+        else torch.empty(0, dtype=torch.long)
+    )
+    codebook_usage = compute_codebook_usage(
+        codebook_token_window, model.get_vocab_size()
+    )
     logger.info(
-        f"Eval complete: avg_loss={avg_loss:.6f}, saved {len(saved_image_paths)} images"
+        f"Eval complete: avg_loss={avg_loss:.6f}, "
+        f"codebook_unique={int(codebook_usage['num_unique'])}/{model.get_vocab_size()} "
+        f"({codebook_usage['usage_fraction']:.2%}), "
+        f"codebook_ppl={codebook_usage['perplexity']:.2f}, "
+        f"saved {len(saved_image_paths)} images"
     )
 
     if real_next_frames_batches and pred_next_frames_batches:
@@ -108,6 +123,9 @@ def eval_model(
             "eval/frechet_distance": frechet_distance,  # Keep for backwards compatibility
             "eval/epoch": epoch if isinstance(epoch, int) else 0,
         }
+        log_dict.update(
+            {f"eval/codebook_{key}": value for key, value in codebook_usage.items()}
+        )
 
         # Log with global_step if provided for proper x-axis alignment with training
         if global_step is not None:
@@ -116,8 +134,7 @@ def eval_model(
             wandb_logger.log(log_dict)
 
         # Log comparison images in batches of 5, stacked vertically
-        log_image_batches(
-            wandb_logger,
+        wandb_logger.log_image_batches(
             key_prefix="eval/comparison",
             image_paths=saved_image_paths,
             batch_size=5,
@@ -135,22 +152,29 @@ def main(config: VideoTokenizerTrainingConfig):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         config.experiment_name = f"pokemon_vqvae_{timestamp}"
 
-    # Setup wandb
-    wandb_logger = setup_wandb(
-        project=config.wandb_project,
+    logging_backend = resolve_logging_backend(
+        logging_backend=config.logging_backend,
+        use_wandb=config.use_wandb,
+    )
+    experiment_logger = ExperimentLogger(
+        backend=logging_backend,
+        run_name=config.experiment_name,
+        config_summary=config.__dict__,
         group="video-tokenizer-test",
-        entity=config.wandb_entity or "",
-        name=config.experiment_name,
-        tags=config.wandb_tags or [],
-        notes=config.wandb_notes or "",
-        config=config.__dict__,
+        wandb_project=config.wandb_project,
+        wandb_entity=config.wandb_entity,
+        wandb_tags=config.wandb_tags or [],
+        wandb_notes=config.wandb_notes or "",
+        tensorboard_dir=config.tensorboard_dir,
     )
 
     logger.info(
         f"Starting Pokemon VQVAE training - Experiment: {config.experiment_name}"
     )
     logger.info(f"Using S3: {config.use_s3}")
-    logger.info(f"Using Wandb: {config.use_wandb}")
+    logger.info(f"Logging backend: {logging_backend}")
+    if experiment_logger and experiment_logger.tensorboard_log_dir is not None:
+        logger.info(f"TensorBoard log dir: {experiment_logger.tensorboard_log_dir}")
 
     # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
@@ -200,10 +224,11 @@ def main(config: VideoTokenizerTrainingConfig):
     for key, value in test_info.items():
         logger.info(f"  {key}: {value}")
 
-    # Log dataset info to wandb
-    if wandb_logger:
-        wandb_logger.log({f"dataset/{key}": value for key, value in train_info.items()})
-        wandb_logger.log(
+    if experiment_logger:
+        experiment_logger.log(
+            {f"dataset/{key}": value for key, value in train_info.items()}
+        )
+        experiment_logger.log(
             {f"test_dataset/{key}": value for key, value in test_info.items()}
         )
 
@@ -227,7 +252,7 @@ def main(config: VideoTokenizerTrainingConfig):
         criterion,
         device,
         epoch=0,
-        wandb_logger=wandb_logger,
+        wandb_logger=experiment_logger,
         save_dir="eval_results",
     )
     logger.info(f"Test loss: {test_loss:.6f}")
@@ -239,7 +264,7 @@ def main(config: VideoTokenizerTrainingConfig):
             criterion,
             device,
             epoch="TEST_EVAL",
-            wandb_logger=wandb_logger,
+            wandb_logger=experiment_logger,
             save_dir="eval_results",
         )
         logger.info(f"Test loss: {eval_loss:.6f}")
@@ -250,6 +275,8 @@ def main(config: VideoTokenizerTrainingConfig):
         logging.error(f"Evaluation error: {e}")
         raise
     finally:
+        if experiment_logger:
+            experiment_logger.finish()
         logger.info("Evaluation completed!")
     logger.info(f"Evaluation loss: {eval_loss:.6f}")
 
