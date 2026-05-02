@@ -25,3 +25,5 @@ wandb/
 *.json
 
 data
+runs/
+tokenizer_runs/

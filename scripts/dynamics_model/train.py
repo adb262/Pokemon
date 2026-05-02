@@ -135,7 +135,7 @@ def evaluate_model(
     # Collect action tokens across batches for codebook-usage metrics
     action_tokens_accum: list[torch.Tensor] = []
 
-    eval_dir = f"{save_dir}/{split}/epoch_{epoch}"
+    eval_dir = f"{save_dir}/{split}/epoch_{epoch}/step_{global_step}"
     os.makedirs(eval_dir, exist_ok=True)
     logger.info(f"Saving {split} eval results to {eval_dir}")
 
@@ -484,7 +484,7 @@ def evaluate_model_rollout(
     rollout_key = f"{split}_rollout"
     teacher_forced_key = f"{split}_teacher_forced"
 
-    eval_dir = f"{save_dir}/{rollout_key}/epoch_{epoch}"
+    eval_dir = f"{save_dir}/{rollout_key}/epoch_{epoch}/step_{global_step}"
     os.makedirs(eval_dir, exist_ok=True)
     logger.info(
         f"Running {split} rollout eval ({config.rollout_eval_batches} batches) → {eval_dir}"
@@ -747,6 +747,9 @@ def train_epoch(
             if config.gradient_clipping is not None:
                 torch.nn.utils.clip_grad_norm_(
                     dynamics_model.parameters(), max_norm=config.gradient_clipping
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    action_model.parameters(), max_norm=config.gradient_clipping
                 )
 
             dynamics_optimizer.step()
@@ -1163,10 +1166,17 @@ def main(config: DynamicsModelTrainingConfig):
         parameter for parameter in action_model.parameters() if parameter.requires_grad
     ]
     action_param_ids = {id(parameter) for parameter in action_params}
+    tokenizer_params = [
+        parameter
+        for parameter in model.tokenizer.parameters()
+    ]
+    tokenizer_param_ids = {id(parameter) for parameter in tokenizer_params}
+
+    # Only optimize the dynamics model parameters that are not shared with the action model or tokenizer
     dynamics_params = [
         parameter
         for parameter in model.parameters()
-        if parameter.requires_grad and id(parameter) not in action_param_ids
+        if parameter.requires_grad and id(parameter) not in action_param_ids and id(parameter) not in tokenizer_param_ids
     ]
     optimizer = optim.AdamW(
         [
@@ -1178,7 +1188,10 @@ def main(config: DynamicsModelTrainingConfig):
     logger.info(
         "Optimizer created with parameter groups: "
         f"dynamics_lr={config.dynamics_learning_rate}, "
-        f"action_lr={config.action_learning_rate}"
+        f"action_lr={config.action_learning_rate}\n"
+        f"Num params dynamics model: {sum(p.numel() for p in dynamics_params)}\n"
+        f"Num params action model: {sum(p.numel() for p in action_params)}\n"
+        f"Num params tokenizer: {sum(p.numel() for p in tokenizer_params)}"
     )
 
     # Cosine annealing scheduler with warmup

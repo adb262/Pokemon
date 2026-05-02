@@ -18,13 +18,13 @@ class VideoTokenizerTrainingConfig:
     patch_size: int = 8
     batch_size: int = 1
     gradient_accumulation_steps: int = 1
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-6
+    learning_rate: float = 1e-5
+    min_learning_rate: float = 1e-7
     num_epochs: int = 5
     device: str = "mps" if torch.backends.mps.is_available() else "cuda"
     frames_dir: str = "pokemon_frames"
     log_interval: int = 10
-    save_interval: int = 500
+    save_interval: int = 5000
     eval_interval: int = 1000
     checkpoint_dir: str = "checkpoints"
     tensorboard_dir: str = "runs"
@@ -57,6 +57,15 @@ class VideoTokenizerTrainingConfig:
     no_wandb: bool = False
     bins: list[int] = field(default_factory=lambda: [8, 8, 6, 5])
     save_dir: str = "tokenization_results"
+    max_comparison_images: int = 5
+    # Reconstruction loss configuration. ``l2`` is the standard mean-squared
+    # error between the input video and its reconstruction. ``clipped_l2``
+    # floors the per-pixel MSE at ``l2_clip_c`` (interpreted in 0-255 pixel
+    # units, then rescaled to [0, 1]) so easy-to-fit pixels can't push the
+    # average loss arbitrarily close to zero. Mirrors the action-decoder
+    # loss option in ``DynamicsModelTrainingConfig``.
+    reconstruction_loss_type: Literal["l2", "clipped_l2"] = "l2"
+    l2_clip_c: float = 10.0
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
     atari_pong_crop_scoreboard: bool = False
@@ -64,6 +73,17 @@ class VideoTokenizerTrainingConfig:
     frame_spacing: int = 1
     num_unique_frames: Optional[int] = None
     dataset_limit: int = 50000
+    # Cap on the number of windows kept in the held-out test split. Eval runs
+    # iterate the entire test loader on every call, so this controls how many
+    # samples each eval step measures against. ``None`` keeps the full split.
+    test_dataset_limit: Optional[int] = 1000
+    # Early stopping (evaluation-level, not epoch-level). Counts evaluation
+    # events — both periodic in-epoch evals (every ``eval_interval``
+    # optimizer steps) and the post-epoch eval. Training stops when this
+    # many consecutive evals fail to improve eval loss by more than
+    # ``early_stopping_min_delta``. ``patience <= 0`` disables early stopping.
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None
