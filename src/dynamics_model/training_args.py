@@ -89,5 +89,5 @@ class DynamicsModelTrainingConfig:
     dataset_limit: int = 500000
 
     # Rollout evaluation
-    rollout_max_steps: int = 25
+    rollout_max_steps: int = 5
     rollout_eval_batches: int = 1

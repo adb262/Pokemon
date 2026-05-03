@@ -216,3 +216,7 @@ Retrain decoder
 - Norms and residuals fixed in LAM
 - Remove pre-norm on PatchEmbedding
 - Switch to RMSNorm
+
+dynamics_model_pong_w_tokenizer_v2 has some crazy results from pre-action model updates. Might be worth reverting action _model to 04-28-upgrade_video_tokenizer_with_swiglu_rmsnorm_nonlinear_upsampler. TBD, need to train the others to same extent.
+
+CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 8 --gradient_accumulation_steps 6 --num_epochs 2 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_256_scheduled >> dynamics_model_pong_w_tokenizer_v2_256_scheduled.log 2>&1
