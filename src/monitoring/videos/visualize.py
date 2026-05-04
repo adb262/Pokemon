@@ -54,8 +54,13 @@ def convert_video_to_images(
             f"Expected 5D input [B, T, C, H, W] or [B, T, H, W, C], got {video_tensor.shape}"
         )
 
-    # If the tensor is float, normalize according to its semantic range.
-    if video_tensor.dtype in [torch.float, torch.float32, torch.float64]:
+    # If the tensor is float (including bf16/fp16 from autocast), normalize
+    # according to its semantic range. ``is_floating_point`` covers fp16,
+    # bf16, fp32, and fp64; the explicit dtype list previously here silently
+    # cast bf16 inputs straight to uint8 (skipping the ``*255`` rescale) and
+    # produced all-black visualizations for autocast model outputs.
+    if video_tensor.is_floating_point():
+        video_tensor = video_tensor.float()
         if value_mode == "image":
             video_tensor = torch.clamp(video_tensor, 0, 1)
         elif value_mode == "signed_residual":

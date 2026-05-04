@@ -14,6 +14,7 @@ import os
 import time
 from datetime import datetime
 import traceback
+import torch._dynamo
 
 import torch
 import torch.optim as optim
@@ -46,6 +47,8 @@ from schedulers.inverse_sigmoid_decay import inverse_sigmoid_decay
 from video_tokenization.checkpoints import load_model_from_checkpoint
 from video_tokenization.model import VideoTokenizer
 
+torch._dynamo.config.cache_size_limit = 64
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -55,6 +58,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MAX_ROLLOUT_STEPS = 5
+VISUALIZATION_SEQUENCE_FRAMES = 5
+
+
+def _prediction_boundary_window(
+    num_frames: int,
+    prediction_start_idx: int,
+) -> tuple[slice, int]:
+    """Return a short frame window that includes the prediction boundary."""
+    if num_frames <= VISUALIZATION_SEQUENCE_FRAMES:
+        return slice(0, num_frames), prediction_start_idx
+
+    start = min(
+        max(prediction_start_idx - 1, 0),
+        num_frames - VISUALIZATION_SEQUENCE_FRAMES,
+    )
+    end = start + VISUALIZATION_SEQUENCE_FRAMES
+    return slice(start, end), prediction_start_idx - start
+
+
+def _slice_actions_for_rollout_grid(
+    actions: torch.Tensor,
+    full_prediction_start_idx: int,
+    frame_window: slice,
+) -> torch.Tensor:
+    frame_start = 0 if frame_window.start is None else frame_window.start
+    frame_stop = frame_start if frame_window.stop is None else frame_window.stop
+    action_start = max(frame_start - full_prediction_start_idx, 0)
+    action_end = max(frame_stop - full_prediction_start_idx, 0)
+    return actions[:, action_start:action_end]
+
 
 @torch.no_grad()
 def reconstruct_predicted_frames_from_residuals(
@@ -275,7 +308,7 @@ def evaluate_model(
                 break
 
             try:
-                video_batch = video_batch.to(device)
+                video_batch = video_batch.to(device, non_blocking=True)
                 if num_frames is not None:
                     video_batch = video_batch[:, :num_frames]
 
@@ -365,28 +398,40 @@ def evaluate_model(
                 # Save comparison images for the reconstructed next frames, plus
                 # a residual-comparison grid when the action model is configured
                 # to predict residuals.
-                predicted_videos = convert_video_to_images(reconstructed_next_frames)
-                expected_videos = convert_video_to_images(video_batch)
+                vis_frames = min(VISUALIZATION_SEQUENCE_FRAMES, video_batch.shape[1])
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
                 image_path = f"{batch_dir}/next_frame_comparison_grid.png"
-                save_comparison_images_next_frame(
-                    predicted_videos,
-                    action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
-                    expected_videos,
-                    batch_dir,
-                )
-                saved_reconstructed_image_paths.append(image_path)
-
                 residual_image_path: str | None = None
-                if predict_action_residuals and reconstructed_residuals is not None:
+                if vis_frames >= 2:
+                    vis_transition_count = vis_frames - 1
+                    predicted_videos = convert_video_to_images(
+                        reconstructed_next_frames[:, :vis_transition_count]
+                    )
+                    expected_videos = convert_video_to_images(
+                        video_batch[:, :vis_frames]
+                    )
+                    vis_action_tokens = action_tokens[:, :vis_transition_count]
+                    save_comparison_images_next_frame(
+                        predicted_videos,
+                        vis_action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
+                        expected_videos,
+                        batch_dir,
+                    )
+                    saved_reconstructed_image_paths.append(image_path)
+
+                if (
+                    vis_frames >= 2
+                    and predict_action_residuals
+                    and reconstructed_residuals is not None
+                ):
                     target_residuals = video_batch[:, 1:, :, :, :] - video_batch[:, :-1, :, :, :]
                     target_residual_videos = convert_video_to_images(
-                        target_residuals,
+                        target_residuals[:, :vis_transition_count],
                         value_mode="signed_residual",
                     )
                     predicted_residual_videos = convert_video_to_images(
-                        reconstructed_residuals,
+                        reconstructed_residuals[:, :vis_transition_count],
                         value_mode="signed_residual",
                     )
                     residual_image_path = (
@@ -395,7 +440,7 @@ def evaluate_model(
                     save_residual_comparison_images(
                         predicted_residual_videos,
                         target_residual_videos,
-                        action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
+                        vis_action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
                         expected_videos,
                         batch_dir,
                         file_suffix="residual_comparison_grid.png",
@@ -653,7 +698,7 @@ def evaluate_model_rollout(
                 break
 
             try:
-                video_batch = video_batch.to(device)  # (B, 2T, C, H, W)
+                video_batch = video_batch.to(device, non_blocking=True)  # (B, 2T, C, H, W)
 
                 # Extract GT actions for the full 2T clip
                 action_encoded = model.action_model.encode(video_batch)
@@ -661,31 +706,17 @@ def evaluate_model_rollout(
                     action_encoded
                 )  # (B, 2T-1)
 
-                gt_images = convert_video_to_images(video_batch)
-
                 teacher_forced_full = model.inference(
                     video_batch,
                     actions_full[:, -1],
                     max_steps=config.rollout_max_steps,
                 )  # (B, 2T, C, H, W)
-                teacher_forced_images = convert_video_to_images(teacher_forced_full)
-                teacher_forced_actions = (
-                    actions_full[:, T - 2 :].detach().cpu().numpy().tolist()
-                )
 
-                rollout_actions = (
-                    actions_full[:, T - 1 :]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .tolist()
-                )
                 predicted_full = model.rollout(
                     video_batch[:, :T],
                     actions_full[:, T - 1 :],
                     max_steps=config.rollout_max_steps,
                 )  # (B, 2T, C, H, W)
-                rollout_images = convert_video_to_images(predicted_full)
 
                 # Autoregressive rollout predictions are at frames T..2T-1.
                 # The previous GT frame for step k (k=0..T-1) is the one at
@@ -716,20 +747,58 @@ def evaluate_model_rollout(
 
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
-                save_rollout_comparison_grid(
-                    gt_videos=gt_images,
-                    predicted_videos=teacher_forced_images,
-                    predicted_actions=teacher_forced_actions,
-                    output_dir=batch_dir,
-                    prediction_start_idx=T - 1,
-                    file_suffix="teacher_forced_comparison_grid.png",
+
+                teacher_window, teacher_prediction_start = _prediction_boundary_window(
+                    video_batch.shape[1],
+                    T - 1,
+                )
+                teacher_forced_actions = _slice_actions_for_rollout_grid(
+                    actions_full[:, T - 2 :],
+                    T - 1,
+                    teacher_window,
+                )
+                gt_teacher_images = convert_video_to_images(
+                    video_batch[:, teacher_window]
+                )
+                teacher_forced_images = convert_video_to_images(
+                    teacher_forced_full[:, teacher_window]
                 )
                 save_rollout_comparison_grid(
-                    gt_videos=gt_images,
-                    predicted_videos=rollout_images,
-                    predicted_actions=rollout_actions,
+                    gt_videos=gt_teacher_images,
+                    predicted_videos=teacher_forced_images,
+                    predicted_actions=teacher_forced_actions.detach()
+                    .cpu()
+                    .numpy()
+                    .tolist(),
                     output_dir=batch_dir,
-                    prediction_start_idx=T,
+                    prediction_start_idx=teacher_prediction_start,
+                    file_suffix="teacher_forced_comparison_grid.png",
+                )
+
+                rollout_window, rollout_prediction_start = _prediction_boundary_window(
+                    video_batch.shape[1],
+                    T,
+                )
+                rollout_actions = _slice_actions_for_rollout_grid(
+                    actions_full[:, T - 1 :],
+                    T,
+                    rollout_window,
+                )
+                gt_rollout_images = convert_video_to_images(
+                    video_batch[:, rollout_window]
+                )
+                rollout_images = convert_video_to_images(
+                    predicted_full[:, rollout_window]
+                )
+                save_rollout_comparison_grid(
+                    gt_videos=gt_rollout_images,
+                    predicted_videos=rollout_images,
+                    predicted_actions=rollout_actions.detach()
+                    .cpu()
+                    .numpy()
+                    .tolist(),
+                    output_dir=batch_dir,
+                    prediction_start_idx=rollout_prediction_start,
                 )
 
                 rollout_image_path = f"{batch_dir}/rollout_comparison_grid.png"
@@ -818,8 +887,14 @@ def run_evaluation_suite(
     config: DynamicsModelTrainingConfig,
     experiment_logger: ExperimentLogger | None,
     label: str,
+    run_rollout: bool,
 ) -> float:
-    """Run the full eval suite once and return eval total loss."""
+    """Run the full eval suite once and return eval total loss.
+
+    When ``run_rollout`` is False the (expensive) autoregressive +
+    teacher-forced rollout evals are skipped; only the standard eval and
+    train_eval losses/metrics are computed.
+    """
     eval_token_loss, eval_action_loss = evaluate_model(
         model,
         test_dataloader,
@@ -855,29 +930,35 @@ def run_evaluation_suite(
             f"Action Loss: {train_eval_action_loss:.6f}"
         )
 
-    if rollout_dataloader is not None:
-        evaluate_model_rollout(
-            model,
-            rollout_dataloader,
-            device,
-            epoch,
-            global_step,
-            config,
-            experiment_logger=experiment_logger,
-            save_dir=config.save_dir,
-            split="eval",
-        )
-    if train_rollout_dataloader is not None:
-        evaluate_model_rollout(
-            model,
-            train_rollout_dataloader,
-            device,
-            epoch,
-            global_step,
-            config,
-            experiment_logger=experiment_logger,
-            save_dir=config.save_dir,
-            split="train",
+    if run_rollout:
+        if rollout_dataloader is not None:
+            evaluate_model_rollout(
+                model,
+                rollout_dataloader,
+                device,
+                epoch,
+                global_step,
+                config,
+                experiment_logger=experiment_logger,
+                save_dir=config.save_dir,
+                split="eval",
+            )
+        if train_rollout_dataloader is not None:
+            evaluate_model_rollout(
+                model,
+                train_rollout_dataloader,
+                device,
+                epoch,
+                global_step,
+                config,
+                experiment_logger=experiment_logger,
+                save_dir=config.save_dir,
+                split="train",
+            )
+    else:
+        logger.info(
+            f"Skipping rollout eval at step {global_step} "
+            f"(rollout runs every {config.eval_interval * config.rollout_every_n_evals} steps)"
         )
 
     return eval_loss
@@ -918,120 +999,93 @@ def train_epoch(
     os.makedirs(f"{save_dir}/train/epoch_{epoch}", exist_ok=True)
 
     epoch_start_time = time.time()
-    action_loss_acc, token_loss_acc = [], []
     total_optimizer_step_action_loss = 0.0
     total_optimizer_step_token_loss = 0.0
+    token_loss_sum_gpu = torch.tensor(0.0, device=device)
+    action_loss_sum_gpu = torch.tensor(0.0, device=device)
+    microbatch_count = 0
     logged_action_tokens: list[torch.Tensor] = []
-    rollout_time_acc: list[float] = []
-    forward_time_acc: list[float] = []
-    rollout_frame_fraction_acc: list[float] = []
+    rollout_calls_acc: list[int] = []
     eps_acc: list[float] = []
     dynamics_optimizer.zero_grad()
+    max_context = dynamics_model.num_images_in_video - 1
+    use_amp = config.use_bf16 and device.type == "cuda"
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp)
 
-    # ``enumerate(..., start=start_batch)`` keeps ``batch_idx`` aligned with
-    # the absolute position in the (full) epoch, so gradient accumulation,
-    # logging, and end-of-epoch detection all match a fresh-start run.
     for batch_idx, video_batch in enumerate(train_dataloader, start=start_batch):
         batch_start_time = time.time()
 
-        # train_dataloader yields 2T-frame clips so the same dataset can also
-        # serve the train-side rollout eval; trim to T frames here for the
-        # actual training forward pass.
-        video_batch = video_batch.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
         video_batch = video_batch[:, :T + 1]
 
-        # Time the action-model + dynamics-forward + loss-computation work
-        # separately from the autoregressive rollout so we can attribute cost.
-        # CUDA kernels are async; explicit syncs are required for accurate
-        # wall-clock measurements.
-        cuda_timing = torch.cuda.is_available() and (
-            device.type == "cuda" if isinstance(device, torch.device)
-            else str(device).startswith("cuda")
-        )
+        with amp_ctx:
+            action_encoded = action_model.encode(video_batch)
+            action_tokens = action_model.get_action_sequence(action_encoded)
 
-        if cuda_timing:
-            torch.cuda.synchronize()
-        forward_start = time.time()
+            # --- Scheduled sampling: build the prediction basis ---
+            eps = inverse_sigmoid_decay(global_step / total_steps, decay_rate=10.0)
+            eps_acc.append(eps)
 
-        # Construct the prediction basis
-        action_encoded = action_model.encode(video_batch)
-        
-        # Shape (B, T)
-        action_tokens = action_model.get_action_sequence(
-            action_encoded
-        )
+            if config.scheduled_sampling == "bengio_per_frame":
+                use_gt = torch.rand(T) < eps
+                duplicate = video_batch.clone()
+                rollout_calls = 0
 
-        if cuda_timing:
-            torch.cuda.synchronize()
-        forward_time_pre_rollout = time.time() - forward_start
+                with torch.no_grad():
+                    for t in range(T):
+                        if bool(use_gt[t]):
+                            continue
+                        ctx = duplicate[:, : t + 1]
+                        ctx_start = max(0, t - max_context + 1)
+                        ctx_actions = action_tokens[:, ctx_start:t]
+                        pred = dynamics_model.predict_next_frame(
+                            ctx,
+                            action_tokens[:, t],
+                            max_steps=MAX_ROLLOUT_STEPS,
+                            context_actions=ctx_actions if ctx_actions.shape[1] > 0 else None,
+                        )
+                        duplicate[:, t + 1] = pred
+                        rollout_calls += 1
 
-        if cuda_timing:
-            torch.cuda.synchronize()
-        rollout_start = time.time()
-        with torch.no_grad():
-            # Get targets for the prediction basis
-            prediction_basis = dynamics_model.rollout(
-                # only use the first frame to get the prediction basis
-                video_batch[:, :1],
-                action_tokens,
-                max_steps=MAX_ROLLOUT_STEPS,
+                video_prediction_basis = duplicate[:, 1:]
+                rollout_calls_acc.append(rollout_calls)
+            elif config.scheduled_sampling == "free_run_mix":
+                B = video_batch.shape[0]
+                with torch.no_grad():
+                    prediction_basis = dynamics_model.rollout(
+                        video_batch[:, :1],
+                        action_tokens,
+                        max_steps=MAX_ROLLOUT_STEPS,
+                    )
+                keep_gt_mask = torch.rand(B, T, 1, 1, 1, device=device) < eps
+                video_prediction_basis = torch.where(
+                    keep_gt_mask,
+                    video_batch[:, 1:],
+                    prediction_basis[:, 1:],
+                )
+                rollout_calls_acc.append(T)
+            else:
+                video_prediction_basis = video_batch[:, 1:]
+                rollout_calls_acc.append(0)
+
+            decoded, token_loss, action_tokens = dynamics_model(
+                video_batch[:, 1:],
+                video_prediction_basis,
+                action_tokens[:, 1:],
             )
-        if cuda_timing:
-            torch.cuda.synchronize()
-        rollout_time = time.time() - rollout_start
-        rollout_time_acc.append(rollout_time)
 
-        # eps is the per-frame probability of keeping the ground-truth frame
-        # in the basis; (1 - eps) is the probability of substituting the
-        # rolled-out prediction. Per-sample, per-frame mixing so different
-        # examples in the batch see different schedules.
-        eps = inverse_sigmoid_decay(global_step / total_steps, decay_rate=10.0)
-        eps_acc.append(eps)
-        B = video_batch.shape[0]
-        keep_gt_mask = torch.rand(B, T, 1, 1, 1, device=device) < eps
-        # Fraction of (sample, frame) slots in the trainable window for which
-        # we substituted a rolled-out prediction in place of the GT frame.
-        rollout_frame_fraction_acc.append((~keep_gt_mask).float().mean().item())
-        video_prediction_basis = torch.where(
-            keep_gt_mask,
-            video_batch[:, 1:],
-            prediction_basis[:, 1:],
-        )
+            reconstructed_action_video = action_model.decode(video_batch, action_encoded)
+            action_loss = dynamics_model.action_loss_fn(video_batch, reconstructed_action_video)
 
-        if cuda_timing:
-            torch.cuda.synchronize()
-        forward_post_start = time.time()
-
-        # Forward pass - MaskGIT returns (predictions, token_loss, action_loss)
-        # We drop frame 0 because it is the (untouched) GT seed used to bootstrap
-        # the rollout; the trainable window is frames 1..T.
-        decoded, token_loss, action_tokens = dynamics_model(
-            video_batch[:, 1:],
-            video_prediction_basis,
-            action_tokens[:, 1:],
-        )
-
-        # Reconstruct the action video from the action tokens
-        reconstructed_action_video = action_model.decode(video_batch, action_encoded)
-
-        # video_residuals = compute_target_residuals(video)
-        action_loss = dynamics_model.action_loss_fn(video_batch, reconstructed_action_video)
-
-        if cuda_timing:
-            torch.cuda.synchronize()
-        forward_time_acc.append(
-            forward_time_pre_rollout + (time.time() - forward_post_start)
-        )
-
-        # Scale each microbatch by the size of its accumulation window so the
-        # accumulated gradient matches the corresponding large-batch mean.
         remaining_batches = num_batches - batch_idx
         current_window_size = min(accumulation_steps, remaining_batches)
         combined_loss = (token_loss + action_loss) / current_window_size
         combined_loss.backward()
-        token_loss_acc.append(token_loss.item())
-        action_loss_acc.append(action_loss.item())
-        logged_action_tokens.append(action_tokens.detach().cpu())
+
+        token_loss_sum_gpu += token_loss.detach()
+        action_loss_sum_gpu += action_loss.detach()
+        microbatch_count += 1
+        logged_action_tokens.append(action_tokens.detach())
 
         # Only step optimizer after accumulating enough gradients
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -1048,14 +1102,14 @@ def train_epoch(
             dynamics_scheduler.step()
             dynamics_optimizer.zero_grad()
 
-            avg_token_loss = sum(token_loss_acc) / len(token_loss_acc)
-            avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
+            avg_token_loss = (token_loss_sum_gpu / microbatch_count).item()
+            avg_action_loss = (action_loss_sum_gpu / microbatch_count).item()
             total_loss = avg_token_loss + avg_action_loss
             total_optimizer_step_loss += total_loss
             total_optimizer_step_action_loss += avg_action_loss
             total_optimizer_step_token_loss += avg_token_loss
             action_token_window = (
-                torch.cat([tokens.reshape(-1) for tokens in logged_action_tokens], dim=0)
+                torch.cat([tokens.reshape(-1) for tokens in logged_action_tokens], dim=0).cpu()
                 if logged_action_tokens
                 else torch.empty(0, dtype=torch.long)
             )
@@ -1069,15 +1123,9 @@ def train_epoch(
             batch_time = time.time() - batch_start_time
             global_step += 1
 
-            avg_rollout_time = sum(rollout_time_acc) / len(rollout_time_acc)
-            avg_forward_time = sum(forward_time_acc) / len(forward_time_acc)
-            avg_rollout_frame_fraction = (
-                sum(rollout_frame_fraction_acc) / len(rollout_frame_fraction_acc)
-            )
+            avg_rollout_calls = sum(rollout_calls_acc) / len(rollout_calls_acc)
             avg_eps = sum(eps_acc) / len(eps_acc)
-            avg_rollout_frames_per_sample = avg_rollout_frame_fraction * T
 
-            # Log to wandb
             if experiment_logger:
                 current_lrs = dynamics_scheduler.get_last_lr()
                 training_metrics = {
@@ -1098,14 +1146,10 @@ def train_epoch(
                     "train/action_codebook_num_unique": action_codebook_usage["num_unique"],
                     "train/action_codebook_num_tokens": action_codebook_usage["num_tokens"],
                     "train/scheduled_sampling_eps": avg_eps,
-                    "train/rollout_time_seconds": avg_rollout_time,
-                    "train/forward_time_seconds": avg_forward_time,
-                    "train/rollout_frame_fraction": avg_rollout_frame_fraction,
-                    "train/rollout_frames_per_sample": avg_rollout_frames_per_sample,
+                    "train/rollout_calls": avg_rollout_calls,
                 }
                 experiment_logger.log(training_metrics, step=global_step)
 
-            # Log progress
             if global_step % config.log_interval == 0:
                 current_lrs = dynamics_scheduler.get_last_lr()
                 logger.info(
@@ -1117,21 +1161,23 @@ def train_epoch(
                     f"top_counts=[{format_top_code_counts(top_code_counts)}], "
                     f"LRs: dynamics={current_lrs[0]:.2e}, action={current_lrs[1]:.2e}, "
                     f"eps={avg_eps:.3f}, "
-                    f"rollout_frames={avg_rollout_frames_per_sample:.2f}/{T}, "
-                    f"rollout_time={avg_rollout_time:.2f}s, "
-                    f"forward_time={avg_forward_time:.2f}s, "
+                    f"rollout_calls={avg_rollout_calls:.2f}/{T}, "
                     f"Time: {batch_time:.2f}s"
                 )
 
-            action_loss_acc, token_loss_acc = [], []
+            token_loss_sum_gpu.zero_()
+            action_loss_sum_gpu.zero_()
+            microbatch_count = 0
             logged_action_tokens = []
-            rollout_time_acc = []
-            forward_time_acc = []
-            rollout_frame_fraction_acc = []
+            rollout_calls_acc = []
             eps_acc = []
 
             eval_improved = False
             if global_step % config.eval_interval == 0:
+                rollout_interval_steps = (
+                    config.eval_interval * config.rollout_every_n_evals
+                )
+                run_rollout = global_step % rollout_interval_steps == 0
                 eval_loss = run_evaluation_suite(
                     dynamics_model,
                     test_dataloader,
@@ -1143,6 +1189,7 @@ def train_epoch(
                     config,
                     experiment_logger,
                     label=f"Step {global_step}",
+                    run_rollout=run_rollout,
                 )
                 eval_improved = eval_loss < best_loss
                 if eval_improved:
@@ -1190,30 +1237,48 @@ def train_epoch(
 
                     train_batch_dir = f"{save_dir}/train/epoch_{epoch}/batch_{batch_idx}"
                     os.makedirs(train_batch_dir, exist_ok=True)
-                    train_expected_videos = convert_video_to_images(video_batch)
-                    train_predicted_videos = convert_video_to_images(train_next_frames)
+                    train_vis_frames = min(
+                        VISUALIZATION_SEQUENCE_FRAMES,
+                        video_batch.shape[1],
+                    )
                     train_image_path = (
                         f"{train_batch_dir}/action_decoder_next_frame_comparison_grid.png"
                     )
-                    save_comparison_images_next_frame(
-                        train_predicted_videos,
-                        train_action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
-                        train_expected_videos,
-                        train_batch_dir,
-                        file_suffix="action_decoder_next_frame_comparison_grid.png",
-                    )
 
                     train_residual_image_path: str | None = None
-                    if train_residuals is not None:
+                    if train_vis_frames >= 2:
+                        train_vis_transition_count = train_vis_frames - 1
+                        train_expected_videos = convert_video_to_images(
+                            video_batch[:, :train_vis_frames]
+                        )
+                        train_predicted_videos = convert_video_to_images(
+                            train_next_frames[:, :train_vis_transition_count]
+                        )
+                        train_vis_action_tokens = train_action_tokens[
+                            :, :train_vis_transition_count
+                        ]
+                        save_comparison_images_next_frame(
+                            train_predicted_videos,
+                            train_vis_action_tokens.squeeze(-1)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .tolist(),
+                            train_expected_videos,
+                            train_batch_dir,
+                            file_suffix="action_decoder_next_frame_comparison_grid.png",
+                        )
+
+                    if train_vis_frames >= 2 and train_residuals is not None:
                         train_target_residuals = (
                             video_batch[:, 1:, :, :, :] - video_batch[:, :-1, :, :, :]
                         )
                         train_target_residual_videos = convert_video_to_images(
-                            train_target_residuals,
+                            train_target_residuals[:, :train_vis_transition_count],
                             value_mode="signed_residual",
                         )
                         train_residual_videos = convert_video_to_images(
-                            train_residuals,
+                            train_residuals[:, :train_vis_transition_count],
                             value_mode="signed_residual",
                         )
                         train_residual_image_path = (
@@ -1222,7 +1287,11 @@ def train_epoch(
                         save_residual_comparison_images(
                             train_residual_videos,
                             train_target_residual_videos,
-                            train_action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
+                            train_vis_action_tokens.squeeze(-1)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .tolist(),
                             train_expected_videos,
                             train_batch_dir,
                             file_suffix="action_decoder_residual_comparison_grid.png",
@@ -1308,6 +1377,8 @@ def main(config: DynamicsModelTrainingConfig):
         raise ValueError("eval_interval must be greater than 0")
     if config.save_interval <= 0:
         raise ValueError("save_interval must be greater than 0")
+    if config.rollout_every_n_evals <= 0:
+        raise ValueError("rollout_every_n_evals must be greater than 0")
 
     # Generate experiment name if not provided
     if config.experiment_name is None:
@@ -1336,7 +1407,12 @@ def main(config: DynamicsModelTrainingConfig):
     if experiment_logger and experiment_logger.tensorboard_log_dir is not None:
         logger.info(f"TensorBoard log dir: {experiment_logger.tensorboard_log_dir}")
 
-    # Set random seeds for reproducibility
+    # Enable TF32 and optimized matmul on supported GPUs (H100, A100, etc.)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
 
@@ -1373,6 +1449,13 @@ def main(config: DynamicsModelTrainingConfig):
     logger.info(
         f"MaskGIT trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
     )
+
+    if config.use_compile and device.type == "cuda":
+        _compile_mode = "default"
+        model.decoder = torch.compile(model.decoder, mode=_compile_mode, dynamic=True)  # type: ignore[assignment]
+        action_model.encoder = torch.compile(action_model.encoder, mode=_compile_mode, dynamic=True)  # type: ignore[assignment]
+        action_model.decoder_transformer = torch.compile(action_model.decoder_transformer, mode=_compile_mode, dynamic=True)  # type: ignore[assignment]
+        logger.info("torch.compile enabled on decoder and action model submodules")
 
     # Create data loader
     logger.info("Creating data loader...")
@@ -1576,7 +1659,8 @@ def main(config: DynamicsModelTrainingConfig):
         logger.info(f"Resumed from epoch {start_epoch}, batch {start_batch}")
 
     logger.info(
-        f"Evaluating every {config.eval_interval} optimizer steps; "
+        f"Evaluating every {config.eval_interval} optimizer steps "
+        f"(rollout eval every {config.eval_interval * config.rollout_every_n_evals} steps); "
         f"saving every {config.save_interval} optimizer steps."
     )
 
@@ -1632,6 +1716,7 @@ def main(config: DynamicsModelTrainingConfig):
                     config,
                     experiment_logger,
                     label=f"Final step {global_step}",
+                    run_rollout=True,
                 )
                 final_eval_ran = True
                 final_eval_is_best = final_eval_loss < best_loss

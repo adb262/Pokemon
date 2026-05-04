@@ -27,6 +27,9 @@ from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.model import VideoTokenizer
 from video_tokenization.training_args import VideoTokenizerTrainingConfig
+import torch._dynamo
+
+torch._dynamo.config.cache_size_limit = 64
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +38,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+VISUALIZATION_SEQUENCE_FRAMES = 5
 
 
 @dataclass
@@ -125,35 +130,30 @@ def train_epoch(
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
-    accumulated_loss = 0.0
+    accumulated_loss_gpu = torch.tensor(0.0, device=device)
+    microbatch_count = 0
     logged_codebook_tokens: list[torch.Tensor] = []
     saved_on_last_step = False
+    use_amp = config.use_bf16 and device.type == "cuda"
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp)
 
-    # ``enumerate(..., start=start_batch)`` keeps ``batch_idx`` aligned with
-    # the absolute position in the (full) epoch, so gradient accumulation,
-    # logging, and end-of-epoch detection all match a fresh-start run.
     for batch_idx, video_batch in enumerate(dataloader, start=start_batch):
         batch_start_time = time.time()
 
-        # Move to device
-        video_batch = video_batch.to(device)
+        video_batch = video_batch.to(device, non_blocking=True)
 
-        # Forward pass with decoder.
-        # Outputs a tensor of shape (batch_size, num_images_in_video, channels, image_height, image_width).
-        quantized = model.encode(video_batch)
-        decoded = model.decode(quantized)
-        codebook_tokens = model.quantized_value_to_codes(quantized.detach())
-        logged_codebook_tokens.append(codebook_tokens.detach().cpu())
+        with amp_ctx:
+            quantized = model.encode(video_batch)
+            decoded = model.decode(quantized)
+            codebook_tokens = model.quantized_value_to_codes(quantized.detach())
+            logged_codebook_tokens.append(codebook_tokens.detach())
 
-        # Calculate loss (reconstruction loss)
-        # Scale loss by accumulation steps for correct gradient averaging
-        loss = criterion(video_batch, decoded) / accumulation_steps
+            loss = criterion(video_batch, decoded) / accumulation_steps
 
-        # Backward pass (accumulate gradients)
         loss.backward()
 
-        # Track unscaled loss for logging
-        accumulated_loss += loss.item() * accumulation_steps
+        accumulated_loss_gpu += loss.detach() * accumulation_steps
+        microbatch_count += 1
 
         # Only step optimizer after accumulating enough gradients
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -165,13 +165,10 @@ def train_epoch(
             optimizer.zero_grad()
             saved_on_last_step = False
 
-            # Calculate average loss over accumulated steps
-            avg_accumulated_loss = accumulated_loss / min(
-                accumulation_steps, (batch_idx % accumulation_steps) + 1
-            )
+            avg_accumulated_loss = (accumulated_loss_gpu / microbatch_count).item()
             total_loss += avg_accumulated_loss
             codebook_token_window = (
-                torch.cat([tokens.reshape(-1) for tokens in logged_codebook_tokens], dim=0)
+                torch.cat([tokens.reshape(-1) for tokens in logged_codebook_tokens], dim=0).cpu()
                 if logged_codebook_tokens
                 else torch.empty(0, dtype=torch.long)
             )
@@ -180,12 +177,10 @@ def train_epoch(
             )
             batch_time = time.time() - batch_start_time
 
-            # Calculate global step (counts optimizer steps, not batches)
             global_step = epoch * (num_batches // accumulation_steps) + (
                 batch_idx // accumulation_steps
             )
 
-            # Log training metrics with system metrics.
             training_metrics = {
                 "train/loss": avg_accumulated_loss,
                 "train/learning_rate": scheduler.get_last_lr()[0],
@@ -202,7 +197,6 @@ def train_epoch(
 
             experiment_logger.log(training_metrics, step=global_step)
 
-            # Log progress
             if (batch_idx // accumulation_steps) % config.log_interval == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 logger.info(
@@ -214,8 +208,8 @@ def train_epoch(
                     f"Time: {batch_time:.2f}s"
                 )
 
-            # Reset accumulated loss
-            accumulated_loss = 0.0
+            accumulated_loss_gpu.zero_()
+            microbatch_count = 0
             logged_codebook_tokens = []
 
             # Save checkpoint + eval periodically (based on cumulative optimizer steps)
@@ -228,8 +222,9 @@ def train_epoch(
                 # save step (eval iterates multiple batches; train only has
                 # the current batch), so we always emit one image here and
                 # never accumulate across an epoch.
-                predicted_videos = convert_video_to_images(decoded)
-                expected_videos = convert_video_to_images(video_batch)
+                vis_frames = min(VISUALIZATION_SEQUENCE_FRAMES, video_batch.shape[1])
+                predicted_videos = convert_video_to_images(decoded[:, :vis_frames])
+                expected_videos = convert_video_to_images(video_batch[:, :vis_frames])
                 comparison_path = f"{save_dir}/train/epoch_{epoch}/batch_{batch_idx}/comparison_grid.png"
                 save_comparison_images(
                     predicted_videos, expected_videos, comparison_path
@@ -252,6 +247,7 @@ def train_epoch(
                     save_dir=config.save_dir,
                     global_step=global_step,
                     max_comparison_images=config.max_comparison_images,
+                    max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
                 )
 
                 improved = early_stopping_state.update(
@@ -355,11 +351,15 @@ def main(config: VideoTokenizerTrainingConfig):
     if experiment_logger and experiment_logger.tensorboard_log_dir is not None:
         logger.info(f"TensorBoard log dir: {experiment_logger.tensorboard_log_dir}")
 
-    # Set random seeds for reproducibility
+    # Enable TF32 and optimized matmul on supported GPUs
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
 
-    # Create device
     device = torch.device(config.device)
     logger.info(f"Using device: {device}")
 
@@ -432,6 +432,11 @@ def main(config: VideoTokenizerTrainingConfig):
     logger.info(
         f"Num params: {sum(p.numel() for p in model.parameters())} on device {device}"
     )
+
+    if config.use_compile and device.type == "cuda":
+        
+        model: VideoTokenizer = torch.compile(model, mode="reduce-overhead", dynamic=True)  # type: ignore[assignment]
+        logger.info("torch.compile enabled on tokenizer model")
 
     if experiment_logger:
         experiment_logger.watch(model, log="all", log_freq=config.log_interval * 10)
@@ -517,6 +522,7 @@ def main(config: VideoTokenizerTrainingConfig):
         save_dir=config.save_dir,
         global_step=0,
         max_comparison_images=config.max_comparison_images,
+        max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
     )
     logger.info(f"Test loss: {test_loss:.6f}")
 
@@ -567,6 +573,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 save_dir=config.save_dir,
                 global_step=global_step,
                 max_comparison_images=config.max_comparison_images,
+                max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
             )
             logger.info(f"Epoch {epoch} eval loss: {eval_loss:.6f}")
 

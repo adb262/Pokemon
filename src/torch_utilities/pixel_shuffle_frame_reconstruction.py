@@ -79,7 +79,7 @@ class UpsampleConvFrameHead(nn.Module):
         logger.debug(f"tokens shape: {tokens.shape}")
         x = self.pre_norm(tokens)
         x = rearrange(
-            tokens, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
+            x, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
         )
         logger.debug(f"x shape after rearrange: {x.shape}")
         x = self.grid_net(x)
