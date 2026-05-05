@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 MAX_ROLLOUT_STEPS = 5
 VISUALIZATION_SEQUENCE_FRAMES = 5
+MAX_EVAL_SAVED_IMAGES = 5
 
 
 def _prediction_boundary_window(
@@ -87,6 +88,10 @@ def _slice_actions_for_rollout_grid(
     action_start = max(frame_start - full_prediction_start_idx, 0)
     action_end = max(frame_stop - full_prediction_start_idx, 0)
     return actions[:, action_start:action_end]
+
+
+def _remaining_visualization_slots(saved_count: int) -> int:
+    return max(MAX_EVAL_SAVED_IMAGES - saved_count, 0)
 
 
 @torch.no_grad()
@@ -278,6 +283,7 @@ def evaluate_model(
     total_samples = 0
     saved_residual_image_paths: list[str] = []
     saved_reconstructed_image_paths: list[str] = []
+    saved_visualization_samples = 0
 
     # Collect real and reconstructed frames for FID/FVD computation
     real_frames_batches: list[torch.Tensor] = []
@@ -400,18 +406,27 @@ def evaluate_model(
                 # to predict residuals.
                 vis_frames = min(VISUALIZATION_SEQUENCE_FRAMES, video_batch.shape[1])
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
-                os.makedirs(batch_dir, exist_ok=True)
-                image_path = f"{batch_dir}/next_frame_comparison_grid.png"
+                image_path: str | None = None
                 residual_image_path: str | None = None
-                if vis_frames >= 2:
+                visualization_slots = _remaining_visualization_slots(
+                    saved_visualization_samples
+                )
+                num_visualized_samples = min(video_batch.shape[0], visualization_slots)
+                if vis_frames >= 2 and num_visualized_samples > 0:
+                    os.makedirs(batch_dir, exist_ok=True)
                     vis_transition_count = vis_frames - 1
                     predicted_videos = convert_video_to_images(
-                        reconstructed_next_frames[:, :vis_transition_count]
+                        reconstructed_next_frames[
+                            :num_visualized_samples, :vis_transition_count
+                        ]
                     )
                     expected_videos = convert_video_to_images(
-                        video_batch[:, :vis_frames]
+                        video_batch[:num_visualized_samples, :vis_frames]
                     )
-                    vis_action_tokens = action_tokens[:, :vis_transition_count]
+                    vis_action_tokens = action_tokens[
+                        :num_visualized_samples, :vis_transition_count
+                    ]
+                    image_path = f"{batch_dir}/next_frame_comparison_grid.png"
                     save_comparison_images_next_frame(
                         predicted_videos,
                         vis_action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
@@ -419,19 +434,25 @@ def evaluate_model(
                         batch_dir,
                     )
                     saved_reconstructed_image_paths.append(image_path)
+                    saved_visualization_samples += num_visualized_samples
 
                 if (
                     vis_frames >= 2
+                    and num_visualized_samples > 0
                     and predict_action_residuals
                     and reconstructed_residuals is not None
                 ):
                     target_residuals = video_batch[:, 1:, :, :, :] - video_batch[:, :-1, :, :, :]
                     target_residual_videos = convert_video_to_images(
-                        target_residuals[:, :vis_transition_count],
+                        target_residuals[
+                            :num_visualized_samples, :vis_transition_count
+                        ],
                         value_mode="signed_residual",
                     )
                     predicted_residual_videos = convert_video_to_images(
-                        reconstructed_residuals[:, :vis_transition_count],
+                        reconstructed_residuals[
+                            :num_visualized_samples, :vis_transition_count
+                        ],
                         value_mode="signed_residual",
                     )
                     residual_image_path = (
@@ -447,7 +468,7 @@ def evaluate_model(
                     )
                     saved_residual_image_paths.append(residual_image_path)
 
-                if experiment_logger:
+                if experiment_logger and image_path is not None:
                     experiment_logger.log_image(
                         f"{split}/comparison_{batch_idx}",
                         image_path,
@@ -459,15 +480,16 @@ def evaluate_model(
                             residual_image_path,
                             step=global_step,
                         )
-                logger.debug(
-                    "Saved comparison images to "
-                    f"{image_path}"
-                    + (
-                        f" and {residual_image_path}"
-                        if residual_image_path is not None
-                        else ""
+                if image_path is not None:
+                    logger.debug(
+                        "Saved comparison images to "
+                        f"{image_path}"
+                        + (
+                            f" and {residual_image_path}"
+                            if residual_image_path is not None
+                            else ""
+                        )
                     )
-                )
 
             except Exception as e:
                 traceback.print_exc()
@@ -670,6 +692,7 @@ def evaluate_model_rollout(
     T = config.num_images_in_video
     saved_rollout_image_paths: list[str] = []
     saved_teacher_forced_image_paths: list[str] = []
+    saved_visualization_samples = 0
 
     # Collect predicted / real / prev-frame slices across batches so we can
     # compute residual-coverage, PSNR, FID and FVD on the full prediction
@@ -745,86 +768,96 @@ def evaluate_model_rollout(
                     video_batch[:, T - 2 : 2 * T - 1].detach().cpu()
                 )
 
-                batch_dir = f"{eval_dir}/batch_{batch_idx}"
-                os.makedirs(batch_dir, exist_ok=True)
+                visualization_slots = _remaining_visualization_slots(
+                    saved_visualization_samples
+                )
+                num_visualized_samples = min(video_batch.shape[0], visualization_slots)
+                if num_visualized_samples > 0:
+                    batch_dir = f"{eval_dir}/batch_{batch_idx}"
+                    os.makedirs(batch_dir, exist_ok=True)
 
-                teacher_window, teacher_prediction_start = _prediction_boundary_window(
-                    video_batch.shape[1],
-                    T - 1,
-                )
-                teacher_forced_actions = _slice_actions_for_rollout_grid(
-                    actions_full[:, T - 2 :],
-                    T - 1,
-                    teacher_window,
-                )
-                gt_teacher_images = convert_video_to_images(
-                    video_batch[:, teacher_window]
-                )
-                teacher_forced_images = convert_video_to_images(
-                    teacher_forced_full[:, teacher_window]
-                )
-                save_rollout_comparison_grid(
-                    gt_videos=gt_teacher_images,
-                    predicted_videos=teacher_forced_images,
-                    predicted_actions=teacher_forced_actions.detach()
-                    .cpu()
-                    .numpy()
-                    .tolist(),
-                    output_dir=batch_dir,
-                    prediction_start_idx=teacher_prediction_start,
-                    file_suffix="teacher_forced_comparison_grid.png",
-                )
-
-                rollout_window, rollout_prediction_start = _prediction_boundary_window(
-                    video_batch.shape[1],
-                    T,
-                )
-                rollout_actions = _slice_actions_for_rollout_grid(
-                    actions_full[:, T - 1 :],
-                    T,
-                    rollout_window,
-                )
-                gt_rollout_images = convert_video_to_images(
-                    video_batch[:, rollout_window]
-                )
-                rollout_images = convert_video_to_images(
-                    predicted_full[:, rollout_window]
-                )
-                save_rollout_comparison_grid(
-                    gt_videos=gt_rollout_images,
-                    predicted_videos=rollout_images,
-                    predicted_actions=rollout_actions.detach()
-                    .cpu()
-                    .numpy()
-                    .tolist(),
-                    output_dir=batch_dir,
-                    prediction_start_idx=rollout_prediction_start,
-                )
-
-                rollout_image_path = f"{batch_dir}/rollout_comparison_grid.png"
-                teacher_forced_image_path = (
-                    f"{batch_dir}/teacher_forced_comparison_grid.png"
-                )
-                saved_rollout_image_paths.append(rollout_image_path)
-                saved_teacher_forced_image_paths.append(teacher_forced_image_path)
-
-                if experiment_logger:
-                    experiment_logger.log_image(
-                        f"{rollout_key}/comparison_{batch_idx}",
-                        rollout_image_path,
-                        step=global_step,
+                    teacher_window, teacher_prediction_start = (
+                        _prediction_boundary_window(
+                            video_batch.shape[1],
+                            T - 1,
+                        )
                     )
-                    experiment_logger.log_image(
-                        f"{teacher_forced_key}/comparison_{batch_idx}",
-                        teacher_forced_image_path,
-                        step=global_step,
+                    teacher_forced_actions = _slice_actions_for_rollout_grid(
+                        actions_full[:num_visualized_samples, T - 2 :],
+                        T - 1,
+                        teacher_window,
+                    )
+                    gt_teacher_images = convert_video_to_images(
+                        video_batch[:num_visualized_samples, teacher_window]
+                    )
+                    teacher_forced_images = convert_video_to_images(
+                        teacher_forced_full[:num_visualized_samples, teacher_window]
+                    )
+                    save_rollout_comparison_grid(
+                        gt_videos=gt_teacher_images,
+                        predicted_videos=teacher_forced_images,
+                        predicted_actions=teacher_forced_actions.detach()
+                        .cpu()
+                        .numpy()
+                        .tolist(),
+                        output_dir=batch_dir,
+                        prediction_start_idx=teacher_prediction_start,
+                        file_suffix="teacher_forced_comparison_grid.png",
                     )
 
-                logger.debug(
-                    "Saved rollout comparison to "
-                    f"{rollout_image_path} and teacher-forced comparison to "
-                    f"{teacher_forced_image_path}"
-                )
+                    rollout_window, rollout_prediction_start = (
+                        _prediction_boundary_window(
+                            video_batch.shape[1],
+                            T,
+                        )
+                    )
+                    rollout_actions = _slice_actions_for_rollout_grid(
+                        actions_full[:num_visualized_samples, T - 1 :],
+                        T,
+                        rollout_window,
+                    )
+                    gt_rollout_images = convert_video_to_images(
+                        video_batch[:num_visualized_samples, rollout_window]
+                    )
+                    rollout_images = convert_video_to_images(
+                        predicted_full[:num_visualized_samples, rollout_window]
+                    )
+                    save_rollout_comparison_grid(
+                        gt_videos=gt_rollout_images,
+                        predicted_videos=rollout_images,
+                        predicted_actions=rollout_actions.detach()
+                        .cpu()
+                        .numpy()
+                        .tolist(),
+                        output_dir=batch_dir,
+                        prediction_start_idx=rollout_prediction_start,
+                    )
+
+                    rollout_image_path = f"{batch_dir}/rollout_comparison_grid.png"
+                    teacher_forced_image_path = (
+                        f"{batch_dir}/teacher_forced_comparison_grid.png"
+                    )
+                    saved_rollout_image_paths.append(rollout_image_path)
+                    saved_teacher_forced_image_paths.append(teacher_forced_image_path)
+                    saved_visualization_samples += num_visualized_samples
+
+                    if experiment_logger:
+                        experiment_logger.log_image(
+                            f"{rollout_key}/comparison_{batch_idx}",
+                            rollout_image_path,
+                            step=global_step,
+                        )
+                        experiment_logger.log_image(
+                            f"{teacher_forced_key}/comparison_{batch_idx}",
+                            teacher_forced_image_path,
+                            step=global_step,
+                        )
+
+                    logger.debug(
+                        "Saved rollout comparison to "
+                        f"{rollout_image_path} and teacher-forced comparison to "
+                        f"{teacher_forced_image_path}"
+                    )
 
             except Exception as e:
                 traceback.print_exc()
@@ -1246,16 +1279,26 @@ def train_epoch(
                     )
 
                     train_residual_image_path: str | None = None
-                    if train_vis_frames >= 2:
+                    train_num_visualized_samples = min(
+                        video_batch.shape[0],
+                        MAX_EVAL_SAVED_IMAGES,
+                    )
+                    if train_vis_frames >= 2 and train_num_visualized_samples > 0:
                         train_vis_transition_count = train_vis_frames - 1
                         train_expected_videos = convert_video_to_images(
-                            video_batch[:, :train_vis_frames]
+                            video_batch[
+                                :train_num_visualized_samples, :train_vis_frames
+                            ]
                         )
                         train_predicted_videos = convert_video_to_images(
-                            train_next_frames[:, :train_vis_transition_count]
+                            train_next_frames[
+                                :train_num_visualized_samples,
+                                :train_vis_transition_count,
+                            ]
                         )
                         train_vis_action_tokens = train_action_tokens[
-                            :, :train_vis_transition_count
+                            :train_num_visualized_samples,
+                            :train_vis_transition_count,
                         ]
                         save_comparison_images_next_frame(
                             train_predicted_videos,
@@ -1269,16 +1312,26 @@ def train_epoch(
                             file_suffix="action_decoder_next_frame_comparison_grid.png",
                         )
 
-                    if train_vis_frames >= 2 and train_residuals is not None:
+                    if (
+                        train_vis_frames >= 2
+                        and train_num_visualized_samples > 0
+                        and train_residuals is not None
+                    ):
                         train_target_residuals = (
                             video_batch[:, 1:, :, :, :] - video_batch[:, :-1, :, :, :]
                         )
                         train_target_residual_videos = convert_video_to_images(
-                            train_target_residuals[:, :train_vis_transition_count],
+                            train_target_residuals[
+                                :train_num_visualized_samples,
+                                :train_vis_transition_count,
+                            ],
                             value_mode="signed_residual",
                         )
                         train_residual_videos = convert_video_to_images(
-                            train_residuals[:, :train_vis_transition_count],
+                            train_residuals[
+                                :train_num_visualized_samples,
+                                :train_vis_transition_count,
+                            ],
                             value_mode="signed_residual",
                         )
                         train_residual_image_path = (

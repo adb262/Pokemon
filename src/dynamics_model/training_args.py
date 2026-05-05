@@ -29,8 +29,8 @@ class DynamicsModelTrainingConfig:
     )
 
     log_interval: int = 10
-    save_interval: int = 1000
-    eval_interval: int = 1000
+    save_interval: int = 2000
+    eval_interval: int = 2000
     checkpoint_dir: str = "dynamics_model_checkpoints"
     save_dir: str = "dynamics_model_results"
 
@@ -95,7 +95,7 @@ class DynamicsModelTrainingConfig:
     # ``eval_interval * rollout_every_n_evals`` optimizer steps. Standard
     # (non-rollout) eval still runs every ``eval_interval`` steps. Defaults
     # to 1, which matches the previous behavior of rolling out on every eval.
-    rollout_every_n_evals: int = 5
+    rollout_every_n_evals: int = 2
 
     # Performance optimizations
     scheduled_sampling: Literal["bengio_per_frame", "free_run_mix", "off"] = "bengio_per_frame"
