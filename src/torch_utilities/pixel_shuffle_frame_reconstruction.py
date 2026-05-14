@@ -1,5 +1,6 @@
 import logging
 
+import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from einops import rearrange
@@ -85,6 +86,9 @@ class UpsampleConvFrameHead(nn.Module):
         x = F.interpolate(x, size=(self.H, self.W), mode="nearest")
         x = self.refine(x)
         x = self.to_pixels(x)
+        # Squash to [0, 1] so reconstructions live in the valid image range.
+        # With zero-bias init, sigmoid(0) = 0.5 -> mid-gray instead of black on the first eval.
+        x = torch.sigmoid(x)
         x = rearrange(x, "(b t) c h w -> b t c h w", b=B, t=T)
         logger.debug(f"x shape after final rearrange: {x.shape}")
         return x

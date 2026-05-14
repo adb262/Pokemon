@@ -4,6 +4,7 @@
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
@@ -16,11 +17,12 @@ from data.data_loaders.factory import build_datasets
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
 from data.s3.s3_utils import default_s3_manager
-from loss.loss_fns import reconstruction_loss
+from loss.loss_fns import clipped_l2_reconstruction_loss, reconstruction_loss
 from monitoring.codebook_usage import compute_codebook_usage
 from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.videos import convert_video_to_images, save_comparison_images
 from scripts.video_tokenizer.eval import eval_model
+from torch_utilities.initialize import init_weights
 from video_tokenization.checkpoints import save_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.model import VideoTokenizer
@@ -35,6 +37,66 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class EarlyStoppingState:
+    """Track eval-loss improvement at evaluation granularity.
+
+    The counter increments once per evaluation event (whether the eval ran
+    mid-epoch via ``eval_interval`` or at an epoch boundary) and resets on
+    any improvement strictly greater than ``min_delta``. ``patience`` is
+    therefore measured in evaluations, not epochs, so users can stop on
+    sub-epoch staleness when ``eval_interval`` divides epochs into many
+    evals.
+    """
+
+    best_loss: float = float("inf")
+    evals_without_improvement: int = 0
+
+    def update(self, eval_loss: float, min_delta: float) -> bool:
+        """Record an eval result and return ``True`` iff it improved the best."""
+        if eval_loss < self.best_loss - min_delta:
+            self.best_loss = eval_loss
+            self.evals_without_improvement = 0
+            return True
+        self.evals_without_improvement += 1
+        return False
+
+    def should_stop(self, patience: int) -> bool:
+        """``patience <= 0`` disables early stopping entirely."""
+        return patience > 0 and self.evals_without_improvement >= patience
+
+
+def build_reconstruction_criterion(
+    config: VideoTokenizerTrainingConfig,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Return the reconstruction loss callable selected by ``config``.
+
+    The returned callable matches the ``criterion(video, decoded)`` shape used
+    throughout the trainer/eval. ``clipped_l2`` floors the per-pixel MSE at
+    ``l2_clip_c / 255**2`` so trivial pixels can't drive the loss to zero,
+    mirroring the action-decoder ``clipped_l2`` option in the dynamics model.
+    """
+    if config.reconstruction_loss_type == "l2":
+        return reconstruction_loss
+
+    if config.reconstruction_loss_type == "clipped_l2":
+        l2_clip_c = config.l2_clip_c
+
+        def clipped_criterion(
+            video: torch.Tensor, decoded: torch.Tensor
+        ) -> torch.Tensor:
+            return clipped_l2_reconstruction_loss(
+                decoded,
+                video,
+                l2_clip_c=l2_clip_c,
+            )
+
+        return clipped_criterion
+    raise ValueError(
+        f"Unknown reconstruction_loss_type: {config.reconstruction_loss_type!r}"
+    )
+
+
 def train_epoch(
     model: VideoTokenizer,
     dataloader: VideoWindowLoader,
@@ -46,25 +108,25 @@ def train_epoch(
     epoch: int,
     config: VideoTokenizerTrainingConfig,
     experiment_logger: ExperimentLogger,
+    early_stopping_state: EarlyStoppingState,
     start_batch: int = 0,
     save_dir: str = "tokenization_results",
 ):
     total_loss = 0.0
     num_batches = len(dataloader)
-    best_loss = float("inf")
     accumulation_steps = config.gradient_accumulation_steps
+    should_early_stop = False
 
     # Set up resumable dataloader
     if start_batch > 0:
         dataloader.resumable_loader.set_epoch(epoch)
         dataloader.resumable_loader.current_batch = start_batch
 
-    os.makedirs(f"{save_dir}/train/epoch_{epoch}", exist_ok=True)
-
     epoch_start_time = time.time()
     batch_start_time = time.time()
     accumulated_loss = 0.0
     logged_codebook_tokens: list[torch.Tensor] = []
+    saved_on_last_step = False
 
     for batch_idx, video_batch in enumerate(dataloader):
         # Skip batches if resuming
@@ -101,6 +163,7 @@ def train_epoch(
             optimizer.step()
             scheduler.step()  # Step scheduler every optimizer step for cosine annealing
             optimizer.zero_grad()
+            saved_on_last_step = False
 
             # Calculate average loss over accumulated steps
             avg_accumulated_loss = accumulated_loss / min(
@@ -155,28 +218,31 @@ def train_epoch(
             accumulated_loss = 0.0
             logged_codebook_tokens = []
 
-            # Save checkpoint periodically (based on optimizer steps)
-            optimizer_step = batch_idx // accumulation_steps
-            if optimizer_step > 0 and optimizer_step % config.save_interval == 0:
+            # Save checkpoint + eval periodically (based on cumulative optimizer steps)
+            if global_step > 0 and global_step % config.eval_interval == 0:
                 dataloader_state = dataloader.get_state()
-                is_best = avg_accumulated_loss < best_loss
-                if is_best:
-                    best_loss = avg_accumulated_loss
+                saved_on_last_step = True
 
+                # Save one fresh train comparison_grid per eval step. The
+                # ``max_comparison_images`` cap applies *within* a single
+                # save step (eval iterates multiple batches; train only has
+                # the current batch), so we always emit one image here and
+                # never accumulate across an epoch.
                 predicted_videos = convert_video_to_images(decoded)
                 expected_videos = convert_video_to_images(video_batch)
-                comparison_path = f"{save_dir}/train/epoch_{epoch}_batch_{batch_idx}/comparison_grid.png"
+                comparison_path = f"{save_dir}/train/epoch_{epoch}/batch_{batch_idx}/comparison_grid.png"
                 save_comparison_images(
                     predicted_videos, expected_videos, comparison_path
                 )
 
-                experiment_logger.log_image(
-                    "train/comparison",
-                    comparison_path,
+                experiment_logger.log_image_batches(
+                    key_prefix="train/comparison",
+                    image_paths=[comparison_path],
+                    batch_size=config.max_comparison_images,
                     step=global_step,
                 )
 
-                eval_model(
+                eval_loss = eval_model(
                     model,
                     test_dataloader,
                     criterion,
@@ -185,7 +251,27 @@ def train_epoch(
                     wandb_logger=experiment_logger,
                     save_dir=config.save_dir,
                     global_step=global_step,
+                    max_comparison_images=config.max_comparison_images,
                 )
+
+                improved = early_stopping_state.update(
+                    eval_loss, config.early_stopping_min_delta
+                )
+                if improved:
+                    logger.info(
+                        f"New best eval loss: {early_stopping_state.best_loss:.6f} "
+                        f"(step {global_step})"
+                    )
+                elif config.early_stopping_patience > 0:
+                    remaining = (
+                        config.early_stopping_patience
+                        - early_stopping_state.evals_without_improvement
+                    )
+                    logger.info(
+                        f"No eval improvement for "
+                        f"{early_stopping_state.evals_without_improvement} eval(s) "
+                        f"(stopping in {max(remaining, 0)} more)"
+                    )
 
                 save_checkpoint(
                     model,
@@ -195,9 +281,26 @@ def train_epoch(
                     batch_idx,
                     avg_accumulated_loss,
                     config,
-                    best_loss,
+                    early_stopping_state.best_loss,
                     dataloader_state,
                 )
+
+                if early_stopping_state.should_stop(config.early_stopping_patience):
+                    logger.info(
+                        f"Early stopping triggered at step {global_step} "
+                        f"(best eval loss: {early_stopping_state.best_loss:.6f})"
+                    )
+                    if experiment_logger:
+                        experiment_logger.log(
+                            {
+                                "train/early_stopped": 1,
+                                "train/early_stopped_step": global_step,
+                                "train/early_stopped_epoch": epoch,
+                            },
+                            step=global_step,
+                        )
+                    should_early_stop = True
+                    break
 
     # Calculate average loss over optimizer steps
     num_optimizer_steps = num_batches // accumulation_steps
@@ -217,7 +320,7 @@ def train_epoch(
     logger.info(
         f"Epoch {epoch} completed. Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s"
     )
-    return avg_loss, global_step
+    return avg_loss, global_step, saved_on_last_step, should_early_stop
 
 
 def main(config: VideoTokenizerTrainingConfig):
@@ -270,7 +373,9 @@ def main(config: VideoTokenizerTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    train_dataset, test_dataset = build_datasets(config, local_cache)
+    train_dataset, test_dataset = build_datasets(
+        config, local_cache, test_limit=config.test_dataset_limit
+    )
 
     logger.info(f"Creating data loader with {len(train_dataset)} videos...")
     train_dataloader = VideoWindowLoader(
@@ -374,8 +479,15 @@ def main(config: VideoTokenizerTrainingConfig):
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Total optimizer steps: {total_steps}")
 
-    # Loss function
-    criterion = reconstruction_loss
+    criterion = build_reconstruction_criterion(config)
+    logger.info(
+        f"Reconstruction loss: {config.reconstruction_loss_type}"
+        + (
+            f" (l2_clip_c={config.l2_clip_c})"
+            if config.reconstruction_loss_type == "clipped_l2"
+            else ""
+        )
+    )
     s3_manager = default_s3_manager
 
     # Resume from checkpoint if specified
@@ -383,7 +495,16 @@ def main(config: VideoTokenizerTrainingConfig):
     start_batch = 0
     # Training loop
     logger.info("Starting training loop...")
-    best_loss = float("inf")
+    early_stopping_state = EarlyStoppingState()
+    if config.early_stopping_patience > 0:
+        logger.info(
+            f"Early stopping enabled: patience={config.early_stopping_patience} "
+            f"eval(s), min_delta={config.early_stopping_min_delta}"
+        )
+
+    # Apply our init scheme before any eval so the pre-training eval reflects
+    # the same initialization used during training.
+    model.apply(init_weights)
 
     # first, evaluate on test dataset
     test_loss = eval_model(
@@ -395,15 +516,19 @@ def main(config: VideoTokenizerTrainingConfig):
         wandb_logger=experiment_logger,
         save_dir=config.save_dir,
         global_step=0,
+        max_comparison_images=config.max_comparison_images,
     )
     logger.info(f"Test loss: {test_loss:.6f}")
 
     try:
         model.train()
+        avg_loss = float("inf")
+        global_step = 0
+        epoch = start_epoch
         for epoch in range(start_epoch, config.num_epochs):
             epoch_start_batch = start_batch if epoch == start_epoch else 0
 
-            avg_loss, global_step = train_epoch(
+            avg_loss, global_step, saved_on_last_step, should_early_stop = train_epoch(
                 model,
                 train_dataloader,
                 test_dataloader,
@@ -414,9 +539,23 @@ def main(config: VideoTokenizerTrainingConfig):
                 epoch,
                 config,
                 experiment_logger,
+                early_stopping_state,
                 epoch_start_batch,
                 config.save_dir,
             )
+            if should_early_stop:
+                break
+
+            # Skip the post-epoch eval when the periodic eval already ran on
+            # the final optimizer step of this epoch — otherwise we'd
+            # double-count an evaluation against the patience counter.
+            if saved_on_last_step:
+                logger.info(
+                    f"Skipping post-epoch eval at step {global_step}: "
+                    "periodic eval already ran on the last optimizer step."
+                )
+                model.train()
+                continue
 
             eval_loss = eval_model(
                 model,
@@ -427,12 +566,18 @@ def main(config: VideoTokenizerTrainingConfig):
                 wandb_logger=experiment_logger,
                 save_dir=config.save_dir,
                 global_step=global_step,
+                max_comparison_images=config.max_comparison_images,
             )
-            logger.info(f"Test loss: {eval_loss:.6f}")
+            logger.info(f"Epoch {epoch} eval loss: {eval_loss:.6f}")
 
-            if eval_loss < best_loss:
-                best_loss = eval_loss
-
+            improved = early_stopping_state.update(
+                eval_loss, config.early_stopping_min_delta
+            )
+            if improved:
+                logger.info(
+                    f"New best eval loss: {early_stopping_state.best_loss:.6f} "
+                    f"(epoch {epoch})"
+                )
                 save_checkpoint(
                     model,
                     optimizer,
@@ -441,9 +586,37 @@ def main(config: VideoTokenizerTrainingConfig):
                     len(train_dataloader),
                     avg_loss,
                     config,
-                    best_loss,
+                    early_stopping_state.best_loss,
                     train_dataloader.get_state(),
                 )
+            elif config.early_stopping_patience > 0:
+                remaining = (
+                    config.early_stopping_patience
+                    - early_stopping_state.evals_without_improvement
+                )
+                logger.info(
+                    f"No eval improvement for "
+                    f"{early_stopping_state.evals_without_improvement} eval(s) "
+                    f"(stopping in {max(remaining, 0)} more)"
+                )
+
+            if early_stopping_state.should_stop(config.early_stopping_patience):
+                logger.info(
+                    f"Early stopping triggered after epoch {epoch} "
+                    f"(best eval loss: {early_stopping_state.best_loss:.6f})"
+                )
+                if experiment_logger:
+                    experiment_logger.log(
+                        {
+                            "train/early_stopped": 1,
+                            "train/early_stopped_step": global_step,
+                            "train/early_stopped_epoch": epoch,
+                        },
+                        step=global_step,
+                    )
+                break
+
+            model.train()
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -457,7 +630,7 @@ def main(config: VideoTokenizerTrainingConfig):
             train_dataloader.resumable_loader.current_batch,
             avg_loss,
             config,
-            best_loss,
+            early_stopping_state.best_loss,
             dataloader_state,
         )
     except Exception as e:
@@ -478,7 +651,7 @@ def main(config: VideoTokenizerTrainingConfig):
             shutil.rmtree(config._temp_tensorboard_dir)
 
     logger.info("Training completed!")
-    logger.info(f"Best loss achieved: {best_loss:.6f}")
+    logger.info(f"Best loss achieved: {early_stopping_state.best_loss:.6f}")
 
     if config.use_s3 and s3_manager:
         logger.info(

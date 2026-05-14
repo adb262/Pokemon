@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from latent_action_model.patch_embedding import PatchEmbeddingConv
+from latent_action_model.patch_embedding import PatchEmbedding, PatchEmbeddingConv
 from quantization.base import BaseQuantizer
 from quantization.fsq import FiniteScalarQuantizer
 from quantization.nsvq import NSVQ
@@ -42,6 +42,14 @@ class LatentActionVQVAE(nn.Module):
         zero_init_output_head: bool = False,
     ):
         super(LatentActionVQVAE, self).__init__()
+
+
+        device = torch.device("cpu")
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+
         self.num_images_in_video = num_images_in_video
         self.image_height = image_height
         self.image_width = image_width
@@ -49,15 +57,11 @@ class LatentActionVQVAE(nn.Module):
         self.patch_height = patch_height
         self.patch_width = patch_width
 
-        self.embed_image_patches = PatchEmbeddingConv(
+        self.embed_image_patches = PatchEmbedding(
+            num_images_in_video=num_images_in_video,
             channels=channels,
-            patch_size=patch_height,
-            d_model=d_model,
-        )
-
-        self.embed_image_patches_decoder = PatchEmbeddingConv(
-            channels=channels,
-            patch_size=patch_height,
+            patch_height=patch_height,
+            patch_width=patch_width,
             d_model=d_model,
         )
 
@@ -66,20 +70,19 @@ class LatentActionVQVAE(nn.Module):
             num_heads=num_heads,
             d_model=d_model,
             num_layers=num_layers,
-            use_spatial_transformer=use_spatial_transformer,
-            use_temporal_transformer=use_temporal_transformer,
+            use_spatial_transformer=True,
+            use_temporal_transformer=True,
         )
-        self.layer_norm = nn.LayerNorm(d_model)
+
+        self.embed_image_patches_decoder = PatchEmbeddingConv(
+            channels=channels,
+            patch_size=patch_height,
+            d_model=d_model,
+        )
 
         num_patches_h = image_height // patch_height
         num_patches_w = image_width // patch_width
         self.num_patches_per_image = num_patches_h * num_patches_w
-
-        device = torch.device("cpu")
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
 
         self.quantizer_type = quantizer_type
 
@@ -98,7 +101,7 @@ class LatentActionVQVAE(nn.Module):
         elif quantizer_type == "fsq":
             self.quantizer = FiniteScalarQuantizer(
                 levels=bins,
-                embedding_dim=2 * d_model,
+                embedding_dim=embedding_dim,
                 device=device,
             )
         else:
@@ -122,17 +125,11 @@ class LatentActionVQVAE(nn.Module):
             H=image_height,
             W=image_width,
         )
-        self.reconstruct = nn.Sequential(
-            nn.LayerNorm(d_model),
-            self.decoder_transformer,
-            nn.LayerNorm(d_model),
-            self.patch_to_pixels,
-        )
+
+        self.pre_action_norm = nn.RMSNorm(d_model)
         self.action_head = nn.Sequential(
-            nn.LayerNorm(d_model),
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
-            nn.LayerNorm(4 * d_model),
             nn.Linear(4 * d_model, len(bins))
         )
 
@@ -140,9 +137,9 @@ class LatentActionVQVAE(nn.Module):
         # Beware, do not add a layer norm here. It will cause the action to be normalized to 0
         # when len(bins) is 1.
         self.action_projection = nn.Sequential(
-            nn.Linear(len(bins), 4 * d_model),
+            nn.Linear(len(bins), d_model // 2),
             nn.GELU(),
-            nn.Linear(4 * d_model, d_model)
+            nn.Linear(d_model // 2, d_model)
         )
         # self.center_indices = get_center_patch_indices(
         #     image_height, patch_height, image_width, patch_width, device
@@ -169,9 +166,23 @@ class LatentActionVQVAE(nn.Module):
         # logger.debug(
         #     f"decoded shape: {decoded.shape}"
         # )  # Decoder outputs a single frame (B, C, H, W)
-        patched_video_for_decoder = self.embed_image_patches_decoder(video)
+        patched_video_for_decoder = self.embed_image_patches_decoder(video[:, :-1, :, :])
 
-        return self.reconstruct(self.project_quantized_actions_fsq(quantized, patched_video_for_decoder))
+        logger.debug(f"patched_video_for_decoder shape: {patched_video_for_decoder.shape}")
+
+        action_projected = self.action_projection(quantized)
+        logger.debug(f"action_projected shape: {action_projected.shape}")
+
+        x = patched_video_for_decoder + action_projected.unsqueeze(2)
+        logger.debug(f"x shape: {x.shape}")
+
+        x = self.decoder_transformer(x)
+        logger.debug(f"x shape after decoder_transformer: {x.shape}")
+
+        x = self.patch_to_pixels(x)
+        logger.debug(f"x shape after patch_to_pixels: {x.shape}")
+
+        return x
 
     def encode_with_fsq(self, video: torch.Tensor) -> torch.Tensor:
         # video is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
@@ -203,7 +214,7 @@ class LatentActionVQVAE(nn.Module):
         # x_encoded_concat = rearrange(x_encoded_concat, "b t p d -> b t (p d)", d=self.d_model * 2)
 
         # New shape is 
-        x_encoded_mean = self.action_head(residuals)
+        x_encoded_mean = self.action_head(self.pre_action_norm(residuals))
 
         logger.debug(f"x_encoded_mean shape: {x_encoded_mean.shape}")
         quantized = self.quantizer(x_encoded_mean)

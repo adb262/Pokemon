@@ -137,24 +137,26 @@ Tried weighting based on white pixelation but that collapsed quickly. We were ab
 
 Pong tokenizer
 ```
-CUDA_VISIBLE_DEVICES=4 python -m scripts.video_tokenizer.train \
+CUDA_VISIBLE_DEVICES=7 python -m scripts.video_tokenizer.train \
   --dataset_type atari_pong \
   --atari_pong_data_dir data/atari_pong \
   --atari_pong_require_full_gameplay \
-  --image_size 128 \
+  --image_size 84 \
   --patch_size 4 \
   --num_images_in_video 5 \
-  --batch_size 4 \
-  --gradient_accumulation_steps 8 \
-  --num_epochs 1000 \
+  --batch_size 32 \
+  --num_epochs 3 \
   --dataset_limit 1_000_000 \
   --bins 8 8 6 5 \
-  --save_dir fsq_tokenizer_atari_pong \
-  --checkpoint_dir fsq_tokenizer_atari_pong \
+  --save_dir fsq_tokenizer_atari_pong_large_ds_clipped \
+  --checkpoint_dir fsq_tokenizer_atari_pong_large_ds_clipped \
   --logging-backend tensorboard \
-  --tensorboard_dir runs \
-  --experiment_name fsq_tokenizer_atari_pong_5_frames \
-  > fsq_tokenizer_atari_pong.log 2>&1
+  --tensorboard_dir tokenizer_runs \
+  --experiment_name fsq_tokenizer_atari_pong_5_frames_large_ds_clipped \
+  --reconstruction_loss_type clipped_l2 --l2_clip_c 10.0 \
+  --early_stopping_patience 10 \
+  --early_stopping_min_delta 1e-5 \
+  > fsq_tokenizer_atari_pong_ds_clipped.log 2>&1
 ```
 
 TODO:
@@ -199,7 +201,18 @@ CUDA_VISIBLE_DEVICES=4 python -m scripts.dynamics_model.train --dataset_type ata
 
 CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 1000 --dataset_limit 100 --save_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --predict-action-residuals --action-decoder-loss clipped_l2 --action-l2-clip-c 10 --dynamics-token-loss clipped_ce --dynamics-ce-clip-c 0.03 --experiment-name clipped_residual_zero > naive_residual_clipped_zero.log 2>&1
 
-CUDA_VISIBLE_DEVICES=4 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 1000 --dataset_limit 100 --save_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --predict-action-residuals --action-decoder-loss clipped_l2 --action-l2-clip-c 10 --dynamics-token-loss clipped_ce --dynamics-ce-clip-c 0.03 --experiment-name clipped_residual_new_head  > naive_residual_clipped_new_head.log 2>&1
+CUDA_VISIBLE_DEVICES=7 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 8 --gradient_accumulation_steps 8 --num_epochs 1000 --dataset_limit 100 --save_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --predict-action-residuals --action-decoder-loss clipped_l2 --action-l2-clip-c 10 --dynamics-token-loss clipped_ce --dynamics-ce-clip-c 0.03 --experiment-name clipped_residual_new_head  > naive_residual_clipped_new_head.log 2>&1
+
+
+CUDA_VISIBLE_DEVICES=6 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 8 --gradient_accumulation_steps 2 --num_epochs 1000 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_lower_lr --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_lower_lr --action_d_model 256 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_lower_lr  > dynamics_model_pong_w_tokenizer_v2_lower_lr.log 2>&1
+
+CUDA_VISIBLE_DEVICES=4 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 16 --batch_size 4 --gradient_accumulation_steps 6 --num_epochs 2 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_256_action_w_corrected_upsample_dim_and_patch_16 --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_256_action_w_corrected_upsample_dim_and_patch_16 --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_256_action_w_corrected_upsample_dim_and_patch_16  > dynamics_model_pong_w_tokenizer_v2_256_action_w_corrected_upsample_dim_and_patch_16.log 2>&1
+
 
 Retrain decoder
 
+
+- Early stopping for LAM
+- Norms and residuals fixed in LAM
+- Remove pre-norm on PatchEmbedding
+- Switch to RMSNorm

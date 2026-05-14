@@ -92,6 +92,41 @@ def convert_video_to_images(
     return images
 
 
+def _draw_grid_overlay(
+    ax,
+    image: Image.Image,
+    *,
+    num_divisions: int = 8,
+    color: str = "cyan",
+    alpha: float = 0.35,
+    linewidth: float = 0.5,
+    linestyle: str = ":",
+) -> None:
+    """Overlay a faint grid on an image axis to make spatial motion visible.
+
+    Lines are drawn between cells (no border lines), so the original frame
+    boundary is preserved.
+    """
+    width, height = image.size
+    for i in range(1, num_divisions):
+        x = i * (width / num_divisions) - 0.5
+        ax.axvline(
+            x=x,
+            color=color,
+            alpha=alpha,
+            linewidth=linewidth,
+            linestyle=linestyle,
+        )
+        y = i * (height / num_divisions) - 0.5
+        ax.axhline(
+            y=y,
+            color=color,
+            alpha=alpha,
+            linewidth=linewidth,
+            linestyle=linestyle,
+        )
+
+
 def save_comparison_images_next_frame(
     predicted_videos: list[list[Image.Image]],
     predicted_actions: list[list[float]],
@@ -152,22 +187,22 @@ def save_comparison_images_next_frame(
             # The 'predicted next frame' is also frame j (in predicted_videos)
             predicted_image = predicted_video[col]
 
-            # Row 0: original
-            axs[row_offset + 0, col].imshow(original_image)
+            axs[row_offset + 0, col].imshow(original_image, interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 0, col], original_image)
             axs[row_offset + 0, col].axis("off")
             if col == 0:
                 axs[row_offset + 0, col].set_ylabel(
                     f"Sample {sample_idx}\nOriginal", fontsize=10
                 )
 
-            # Row 1: expected next
-            axs[row_offset + 1, col].imshow(expected_image)
+            axs[row_offset + 1, col].imshow(expected_image, interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 1, col], expected_image)
             axs[row_offset + 1, col].axis("off")
             if col == 0:
                 axs[row_offset + 1, col].set_ylabel("Expected Next", fontsize=10)
 
-            # Row 2: predicted next
-            axs[row_offset + 2, col].imshow(predicted_image)
+            axs[row_offset + 2, col].imshow(predicted_image, interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 2, col], predicted_image)
             axs[row_offset + 2, col].axis("off")
             if col == 0:
                 axs[row_offset + 2, col].set_ylabel(predicted_label, fontsize=10)
@@ -243,24 +278,32 @@ def save_residual_comparison_images(
             ground_truth_residual_image = ground_truth_residual_video[col]
             predicted_residual_image = predicted_residual_video[col]
 
-            axs[row_offset + 0, col].imshow(original_image)
+            axs[row_offset + 0, col].imshow(original_image, interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 0, col], original_image)
             axs[row_offset + 0, col].axis("off")
             if col == 0:
                 axs[row_offset + 0, col].set_ylabel(
                     f"Sample {sample_idx}\nOriginal", fontsize=10
                 )
 
-            axs[row_offset + 1, col].imshow(expected_image)
+            axs[row_offset + 1, col].imshow(expected_image, interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 1, col], expected_image)
             axs[row_offset + 1, col].axis("off")
             if col == 0:
                 axs[row_offset + 1, col].set_ylabel("Expected Next", fontsize=10)
 
-            axs[row_offset + 2, col].imshow(ground_truth_residual_image)
+            axs[row_offset + 2, col].imshow(
+                ground_truth_residual_image, interpolation="nearest"
+            )
+            _draw_grid_overlay(axs[row_offset + 2, col], ground_truth_residual_image)
             axs[row_offset + 2, col].axis("off")
             if col == 0:
                 axs[row_offset + 2, col].set_ylabel("GT Residual", fontsize=10)
 
-            axs[row_offset + 3, col].imshow(predicted_residual_image)
+            axs[row_offset + 3, col].imshow(
+                predicted_residual_image, interpolation="nearest"
+            )
+            _draw_grid_overlay(axs[row_offset + 3, col], predicted_residual_image)
             axs[row_offset + 3, col].axis("off")
             if col == 0:
                 axs[row_offset + 3, col].set_ylabel("Predicted Residual", fontsize=10)
@@ -321,8 +364,8 @@ def save_rollout_comparison_grid(
         row_offset = sample_idx * 2
 
         for col in range(total_cols):
-            # Row 0: ground truth
-            axs[row_offset, col].imshow(gt[col])
+            axs[row_offset, col].imshow(gt[col], interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset, col], gt[col])
             axs[row_offset, col].axis("off")
             if col == 0:
                 axs[row_offset, col].set_ylabel(
@@ -330,7 +373,8 @@ def save_rollout_comparison_grid(
                 )
 
             # Row 1: predicted (context region = raw GT, rollout region = model predictions)
-            axs[row_offset + 1, col].imshow(pred[col])
+            axs[row_offset + 1, col].imshow(pred[col], interpolation="nearest")
+            _draw_grid_overlay(axs[row_offset + 1, col], pred[col])
             axs[row_offset + 1, col].axis("off")
             if col == 0:
                 axs[row_offset + 1, col].set_ylabel("Predicted", fontsize=10)
@@ -406,11 +450,13 @@ def save_comparison_images(
             # The 'predicted frame' is also frame j (in predicted_videos)
             predicted_image = predicted_video[j]
 
-            axs[i, j * 2].imshow(original_image)
+            axs[i, j * 2].imshow(original_image, interpolation="nearest")
+            _draw_grid_overlay(axs[i, j * 2], original_image)
             axs[i, j * 2].set_title(f"Orig S{i}F{j}")
             axs[i, j * 2].axis("off")
 
-            axs[i, j * 2 + 1].imshow(predicted_image)
+            axs[i, j * 2 + 1].imshow(predicted_image, interpolation="nearest")
+            _draw_grid_overlay(axs[i, j * 2 + 1], predicted_image)
             axs[i, j * 2 + 1].set_title(f"Pred S{i}F{j}")
             axs[i, j * 2 + 1].axis("off")
 

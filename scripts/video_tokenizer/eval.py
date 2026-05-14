@@ -33,6 +33,7 @@ def eval_model(
     wandb_logger: ExperimentLogger,
     save_dir: str = "tokenization_results",
     global_step: int | None = None,
+    max_comparison_images: int = 5,
 ):
     model.eval()
     total_loss = 0.0
@@ -63,15 +64,16 @@ def eval_model(
                 real_next_frames_batches.append(video_batch.detach().cpu())
                 pred_next_frames_batches.append(decoded.detach().cpu())
 
-            # Save the image locally
+            # Save the image locally up to max_comparison_images
             # View as (b, num_frames, h, w, c)
             # Decoded is the residual, must add the previous frame to get the predicted frame
-            predicted_videos = convert_video_to_images(decoded)
-            expected_videos = convert_video_to_images(video_batch)
-            image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
-            save_comparison_images(predicted_videos, expected_videos, image_path)
-            saved_image_paths.append(image_path)
-            logger.info(f"Saved comparison image to {image_path}")
+            if len(saved_image_paths) < max_comparison_images:
+                predicted_videos = convert_video_to_images(decoded)
+                expected_videos = convert_video_to_images(video_batch)
+                image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
+                save_comparison_images(predicted_videos, expected_videos, image_path)
+                saved_image_paths.append(image_path)
+                logger.info(f"Saved comparison image to {image_path}")
 
             total_loss += loss.item() * video_batch.size(0)
             total_samples += video_batch.size(0)
@@ -194,7 +196,9 @@ def main(config: VideoTokenizerTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    train_dataset, test_dataset = build_datasets(config, local_cache)
+    train_dataset, test_dataset = build_datasets(
+        config, local_cache, test_limit=config.test_dataset_limit
+    )
 
     logger.info("Creating data loader...")
     train_dataloader = VideoWindowLoader(

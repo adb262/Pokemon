@@ -19,7 +19,7 @@ class DynamicsModelTrainingConfig:
     gradient_accumulation_steps: int = 1
     num_epochs: int = 3
     warmup_steps: int = 100
-    min_learning_rate: float = 1e-7
+    min_learning_rate: float = 1e-6
     device: str = (
         "mps"
         if torch.backends.mps.is_available()
@@ -29,13 +29,13 @@ class DynamicsModelTrainingConfig:
     )
 
     log_interval: int = 10
-    save_interval: int = 600
-    eval_interval: int = 200
+    save_interval: int = 500
+    eval_interval: int = 500
     checkpoint_dir: str = "dynamics_model_checkpoints"
     save_dir: str = "dynamics_model_results"
 
     # Action model configuration
-    action_bins: list[int] = field(default_factory=lambda: [6, 3])
+    action_bins: list[int] = field(default_factory=lambda: [6, 4])
     action_d_model: int = 256
     action_num_transformer_layers: int = 4
     action_num_heads: int = 2
@@ -43,7 +43,7 @@ class DynamicsModelTrainingConfig:
 
     # Dynamics model configuration
     dynamics_d_model: int = 512
-    dynamics_num_transformer_layers: int = 12
+    dynamics_num_transformer_layers: int = 8
     dynamics_num_heads: int = 8
 
     # When True, the latent-action model's decoder output is interpreted as
