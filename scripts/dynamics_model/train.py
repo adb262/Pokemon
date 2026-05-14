@@ -51,6 +51,31 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
+def get_top_code_counts(
+    action_tokens: torch.Tensor, vocab_size: int, top_k: int = 10
+) -> list[tuple[int, int]]:
+    """Return the most frequently used action-code ids and their counts."""
+    flat_tokens = action_tokens.reshape(-1).long().cpu()
+    if flat_tokens.numel() == 0 or vocab_size <= 0:
+        return []
+
+    counts = torch.bincount(flat_tokens, minlength=vocab_size)
+    top_counts, top_indices = torch.topk(counts, k=min(top_k, vocab_size))
+    return [
+        (int(code_idx), int(code_count))
+        for code_idx, code_count in zip(top_indices.tolist(), top_counts.tolist())
+        if code_count > 0
+    ]
+
+
+def format_top_code_counts(top_code_counts: list[tuple[int, int]]) -> str:
+    """Format top code-count pairs for compact logging."""
+    if not top_code_counts:
+        return "none"
+    return ", ".join(f"{code_idx}:{code_count}" for code_idx, code_count in top_code_counts)
+
+
+@torch.no_grad()
 def maskgit_predict_last_frame(
     model: DynamicsModel,
     video_batch: torch.Tensor,
@@ -123,7 +148,7 @@ def evaluate_model(
 
             try:
                 video_batch = video_batch.to(device)
-                decoded, token_loss, action_loss = model(video_batch)
+                decoded, token_loss, action_loss, action_tokens = model(video_batch)
 
                 total_token_loss += token_loss.item() * video_batch.size(0)
                 total_action_loss += action_loss.item() * video_batch.size(0)
@@ -132,7 +157,6 @@ def evaluate_model(
                 # Get reconstructed video from action model for FID/FVD
                 # The action model reconstructs frames 1:T from frames 0:T-1
                 action_encoded = model.action_model.encode(video_batch)
-                action_tokens = model.action_model.get_action_sequence(action_encoded)
                 reconstructed_video = model.action_model.decode(video_batch, action_encoded)
 
                 # Real target frames: video[:, 1:, :, :, :]
@@ -531,6 +555,7 @@ def train_epoch(
 
     epoch_start_time = time.time()
     action_loss_acc, token_loss_acc = [], []
+    logged_action_tokens: list[torch.Tensor] = []
     dynamics_optimizer.zero_grad()
 
     for batch_idx, video_batch in enumerate(train_dataloader):
@@ -544,7 +569,7 @@ def train_epoch(
         video_batch = video_batch.to(device)
 
         # Forward pass - MaskGIT returns (predictions, token_loss, action_loss)
-        decoded, token_loss, action_loss = dynamics_model(video_batch)
+        decoded, token_loss, action_loss, action_tokens = dynamics_model(video_batch)
 
         # Scale each microbatch by the size of its accumulation window so the
         # accumulated gradient matches the corresponding large-batch mean.
@@ -554,6 +579,7 @@ def train_epoch(
         combined_loss.backward()
         token_loss_acc.append(token_loss.item())
         action_loss_acc.append(action_loss.item())
+        logged_action_tokens.append(action_tokens.detach().cpu())
 
         # Only step optimizer after accumulating enough gradients
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -571,6 +597,17 @@ def train_epoch(
             avg_action_loss = sum(action_loss_acc) / len(action_loss_acc)
             total_loss = avg_token_loss + avg_action_loss
             total_optimizer_step_loss += total_loss
+            action_token_window = (
+                torch.cat([tokens.reshape(-1) for tokens in logged_action_tokens], dim=0)
+                if logged_action_tokens
+                else torch.empty(0, dtype=torch.long)
+            )
+            action_codebook_usage = compute_codebook_usage(
+                action_token_window, action_model.action_vocab_size
+            )
+            top_code_counts = get_top_code_counts(
+                action_token_window, action_model.action_vocab_size
+            )
 
             batch_time = time.time() - batch_start_time
 
@@ -587,6 +624,13 @@ def train_epoch(
                     "train/batch_time": batch_time,
                     "train/epoch": epoch,
                     "train/batch": batch_idx,
+                    "train/action_codebook_usage_fraction": action_codebook_usage["usage_fraction"],
+                    "train/action_codebook_perplexity": action_codebook_usage["perplexity"],
+                    "train/action_codebook_normalized_entropy": action_codebook_usage[
+                        "normalized_entropy"
+                    ],
+                    "train/action_codebook_num_unique": action_codebook_usage["num_unique"],
+                    "train/action_codebook_num_tokens": action_codebook_usage["num_tokens"],
                 }
                 wandb_logger.log(wandb_metrics, step=global_step)
 
@@ -596,11 +640,16 @@ def train_epoch(
                 logger.info(
                     f"Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
                     f"Loss: {total_loss:.6f} (token: {avg_token_loss:.6f}, action: {avg_action_loss:.6f}), "
+                    f"Codebook: unique={int(action_codebook_usage['num_unique'])}/{action_model.action_vocab_size} "
+                    f"({action_codebook_usage['usage_fraction']:.2%}), "
+                    f"ppl={action_codebook_usage['perplexity']:.2f}, "
+                    f"top_counts=[{format_top_code_counts(top_code_counts)}], "
                     f"LRs: dynamics={current_lrs[0]:.2e}, action={current_lrs[1]:.2e}, "
                     f"Time: {batch_time:.2f}s"
                 )
 
             action_loss_acc, token_loss_acc = [], []
+            logged_action_tokens = []
 
             # Save checkpoint periodically
             optimizer_step = batch_idx // accumulation_steps

@@ -89,7 +89,7 @@ class DynamicsModel(nn.Module):
 
     def forward(
         self, video: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # input is of shape (batch_size, num_images_in_video, channels, image_height, image_width)
         # Return our predictions (batch_size, num_images_in_video, num_patches, vocab_size)
         # And the masked targets
@@ -167,7 +167,7 @@ class DynamicsModel(nn.Module):
             predicted_tokens.transpose(1, 2), target_tokens
         )
 
-        return x, token_loss, action_loss
+        return x, token_loss, action_loss, action_tokens
 
     @torch.inference_mode()
     def _inference_window(
