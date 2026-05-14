@@ -57,6 +57,8 @@ class InteractiveInferenceArgs:
     batch_size: int = BASE_CONFIG.batch_size
     dataset_type: Literal["pokemon", "atari_pong"] = BASE_CONFIG.dataset_type
     atari_pong_data_dir: Optional[str] = BASE_CONFIG.atari_pong_data_dir
+    atari_pong_crop_scoreboard: bool = BASE_CONFIG.atari_pong_crop_scoreboard
+    atari_pong_require_full_gameplay: bool = BASE_CONFIG.atari_pong_require_full_gameplay
     frames_dir: str = BASE_CONFIG.frames_dir
     local_cache_dir: Optional[str] = BASE_CONFIG.local_cache_dir
     use_s3: bool = BASE_CONFIG.use_s3
@@ -93,6 +95,8 @@ def _build_config(args: InteractiveInferenceArgs) -> DynamicsModelTrainingConfig
         batch_size=args.batch_size,
         dataset_type=args.dataset_type,
         atari_pong_data_dir=args.atari_pong_data_dir,
+        atari_pong_crop_scoreboard=args.atari_pong_crop_scoreboard,
+        atari_pong_require_full_gameplay=args.atari_pong_require_full_gameplay,
         frames_dir=args.frames_dir,
         local_cache_dir=args.local_cache_dir,
         use_s3=args.use_s3,
@@ -136,6 +140,10 @@ def _build_config(args: InteractiveInferenceArgs) -> DynamicsModelTrainingConfig
         config.dataset_type = dynamics_checkpoint_config["dataset_type"]
     if "atari_pong_data_dir" in dynamics_checkpoint_config:
         config.atari_pong_data_dir = dynamics_checkpoint_config["atari_pong_data_dir"]
+    if "atari_pong_crop_scoreboard" in dynamics_checkpoint_config:
+        config.atari_pong_crop_scoreboard = dynamics_checkpoint_config["atari_pong_crop_scoreboard"]
+    if "atari_pong_require_full_gameplay" in dynamics_checkpoint_config:
+        config.atari_pong_require_full_gameplay = dynamics_checkpoint_config["atari_pong_require_full_gameplay"]
     if "tokenizer_checkpoint_path" in dynamics_checkpoint_config:
         config.tokenizer_checkpoint_path = dynamics_checkpoint_config[
             "tokenizer_checkpoint_path"

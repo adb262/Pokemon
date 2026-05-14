@@ -52,6 +52,8 @@ class VideoTrainingConfig:
     save_dir: str = "latent_action_results"
     dataset_type: Literal["pokemon", "atari_pong"] = "pokemon"
     atari_pong_data_dir: Optional[str] = None
+    atari_pong_crop_scoreboard: bool = False
+    atari_pong_require_full_gameplay: bool = False
     dataset_train_key: Optional[str] = None
     sync_from_s3: bool = False
     frame_spacing: int = 1
