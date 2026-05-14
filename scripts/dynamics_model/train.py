@@ -680,7 +680,7 @@ def evaluate_model_rollout(
     ``2 * config.num_images_in_video`` (2T). For each clip the function:
 
     1. Extracts GT actions for the full 2T clip via the action model.
-    2. Saves a teacher-forced comparison grid from ``model.inference`` over the
+    2. Saves a teacher-forced comparison grid from ``model.rollout`` over the
        entire 2T clip, with predictions beginning at frame ``T - 1``.
     3. Saves an autoregressive rollout grid from ``model.rollout`` seeded by
        a *single* GT frame and predicting the remaining ``2T - 1`` frames.
@@ -735,10 +735,22 @@ def evaluate_model_rollout(
                     action_encoded
                 )  # (B, 2T-1)
 
-                teacher_forced_full = model.inference(
-                    video_batch,
-                    actions_full[:, -1],
-                    max_steps=config.rollout_max_denoising_steps,
+                # Teacher-forced one-step predictions: each target frame is
+                # generated from the GT prefix that precedes it.
+                teacher_forced_pred = torch.stack(
+                    [
+                        model.rollout(
+                            video_batch[:, :target_idx],
+                            actions_full[:, target_idx - 1 : target_idx],
+                            max_steps=config.rollout_max_denoising_steps,
+                        )[:, -1]
+                        for target_idx in range(T - 1, video_batch.shape[1])
+                    ],
+                    dim=1,
+                )
+                teacher_forced_full = torch.cat(
+                    [video_batch[:, : T - 1], teacher_forced_pred],
+                    dim=1,
                 )  # (B, 2T, C, H, W)
 
                 # Seed with a *single* GT frame and roll out across the full
