@@ -20,7 +20,7 @@ import torch.optim as optim
 import tyro
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from data.data_loaders.factory import build_datasets, build_rollout_eval_dataset
+from data.data_loaders.factory import build_datasets
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
 from data.s3.s3_utils import default_s3_manager
@@ -99,6 +99,7 @@ def evaluate_model(
 ) -> tuple[float, float]:
     """Evaluate model on a subset of data with FID/FVD metrics and comparison images."""
     model.eval()
+    predict_action_residuals = model.predict_action_residuals
     total_token_loss = 0.0
     total_action_loss = 0.0
     total_samples = 0
@@ -141,14 +142,22 @@ def evaluate_model(
                 total_action_loss += action_loss.item() * video_batch.size(0)
                 total_samples += video_batch.size(0)
 
-                # The action model predicts residuals for frames 1:T from frames 0:T-1.
+                # The action model predicts either residuals or next frames for
+                # frames 1:T from frames 0:T-1, depending on training config.
                 action_encoded = model.action_model.encode(video_batch)
-                reconstructed_residuals = model.action_model.decode(
+                action_decoded = model.action_model.decode(
                     video_batch, action_encoded
                 )
-                reconstructed_next_frames = reconstruct_predicted_frames_from_residuals(
-                    video_batch, reconstructed_residuals
-                )
+                if predict_action_residuals:
+                    reconstructed_residuals = action_decoded
+                    reconstructed_next_frames = (
+                        reconstruct_predicted_frames_from_residuals(
+                            video_batch, reconstructed_residuals
+                        )
+                    )
+                else:
+                    reconstructed_residuals = None
+                    reconstructed_next_frames = action_decoded
 
                 # Real target frames correspond to the action-model predictions for frames 1:T.
                 real_target_frames = video_batch[:, 1:, :, :, :]
@@ -194,47 +203,59 @@ def evaluate_model(
                         )
                     )
 
-                # Save comparison images for both residuals and reconstructed next frames.
-                predicted_residual_videos = convert_video_to_images(
-                    reconstructed_residuals
-                )
+                # Save comparison images for the reconstructed next frames, plus
+                # a residual-comparison grid when the action model is configured
+                # to predict residuals.
                 predicted_videos = convert_video_to_images(reconstructed_next_frames)
                 expected_videos = convert_video_to_images(video_batch)
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
-                residual_image_path = f"{batch_dir}/residual_comparison_grid.png"
                 image_path = f"{batch_dir}/next_frame_comparison_grid.png"
-                save_comparison_images_next_frame(
-                    predicted_residual_videos,
-                    action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
-                    expected_videos,
-                    batch_dir,
-                    file_suffix="residual_comparison_grid.png",
-                )
                 save_comparison_images_next_frame(
                     predicted_videos,
                     action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
                     expected_videos,
                     batch_dir,
                 )
+                saved_reconstructed_image_paths.append(image_path)
 
-                # Log comparison image to wandb
-                if experiment_logger:
-                    experiment_logger.log_image(
-                        f"eval/residual_comparison_{batch_idx}",
-                        residual_image_path,
-                        step=global_step,
+                residual_image_path: str | None = None
+                if predict_action_residuals and reconstructed_residuals is not None:
+                    predicted_residual_videos = convert_video_to_images(
+                        reconstructed_residuals
                     )
+                    residual_image_path = (
+                        f"{batch_dir}/residual_comparison_grid.png"
+                    )
+                    save_comparison_images_next_frame(
+                        predicted_residual_videos,
+                        action_tokens.squeeze(-1).detach().cpu().numpy().tolist(),
+                        expected_videos,
+                        batch_dir,
+                        file_suffix="residual_comparison_grid.png",
+                    )
+                    saved_residual_image_paths.append(residual_image_path)
+
+                if experiment_logger:
                     experiment_logger.log_image(
                         f"eval/comparison_{batch_idx}",
                         image_path,
                         step=global_step,
                     )
-                saved_residual_image_paths.append(residual_image_path)
-                saved_reconstructed_image_paths.append(image_path)
+                    if residual_image_path is not None:
+                        experiment_logger.log_image(
+                            f"eval/residual_comparison_{batch_idx}",
+                            residual_image_path,
+                            step=global_step,
+                        )
                 logger.debug(
                     "Saved comparison images to "
-                    f"{residual_image_path} and {image_path}"
+                    f"{image_path}"
+                    + (
+                        f" and {residual_image_path}"
+                        if residual_image_path is not None
+                        else ""
+                    )
                 )
 
             except Exception as e:
@@ -358,11 +379,16 @@ def evaluate_model(
         log_parts.append(
             f"codebook_ppl={codebook_metrics.get('eval/action_codebook_perplexity', float('nan')):.2f}"
         )
-    log_parts.append(
-        "saved "
-        f"{len(saved_residual_image_paths)} residual and "
-        f"{len(saved_reconstructed_image_paths)} reconstructed images"
-    )
+    if predict_action_residuals:
+        log_parts.append(
+            "saved "
+            f"{len(saved_residual_image_paths)} residual and "
+            f"{len(saved_reconstructed_image_paths)} reconstructed images"
+        )
+    else:
+        log_parts.append(
+            f"saved {len(saved_reconstructed_image_paths)} reconstructed images"
+        )
     
     logger.info(f"Eval complete: {', '.join(log_parts)}")
 
@@ -382,17 +408,17 @@ def evaluate_model(
         experiment_logger.log(log_dict, step=global_step)
 
         # Log comparison images in batches of 5, stacked vertically
-        if saved_residual_image_paths:
-            experiment_logger.log_image_batches(
-                key_prefix="eval/residual_comparison",
-                image_paths=saved_residual_image_paths,
-                batch_size=5,
-                step=global_step,
-            )
         if saved_reconstructed_image_paths:
             experiment_logger.log_image_batches(
                 key_prefix="eval/comparison",
                 image_paths=saved_reconstructed_image_paths,
+                batch_size=5,
+                step=global_step,
+            )
+        if predict_action_residuals and saved_residual_image_paths:
+            experiment_logger.log_image_batches(
+                key_prefix="eval/residual_comparison",
+                image_paths=saved_residual_image_paths,
                 batch_size=5,
                 step=global_step,
             )
@@ -410,6 +436,7 @@ def evaluate_model_rollout(
     config: DynamicsModelTrainingConfig,
     experiment_logger: ExperimentLogger | None = None,
     save_dir: str = "dynamics_model_results",
+    split: str = "eval",
 ) -> None:
     """Run teacher-forced and autoregressive rollout evals.
 
@@ -421,15 +448,26 @@ def evaluate_model_rollout(
        entire 2T clip, with predictions beginning at frame ``T - 1``.
     3. Saves an autoregressive rollout grid from ``model.rollout`` seeded by
        the first T GT frames, with predictions beginning at frame ``T``.
+
+    ``split`` controls the prefix used for log keys and the on-disk directory
+    (``"eval"`` for the test dataloader, ``"train"`` for the train dataloader).
     """
+    if split not in ("eval", "train"):
+        raise ValueError(f"split must be 'eval' or 'train', got {split!r}")
+
     model.eval()
     T = config.num_images_in_video
     saved_rollout_image_paths: list[str] = []
     saved_teacher_forced_image_paths: list[str] = []
 
-    eval_dir = f"{save_dir}/eval_rollout/epoch_{epoch}"
+    rollout_key = f"{split}_rollout"
+    teacher_forced_key = f"{split}_teacher_forced"
+
+    eval_dir = f"{save_dir}/{rollout_key}/epoch_{epoch}"
     os.makedirs(eval_dir, exist_ok=True)
-    logger.info(f"Running rollout eval ({config.rollout_eval_batches} batches) → {eval_dir}")
+    logger.info(
+        f"Running {split} rollout eval ({config.rollout_eval_batches} batches) → {eval_dir}"
+    )
 
     with torch.no_grad():
         for batch_idx, video_batch in enumerate(rollout_dataloader):
@@ -498,12 +536,12 @@ def evaluate_model_rollout(
 
                 if experiment_logger:
                     experiment_logger.log_image(
-                        f"eval_rollout/comparison_{batch_idx}",
+                        f"{rollout_key}/comparison_{batch_idx}",
                         rollout_image_path,
                         step=global_step,
                     )
                     experiment_logger.log_image(
-                        f"eval_teacher_forced/comparison_{batch_idx}",
+                        f"{teacher_forced_key}/comparison_{batch_idx}",
                         teacher_forced_image_path,
                         step=global_step,
                     )
@@ -520,21 +558,21 @@ def evaluate_model_rollout(
                 continue
 
     logger.info(
-        "Rollout eval complete: saved "
+        f"{split} rollout eval complete: saved "
         f"{len(saved_rollout_image_paths)} rollout grids and "
         f"{len(saved_teacher_forced_image_paths)} teacher-forced grids"
     )
 
     if experiment_logger and saved_rollout_image_paths:
         experiment_logger.log_image_batches(
-            key_prefix="eval_rollout/comparison",
+            key_prefix=f"{rollout_key}/comparison",
             image_paths=saved_rollout_image_paths,
             batch_size=5,
             step=global_step,
         )
     if experiment_logger and saved_teacher_forced_image_paths:
         experiment_logger.log_image_batches(
-            key_prefix="eval_teacher_forced/comparison",
+            key_prefix=f"{teacher_forced_key}/comparison",
             image_paths=saved_teacher_forced_image_paths,
             batch_size=5,
             step=global_step,
@@ -549,6 +587,7 @@ def train_epoch(
     train_dataloader: VideoWindowLoader,
     test_dataloader: VideoWindowLoader,
     rollout_dataloader: VideoWindowLoader | None,
+    train_rollout_dataloader: VideoWindowLoader | None,
     dynamics_optimizer: optim.Optimizer,
     dynamics_scheduler: optim.lr_scheduler.LRScheduler,
     device: torch.device,
@@ -565,6 +604,7 @@ def train_epoch(
     num_batches = len(train_dataloader)
     best_loss = float("inf")
     accumulation_steps = config.gradient_accumulation_steps
+    T = config.num_images_in_video
 
     # Set up resumable dataloader
     if start_batch > 0:
@@ -585,8 +625,11 @@ def train_epoch(
 
         batch_start_time = time.time()
 
-        # Move to device
+        # train_dataloader yields 2T-frame clips so the same dataset can also
+        # serve the train-side rollout eval; trim to T frames here for the
+        # actual training forward pass.
         video_batch = video_batch.to(device)
+        video_batch = video_batch[:, :T]
 
         # Forward pass - MaskGIT returns (predictions, token_loss, action_loss)
         decoded, token_loss, action_loss, action_tokens = dynamics_model(video_batch)
@@ -704,6 +747,20 @@ def train_epoch(
                         config,
                         experiment_logger=experiment_logger,
                         save_dir=config.save_dir,
+                        split="eval",
+                    )
+
+                if train_rollout_dataloader is not None:
+                    evaluate_model_rollout(
+                        dynamics_model,
+                        train_rollout_dataloader,
+                        device,
+                        epoch,
+                        global_step,
+                        config,
+                        experiment_logger=experiment_logger,
+                        save_dir=config.save_dir,
+                        split="train",
                     )
 
                 # Residual coverage on the current train batch
@@ -846,7 +903,23 @@ def main(config: DynamicsModelTrainingConfig):
         cache_dir=config.local_cache_dir,
     )
 
-    train_dataset, test_dataset = build_datasets(config, local_cache)
+    # Build the train dataset with 2T-frame windows so a single underlying
+    # dataset can be reused for both training (trimmed to T frames per batch)
+    # and the train-side rollout eval (full 2T frames). This avoids creating a
+    # second small "train rollout" subset that the model could overfit to.
+    rollout_window = 2 * config.num_images_in_video
+    logger.info(
+        f"Building train dataset with 2T window={rollout_window} "
+        "(trimmed to T at training time)..."
+    )
+    train_dataset, rollout_dataset = build_datasets(
+        config,
+        local_cache,
+        num_frames_in_video=rollout_window,
+        train_limit=None,
+        test_limit=100,
+    )
+    _, test_dataset = build_datasets(config, local_cache)
 
     logger.info(f"Creating data loader with {len(train_dataset)} videos...")
     train_dataloader = VideoWindowLoader(
@@ -866,23 +939,26 @@ def main(config: DynamicsModelTrainingConfig):
         seed=config.seed,
     )
 
-    # Build a 2T-frame eval dataset for rollout evaluation
-    rollout_window = 2 * config.num_images_in_video
-    logger.info(f"Building rollout eval dataset with window={rollout_window}...")
-    try:
-        rollout_dataset = build_rollout_eval_dataset(config, local_cache, rollout_window)
-        rollout_dataloader: VideoWindowLoader | None = VideoWindowLoader(
-            dataset=rollout_dataset,
-            batch_size=config.batch_size,
-            image_size=config.image_size,
-            shuffle=True,
-            num_workers=4,
-            seed=config.seed,
-        )
-        logger.info(f"Rollout eval dataset: {len(rollout_dataset)} samples")
-    except Exception as e:
-        logger.warning(f"Could not build rollout eval dataset (skipping rollout eval): {e}")
-        rollout_dataloader = None
+    rollout_dataloader: VideoWindowLoader = VideoWindowLoader(
+        dataset=rollout_dataset,
+        batch_size=config.batch_size,
+        image_size=config.image_size,
+        shuffle=True,
+        num_workers=4,
+        seed=config.seed,
+    )
+    logger.info(f"Rollout eval dataset (test): {len(rollout_dataset)} samples")
+
+    # Train rollout eval: a second dataloader over the SAME train_dataset so we
+    # don't build a separate small fixed "train rollout" subset.
+    train_rollout_dataloader: VideoWindowLoader = VideoWindowLoader(
+        dataset=train_dataset,
+        batch_size=config.batch_size,
+        image_size=config.image_size,
+        shuffle=True,
+        num_workers=4,
+        seed=config.seed,
+    )
 
     # Print dataset info
     train_info = train_dataloader.get_dataset_info()
@@ -1017,8 +1093,10 @@ def main(config: DynamicsModelTrainingConfig):
         f"Initial eval - Token Loss: {eval_token_loss:.6f}, Action Loss: {eval_action_loss:.6f}"
     )
 
-    # Skip rollout evaluation before any optimizer steps have run.
-    if rollout_dataloader is not None and global_step > 0:
+    # Run rollout evaluation alongside the initial regular eval so that the
+    # train_/eval_ teacher-forced and rollout plots are reported at the same
+    # step counts as the eval/ comparison plots.
+    if rollout_dataloader is not None:
         evaluate_model_rollout(
             model,
             rollout_dataloader,
@@ -1028,6 +1106,19 @@ def main(config: DynamicsModelTrainingConfig):
             config=config,
             experiment_logger=experiment_logger,
             save_dir=config.save_dir,
+            split="eval",
+        )
+    if train_rollout_dataloader is not None:
+        evaluate_model_rollout(
+            model,
+            train_rollout_dataloader,
+            device,
+            epoch=0,
+            global_step=0,
+            config=config,
+            experiment_logger=experiment_logger,
+            save_dir=config.save_dir,
+            split="train",
         )
 
     # Training loop
@@ -1044,6 +1135,7 @@ def main(config: DynamicsModelTrainingConfig):
                 train_dataloader,
                 test_dataloader,
                 rollout_dataloader,
+                train_rollout_dataloader,
                 optimizer,
                 scheduler,
                 device,
@@ -1081,6 +1173,19 @@ def main(config: DynamicsModelTrainingConfig):
                     config,
                     experiment_logger=experiment_logger,
                     save_dir=config.save_dir,
+                    split="eval",
+                )
+            if train_rollout_dataloader is not None:
+                evaluate_model_rollout(
+                    model,
+                    train_rollout_dataloader,
+                    device,
+                    epoch,
+                    global_step,
+                    config,
+                    experiment_logger=experiment_logger,
+                    save_dir=config.save_dir,
+                    split="train",
                 )
 
             if eval_loss < best_loss:

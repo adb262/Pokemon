@@ -46,6 +46,12 @@ class DynamicsModelTrainingConfig:
     dynamics_num_transformer_layers: int = 12
     dynamics_num_heads: int = 8
 
+    # When True, the latent-action model's decoder output is interpreted as
+    # frame-to-frame residuals (and we reconstruct next frames as
+    # ``prev + residual``). When False, the decoder output is treated as the
+    # next frames directly and residual-specific plots/metrics are skipped.
+    predict_action_residuals: bool = True
+
     action_learning_rate: float = 5e-5
     dynamics_learning_rate: float = 5e-5
 

@@ -30,5 +30,6 @@ def create_dynamics_model(
         d_model=config.dynamics_d_model,
         tokenizer=tokenizer,
         action_model=action_model,
+        predict_action_residuals=config.predict_action_residuals,
     )
     return model
