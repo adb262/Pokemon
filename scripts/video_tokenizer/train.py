@@ -117,10 +117,11 @@ def train_epoch(
     accumulation_steps = config.gradient_accumulation_steps
     should_early_stop = False
 
-    # Set up resumable dataloader
-    if start_batch > 0:
-        dataloader.resumable_loader.set_epoch(epoch)
-        dataloader.resumable_loader.current_batch = start_batch
+    # Configure the resumable dataloader: set the per-epoch shuffle and skip
+    # ahead to ``start_batch`` at the sampler level, so workers never load
+    # (and discard) the skipped batches.
+    dataloader.resumable_loader.set_epoch(epoch)
+    dataloader.resumable_loader.set_start_batch(start_batch)
 
     epoch_start_time = time.time()
     batch_start_time = time.time()
@@ -128,11 +129,10 @@ def train_epoch(
     logged_codebook_tokens: list[torch.Tensor] = []
     saved_on_last_step = False
 
-    for batch_idx, video_batch in enumerate(dataloader):
-        # Skip batches if resuming
-        if batch_idx < start_batch:
-            continue
-
+    # ``enumerate(..., start=start_batch)`` keeps ``batch_idx`` aligned with
+    # the absolute position in the (full) epoch, so gradient accumulation,
+    # logging, and end-of-epoch detection all match a fresh-start run.
+    for batch_idx, video_batch in enumerate(dataloader, start=start_batch):
         batch_start_time = time.time()
 
         # Move to device

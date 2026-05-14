@@ -465,21 +465,21 @@ def train_epoch(
     num_batches = len(train_dataloader)
     accumulation_steps = config.gradient_accumulation_steps
 
-    # Set up resumable dataloader
-    if start_batch > 0:
-        train_dataloader.resumable_loader.set_epoch(epoch)
-        train_dataloader.resumable_loader.current_batch = start_batch
+    # Configure the resumable dataloader: set the per-epoch shuffle and skip
+    # ahead to ``start_batch`` at the sampler level, so workers never load
+    # (and discard) the skipped batches.
+    train_dataloader.resumable_loader.set_epoch(epoch)
+    train_dataloader.resumable_loader.set_start_batch(start_batch)
 
     epoch_start_time = time.time()
     loss_acc: list[float] = []
     logged_action_tokens: list[torch.Tensor] = []
     optimizer.zero_grad()
 
-    for batch_idx, video_batch in enumerate(train_dataloader):
-        # Skip batches if resuming
-        if batch_idx < start_batch:
-            continue
-
+    # ``enumerate(..., start=start_batch)`` keeps ``batch_idx`` aligned with
+    # the absolute position in the (full) epoch, so gradient accumulation,
+    # logging, and end-of-epoch detection all match a fresh-start run.
+    for batch_idx, video_batch in enumerate(train_dataloader, start=start_batch):
         batch_start_time = time.time()
 
         video_batch = video_batch.to(device)

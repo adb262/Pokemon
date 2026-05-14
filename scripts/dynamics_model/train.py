@@ -34,7 +34,7 @@ from monitoring.action_code_counts import format_top_code_counts, get_top_code_c
 from monitoring.codebook_usage import compute_codebook_usage
 from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
-from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity
+from monitoring.psnr import compute_delta_psnr, compute_frame_pixel_similarity, compute_psnr
 from monitoring.residual_coverage import compute_residual_coverage
 from monitoring.videos import (
     convert_video_to_images,
@@ -42,6 +42,7 @@ from monitoring.videos import (
     save_residual_comparison_images,
     save_rollout_comparison_grid,
 )
+from schedulers.inverse_sigmoid_decay import inverse_sigmoid_decay
 from video_tokenization.checkpoints import load_model_from_checkpoint
 from video_tokenization.model import VideoTokenizer
 
@@ -53,6 +54,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+MAX_ROLLOUT_STEPS = 5
 
 @torch.no_grad()
 def reconstruct_predicted_frames_from_residuals(
@@ -64,6 +66,133 @@ def reconstruct_predicted_frames_from_residuals(
         0.0,
         1.0,
     )
+
+
+@torch.no_grad()
+def compute_rollout_metrics(
+    pred_frames: torch.Tensor,
+    real_frames: torch.Tensor,
+    prev_frames: torch.Tensor,
+) -> dict[str, float]:
+    """Compute per-step and aggregated rollout-quality metrics.
+
+    Each input is a video of predicted frames ``[B, K, C, H, W]``.
+    For each step ``k`` in ``[0, K)``:
+
+    * ``pred_frames[:, k]`` is the predicted frame at horizon ``k``.
+    * ``real_frames[:, k]`` is the ground-truth frame at horizon ``k``.
+    * ``prev_frames[:, k]`` is the ground-truth frame *immediately before*
+      ``real_frames[:, k]`` (used as the copy-prev baseline for residual R²).
+
+    Returns a dict containing:
+
+    * ``per_step_<metric>/step_<k>`` - the value of ``<metric>`` at step ``k``.
+    * ``mean_<metric>`` - mean of ``<metric>`` across all ``K`` steps.
+    * ``final_<metric>`` - value at the most-drifted step (``k = K - 1``).
+
+    where ``<metric>`` ranges over the residual-coverage metrics
+    (``residual_r2``, ``residual_cosine``, ``changed_pixel_mse``, ``pred_mse``,
+    ``copy_prev_mse``, ``changed_pixel_fraction``) plus ``psnr``.
+    """
+    if pred_frames.shape != real_frames.shape:
+        raise ValueError(
+            f"pred_frames and real_frames must match: "
+            f"{pred_frames.shape} vs {real_frames.shape}"
+        )
+    if pred_frames.shape != prev_frames.shape:
+        raise ValueError(
+            f"pred_frames and prev_frames must match: "
+            f"{pred_frames.shape} vs {prev_frames.shape}"
+        )
+    if pred_frames.dim() != 5:
+        raise ValueError(
+            f"Expected 5D tensors [B, K, C, H, W], got shape {pred_frames.shape}"
+        )
+
+    num_steps = pred_frames.shape[1]
+    per_step_metrics: list[dict[str, float]] = []
+    for k in range(num_steps):
+        coverage = compute_residual_coverage(
+            gt_frame=real_frames[:, k],
+            pred_frame=pred_frames[:, k],
+            prev_frame=prev_frames[:, k],
+        )
+        coverage["psnr"] = compute_psnr(real_frames[:, k], pred_frames[:, k])
+        per_step_metrics.append(coverage)
+
+    metrics: dict[str, float] = {}
+    metric_keys = list(per_step_metrics[0].keys())
+
+    for k, step_metrics in enumerate(per_step_metrics):
+        for key, val in step_metrics.items():
+            metrics[f"per_step_{key}/step_{k}"] = val
+
+    for key in metric_keys:
+        finite_values = [step[key] for step in per_step_metrics if math.isfinite(step[key])]
+        if finite_values:
+            metrics[f"mean_{key}"] = sum(finite_values) / len(finite_values)
+        else:
+            metrics[f"mean_{key}"] = float("nan")
+
+    for key, val in per_step_metrics[-1].items():
+        metrics[f"final_{key}"] = val
+
+    return metrics
+
+
+def _aggregate_rollout_metrics(
+    pred_batches: list[torch.Tensor],
+    real_batches: list[torch.Tensor],
+    prev_batches: list[torch.Tensor],
+    prefix: str,
+    label: str,
+) -> dict[str, float]:
+    """Concatenate per-batch frame slices and compute rollout metrics.
+
+    Returns a flat ``{prefix}/<metric>`` dict suitable for logging. Includes
+    per-step / mean / final residual-coverage and PSNR metrics plus FID and
+    FVD computed once over the full prediction horizon.
+    """
+    if not pred_batches:
+        return {}
+
+    pred_all = torch.cat(pred_batches, dim=0)
+    real_all = torch.cat(real_batches, dim=0)
+    prev_all = torch.cat(prev_batches, dim=0)
+
+    metrics = compute_rollout_metrics(pred_all, real_all, prev_all)
+
+    logger.info(
+        f"Computing {label} FID over {real_all.shape} vs {pred_all.shape}"
+    )
+    t = time.time()
+    fid_score = compute_frechet_distance(real_all, pred_all)
+    logger.info(
+        f"{label} FID computed in {time.time() - t:.2f}s: {fid_score:.4f}"
+    )
+    logger.info(
+        f"Computing {label} FVD over {real_all.shape} vs {pred_all.shape}"
+    )
+    t = time.time()
+    fvd_score = compute_fvd(real_all, pred_all)
+    logger.info(
+        f"{label} FVD computed in {time.time() - t:.2f}s: {fvd_score:.4f}"
+    )
+    metrics["fid"] = fid_score
+    metrics["fvd"] = fvd_score
+
+    logger.info(
+        f"{label} metrics: "
+        f"mean R²={metrics.get('mean_residual_r2', float('nan')):.4f}, "
+        f"final R²={metrics.get('final_residual_r2', float('nan')):.4f}, "
+        f"mean MSE={metrics.get('mean_pred_mse', float('nan')):.6f}, "
+        f"final MSE={metrics.get('final_pred_mse', float('nan')):.6f}, "
+        f"mean PSNR={metrics.get('mean_psnr', float('nan')):.4f}, "
+        f"final PSNR={metrics.get('final_psnr', float('nan')):.4f}, "
+        f"FID={fid_score:.4f}, FVD={fvd_score:.4f}"
+    )
+
+    return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
 @torch.no_grad()
@@ -98,6 +227,7 @@ def evaluate_model(
     device: torch.device,
     epoch: int,
     global_step: int,
+    config: DynamicsModelTrainingConfig,
     experiment_logger: ExperimentLogger | None = None,
     save_dir: str = "dynamics_model_results",
     num_batches: int = 10,
@@ -148,18 +278,33 @@ def evaluate_model(
                 video_batch = video_batch.to(device)
                 if num_frames is not None:
                     video_batch = video_batch[:, :num_frames]
-                decoded, token_loss, action_loss, action_tokens = model(video_batch)
+
+                # Teacher-forced token loss: encode the full clip once with
+                # the action model, then feed the GT video in as both the
+                # target video and the prediction basis so ``forward`` masks a
+                # random subset of tokens and scores reconstruction of those
+                # positions under ground-truth conditioning. This mirrors the
+                # training forward-pass shape conventions (T-frame video +
+                # T-1 action tokens) without running the autoregressive
+                # rollout used during training.
+                action_encoded = model.action_model.encode(video_batch)
+                action_tokens = model.action_model.get_action_sequence(
+                    action_encoded
+                )
+                decoded, token_loss, _ = model(
+                    video_batch,
+                    video_batch,
+                    action_tokens,
+                )
+                action_decoded = model.action_model.decode(
+                    video_batch, action_encoded
+                )
+                action_loss = model.action_loss_fn(video_batch, action_decoded)
 
                 total_token_loss += token_loss.item() * video_batch.size(0)
                 total_action_loss += action_loss.item() * video_batch.size(0)
                 total_samples += video_batch.size(0)
 
-                # The action model predicts either residuals or next frames for
-                # frames 1:T from frames 0:T-1, depending on training config.
-                action_encoded = model.action_model.encode(video_batch)
-                action_decoded = model.action_model.decode(
-                    video_batch, action_encoded
-                )
                 if predict_action_residuals:
                     reconstructed_residuals = action_decoded
                     reconstructed_next_frames = (
@@ -208,7 +353,7 @@ def evaluate_model(
 
                 # Residual coverage via MaskGIT inference
                 if video_batch.shape[1] >= 2:
-                    pred_video_maskgit = maskgit_predict_last_frame(model, video_batch)
+                    pred_video_maskgit = maskgit_predict_last_frame(model, video_batch, config.rollout_max_steps)
                     residual_coverage_accum.append(
                         compute_residual_coverage(
                             gt_frame=video_batch[:, -1],
@@ -481,6 +626,18 @@ def evaluate_model_rollout(
     saved_rollout_image_paths: list[str] = []
     saved_teacher_forced_image_paths: list[str] = []
 
+    # Collect predicted / real / prev-frame slices across batches so we can
+    # compute residual-coverage, PSNR, FID and FVD on the full prediction
+    # horizon at the end. ``prev`` for each predicted frame is the GT frame
+    # that immediately precedes it; this matches the "copy previous frame"
+    # baseline used by ``compute_residual_coverage``.
+    rollout_pred_batches: list[torch.Tensor] = []
+    rollout_real_batches: list[torch.Tensor] = []
+    rollout_prev_batches: list[torch.Tensor] = []
+    teacher_forced_pred_batches: list[torch.Tensor] = []
+    teacher_forced_real_batches: list[torch.Tensor] = []
+    teacher_forced_prev_batches: list[torch.Tensor] = []
+
     rollout_key = f"{split}_rollout"
     teacher_forced_key = f"{split}_teacher_forced"
 
@@ -530,6 +687,33 @@ def evaluate_model_rollout(
                 )  # (B, 2T, C, H, W)
                 rollout_images = convert_video_to_images(predicted_full)
 
+                # Autoregressive rollout predictions are at frames T..2T-1.
+                # The previous GT frame for step k (k=0..T-1) is the one at
+                # index T-1+k, i.e. video_batch[:, T-1:2T-1].
+                rollout_pred_batches.append(
+                    predicted_full[:, T:].detach().cpu()
+                )
+                rollout_real_batches.append(
+                    video_batch[:, T:].detach().cpu()
+                )
+                rollout_prev_batches.append(
+                    video_batch[:, T - 1 : 2 * T - 1].detach().cpu()
+                )
+
+                # Teacher-forced predictions are at frames T-1..2T-1 (T+1
+                # frames, one per sliding T-frame window). The previous GT
+                # frame for predicted frame at index k is at index k-1, so
+                # prev spans T-2..2T-2 inclusive == video_batch[:, T-2:2T-1].
+                teacher_forced_pred_batches.append(
+                    teacher_forced_full[:, T - 1 :].detach().cpu()
+                )
+                teacher_forced_real_batches.append(
+                    video_batch[:, T - 1 :].detach().cpu()
+                )
+                teacher_forced_prev_batches.append(
+                    video_batch[:, T - 2 : 2 * T - 1].detach().cpu()
+                )
+
                 batch_dir = f"{eval_dir}/batch_{batch_idx}"
                 os.makedirs(batch_dir, exist_ok=True)
                 save_rollout_comparison_grid(
@@ -578,26 +762,47 @@ def evaluate_model_rollout(
                 logger.warning(f"Error in rollout eval batch {batch_idx}: {e}")
                 continue
 
+    rollout_metrics = _aggregate_rollout_metrics(
+        pred_batches=rollout_pred_batches,
+        real_batches=rollout_real_batches,
+        prev_batches=rollout_prev_batches,
+        prefix=rollout_key,
+        label="autoregressive rollout",
+    )
+    teacher_forced_metrics = _aggregate_rollout_metrics(
+        pred_batches=teacher_forced_pred_batches,
+        real_batches=teacher_forced_real_batches,
+        prev_batches=teacher_forced_prev_batches,
+        prefix=teacher_forced_key,
+        label="teacher-forced rollout",
+    )
+
     logger.info(
         f"{split} rollout eval complete: saved "
         f"{len(saved_rollout_image_paths)} rollout grids and "
         f"{len(saved_teacher_forced_image_paths)} teacher-forced grids"
     )
 
-    if experiment_logger and saved_rollout_image_paths:
-        experiment_logger.log_image_batches(
-            key_prefix=f"{rollout_key}/comparison",
-            image_paths=saved_rollout_image_paths,
-            batch_size=5,
-            step=global_step,
-        )
-    if experiment_logger and saved_teacher_forced_image_paths:
-        experiment_logger.log_image_batches(
-            key_prefix=f"{teacher_forced_key}/comparison",
-            image_paths=saved_teacher_forced_image_paths,
-            batch_size=5,
-            step=global_step,
-        )
+    if experiment_logger:
+        if rollout_metrics or teacher_forced_metrics:
+            experiment_logger.log(
+                {**rollout_metrics, **teacher_forced_metrics},
+                step=global_step,
+            )
+        if saved_rollout_image_paths:
+            experiment_logger.log_image_batches(
+                key_prefix=f"{rollout_key}/comparison",
+                image_paths=saved_rollout_image_paths,
+                batch_size=5,
+                step=global_step,
+            )
+        if saved_teacher_forced_image_paths:
+            experiment_logger.log_image_batches(
+                key_prefix=f"{teacher_forced_key}/comparison",
+                image_paths=saved_teacher_forced_image_paths,
+                batch_size=5,
+                step=global_step,
+            )
 
     model.train()
 
@@ -621,6 +826,7 @@ def run_evaluation_suite(
         device,
         epoch,
         global_step,
+        config,
         experiment_logger=experiment_logger,
         save_dir=config.save_dir,
         split="eval",
@@ -638,6 +844,7 @@ def run_evaluation_suite(
             device,
             epoch,
             global_step,
+            config,
             experiment_logger=experiment_logger,
             save_dir=config.save_dir,
             split="train_eval",
@@ -690,6 +897,7 @@ def train_epoch(
     config: DynamicsModelTrainingConfig,
     experiment_logger: ExperimentLogger | None,
     global_step: int,
+    total_steps: int,
     best_loss: float,
     start_batch: int = 0,
     save_dir: str = "dynamics_model_results",
@@ -701,10 +909,11 @@ def train_epoch(
     accumulation_steps = config.gradient_accumulation_steps
     T = config.num_images_in_video
 
-    # Set up resumable dataloader
-    if start_batch > 0:
-        train_dataloader.resumable_loader.set_epoch(epoch)
-        train_dataloader.resumable_loader.current_batch = start_batch
+    # Configure the resumable dataloader: set the per-epoch shuffle and skip
+    # ahead to ``start_batch`` at the sampler level, so workers never load
+    # (and discard) the skipped batches.
+    train_dataloader.resumable_loader.set_epoch(epoch)
+    train_dataloader.resumable_loader.set_start_batch(start_batch)
 
     os.makedirs(f"{save_dir}/train/epoch_{epoch}", exist_ok=True)
 
@@ -713,23 +922,106 @@ def train_epoch(
     total_optimizer_step_action_loss = 0.0
     total_optimizer_step_token_loss = 0.0
     logged_action_tokens: list[torch.Tensor] = []
+    rollout_time_acc: list[float] = []
+    forward_time_acc: list[float] = []
+    rollout_frame_fraction_acc: list[float] = []
+    eps_acc: list[float] = []
     dynamics_optimizer.zero_grad()
 
-    for batch_idx, video_batch in enumerate(train_dataloader):
-        # Skip batches if resuming
-        if batch_idx < start_batch:
-            continue
-
+    # ``enumerate(..., start=start_batch)`` keeps ``batch_idx`` aligned with
+    # the absolute position in the (full) epoch, so gradient accumulation,
+    # logging, and end-of-epoch detection all match a fresh-start run.
+    for batch_idx, video_batch in enumerate(train_dataloader, start=start_batch):
         batch_start_time = time.time()
 
         # train_dataloader yields 2T-frame clips so the same dataset can also
         # serve the train-side rollout eval; trim to T frames here for the
         # actual training forward pass.
         video_batch = video_batch.to(device)
-        video_batch = video_batch[:, :T]
+        video_batch = video_batch[:, :T + 1]
+
+        # Time the action-model + dynamics-forward + loss-computation work
+        # separately from the autoregressive rollout so we can attribute cost.
+        # CUDA kernels are async; explicit syncs are required for accurate
+        # wall-clock measurements.
+        cuda_timing = torch.cuda.is_available() and (
+            device.type == "cuda" if isinstance(device, torch.device)
+            else str(device).startswith("cuda")
+        )
+
+        if cuda_timing:
+            torch.cuda.synchronize()
+        forward_start = time.time()
+
+        # Construct the prediction basis
+        action_encoded = action_model.encode(video_batch)
+        
+        # Shape (B, T)
+        action_tokens = action_model.get_action_sequence(
+            action_encoded
+        )
+
+        if cuda_timing:
+            torch.cuda.synchronize()
+        forward_time_pre_rollout = time.time() - forward_start
+
+        if cuda_timing:
+            torch.cuda.synchronize()
+        rollout_start = time.time()
+        with torch.no_grad():
+            # Get targets for the prediction basis
+            prediction_basis = dynamics_model.rollout(
+                # only use the first frame to get the prediction basis
+                video_batch[:, :1],
+                action_tokens,
+                max_steps=MAX_ROLLOUT_STEPS,
+            )
+        if cuda_timing:
+            torch.cuda.synchronize()
+        rollout_time = time.time() - rollout_start
+        rollout_time_acc.append(rollout_time)
+
+        # eps is the per-frame probability of keeping the ground-truth frame
+        # in the basis; (1 - eps) is the probability of substituting the
+        # rolled-out prediction. Per-sample, per-frame mixing so different
+        # examples in the batch see different schedules.
+        eps = inverse_sigmoid_decay(global_step / total_steps, decay_rate=10.0)
+        eps_acc.append(eps)
+        B = video_batch.shape[0]
+        keep_gt_mask = torch.rand(B, T, 1, 1, 1, device=device) < eps
+        # Fraction of (sample, frame) slots in the trainable window for which
+        # we substituted a rolled-out prediction in place of the GT frame.
+        rollout_frame_fraction_acc.append((~keep_gt_mask).float().mean().item())
+        video_prediction_basis = torch.where(
+            keep_gt_mask,
+            video_batch[:, 1:],
+            prediction_basis[:, 1:],
+        )
+
+        if cuda_timing:
+            torch.cuda.synchronize()
+        forward_post_start = time.time()
 
         # Forward pass - MaskGIT returns (predictions, token_loss, action_loss)
-        decoded, token_loss, action_loss, action_tokens = dynamics_model(video_batch)
+        # We drop frame 0 because it is the (untouched) GT seed used to bootstrap
+        # the rollout; the trainable window is frames 1..T.
+        decoded, token_loss, action_tokens = dynamics_model(
+            video_batch[:, 1:],
+            video_prediction_basis,
+            action_tokens[:, 1:],
+        )
+
+        # Reconstruct the action video from the action tokens
+        reconstructed_action_video = action_model.decode(video_batch, action_encoded)
+
+        # video_residuals = compute_target_residuals(video)
+        action_loss = dynamics_model.action_loss_fn(video_batch, reconstructed_action_video)
+
+        if cuda_timing:
+            torch.cuda.synchronize()
+        forward_time_acc.append(
+            forward_time_pre_rollout + (time.time() - forward_post_start)
+        )
 
         # Scale each microbatch by the size of its accumulation window so the
         # accumulated gradient matches the corresponding large-batch mean.
@@ -777,6 +1069,14 @@ def train_epoch(
             batch_time = time.time() - batch_start_time
             global_step += 1
 
+            avg_rollout_time = sum(rollout_time_acc) / len(rollout_time_acc)
+            avg_forward_time = sum(forward_time_acc) / len(forward_time_acc)
+            avg_rollout_frame_fraction = (
+                sum(rollout_frame_fraction_acc) / len(rollout_frame_fraction_acc)
+            )
+            avg_eps = sum(eps_acc) / len(eps_acc)
+            avg_rollout_frames_per_sample = avg_rollout_frame_fraction * T
+
             # Log to wandb
             if experiment_logger:
                 current_lrs = dynamics_scheduler.get_last_lr()
@@ -797,6 +1097,11 @@ def train_epoch(
                     ],
                     "train/action_codebook_num_unique": action_codebook_usage["num_unique"],
                     "train/action_codebook_num_tokens": action_codebook_usage["num_tokens"],
+                    "train/scheduled_sampling_eps": avg_eps,
+                    "train/rollout_time_seconds": avg_rollout_time,
+                    "train/forward_time_seconds": avg_forward_time,
+                    "train/rollout_frame_fraction": avg_rollout_frame_fraction,
+                    "train/rollout_frames_per_sample": avg_rollout_frames_per_sample,
                 }
                 experiment_logger.log(training_metrics, step=global_step)
 
@@ -811,11 +1116,19 @@ def train_epoch(
                     f"ppl={action_codebook_usage['perplexity']:.2f}, "
                     f"top_counts=[{format_top_code_counts(top_code_counts)}], "
                     f"LRs: dynamics={current_lrs[0]:.2e}, action={current_lrs[1]:.2e}, "
+                    f"eps={avg_eps:.3f}, "
+                    f"rollout_frames={avg_rollout_frames_per_sample:.2f}/{T}, "
+                    f"rollout_time={avg_rollout_time:.2f}s, "
+                    f"forward_time={avg_forward_time:.2f}s, "
                     f"Time: {batch_time:.2f}s"
                 )
 
             action_loss_acc, token_loss_acc = [], []
             logged_action_tokens = []
+            rollout_time_acc = []
+            forward_time_acc = []
+            rollout_frame_fraction_acc = []
+            eps_acc = []
 
             eval_improved = False
             if global_step % config.eval_interval == 0:
@@ -1291,6 +1604,7 @@ def main(config: DynamicsModelTrainingConfig):
                 config,
                 experiment_logger,
                 global_step,
+                total_steps,
                 best_loss,
                 epoch_start_batch,
                 config.save_dir,
