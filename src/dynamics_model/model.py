@@ -6,8 +6,10 @@ from torch.distributions import uniform
 from latent_action_model.model import LatentActionVQVAE
 from loss.loss_fns import (
     changed_patch_weighted_token_cross_entropy_loss,
+    compute_target_residuals,
     next_frame_reconstruction_loss,
     next_frame_reconstruction_loss_l1,
+    next_frame_reconstruction_residual_loss,
 )
 from torch_utilities.initialize import init_weights
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
@@ -70,7 +72,7 @@ class DynamicsModel(nn.Module):
         )
         self.softmax = nn.Softmax(dim=-1)
         self.changed_patch_loss_weight = 30.0
-        self.action_loss_fn = next_frame_reconstruction_loss_l1
+        self.action_loss_fn = next_frame_reconstruction_residual_loss
 
         # Only initialize the newly-created submodules. ``self.apply`` would
         # recurse into ``self.tokenizer`` and ``self.action_model`` and wipe
@@ -138,6 +140,7 @@ class DynamicsModel(nn.Module):
         x = self.vocab_head(x)
 
         reconstructed_action_video = self.action_model.decode(video, action_video_encoded)
+        # video_residuals = compute_target_residuals(video)
         action_loss = self.action_loss_fn(video, reconstructed_action_video)
 
         # Only compute token loss on masked positions of the final frame.
