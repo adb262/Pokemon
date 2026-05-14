@@ -57,7 +57,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-MAX_ROLLOUT_STEPS = 5
 VISUALIZATION_SEQUENCE_FRAMES = 5
 MAX_EVAL_SAVED_IMAGES = 5
 
@@ -239,11 +238,11 @@ def maskgit_predict_last_frame(
     video_batch: torch.Tensor,
     max_steps: int = 25,
 ) -> torch.Tensor:
-    """Run MaskGIT inference to predict the last frame of ``video_batch``.
+    """Roll out one step to predict the held-out last frame of ``video_batch``.
 
-    ``model.inference`` now treats the last frame of its input as the masked
-    target, so we pass the full ``video_batch`` (not ``video_batch[:, :-1]``)
-    and supply the action describing the transition into the final frame.
+    The full ``video_batch`` is used only to infer the GT action token for the
+    transition into the target frame. Generation is seeded with
+    ``video_batch[:, :-1]`` so the target pixels are held out.
 
     Args:
         video_batch: [B, T, C, H, W] full video including the target frame.
@@ -256,7 +255,11 @@ def maskgit_predict_last_frame(
     action_encoded = model.action_model.encode(video_batch)
     action_tokens = model.action_model.get_action_sequence(action_encoded)
     last_action = action_tokens[:, -1]  # (B,)
-    return model.inference(video_batch, last_action, max_steps=max_steps)
+    return model.rollout(
+        video_batch[:, :-1],
+        last_action.unsqueeze(1),
+        max_steps=max_steps,
+    )
 
 
 def evaluate_model(
@@ -392,7 +395,7 @@ def evaluate_model(
 
                 # Residual coverage via MaskGIT inference
                 if video_batch.shape[1] >= 2:
-                    pred_video_maskgit = maskgit_predict_last_frame(model, video_batch, config.rollout_max_steps)
+                    pred_video_maskgit = maskgit_predict_last_frame(model, video_batch, config.rollout_max_denoising_steps)
                     residual_coverage_accum.append(
                         compute_residual_coverage(
                             gt_frame=video_batch[:, -1],
@@ -680,7 +683,10 @@ def evaluate_model_rollout(
     2. Saves a teacher-forced comparison grid from ``model.inference`` over the
        entire 2T clip, with predictions beginning at frame ``T - 1``.
     3. Saves an autoregressive rollout grid from ``model.rollout`` seeded by
-       the first T GT frames, with predictions beginning at frame ``T``.
+       a *single* GT frame and predicting the remaining ``2T - 1`` frames.
+       This stresses the model's ability to extrapolate beyond its trained
+       context length of ``T`` frames; the comparison grid renders the full
+       2T-frame horizon so context degradation past frame ``T`` is visible.
 
     ``split`` controls the prefix used for log keys and the on-disk directory
     (``"eval"`` for the test dataloader, ``"train"`` for the train dataloader).
@@ -732,26 +738,32 @@ def evaluate_model_rollout(
                 teacher_forced_full = model.inference(
                     video_batch,
                     actions_full[:, -1],
-                    max_steps=config.rollout_max_steps,
+                    max_steps=config.rollout_max_denoising_steps,
                 )  # (B, 2T, C, H, W)
 
+                # Seed with a *single* GT frame and roll out across the full
+                # 2T-frame horizon to stress how predictions degrade as the
+                # autoregressive context grows past the trained window of T
+                # frames. ``actions_full`` already contains all 2T-1
+                # transitions (index 0 is the transition into frame 1), which
+                # is exactly what ``rollout`` needs.
                 predicted_full = model.rollout(
-                    video_batch[:, :T],
-                    actions_full[:, T - 1 :],
-                    max_steps=config.rollout_max_steps,
+                    video_batch[:, :1],
+                    actions_full,
+                    max_steps=config.rollout_max_denoising_steps,
                 )  # (B, 2T, C, H, W)
 
-                # Autoregressive rollout predictions are at frames T..2T-1.
-                # The previous GT frame for step k (k=0..T-1) is the one at
-                # index T-1+k, i.e. video_batch[:, T-1:2T-1].
+                # Autoregressive rollout predictions are at frames 1..2T-1.
+                # The previous GT frame for step k (k=0..2T-2) is the one at
+                # index k, i.e. video_batch[:, :2T-1].
                 rollout_pred_batches.append(
-                    predicted_full[:, T:].detach().cpu()
+                    predicted_full[:, 1:].detach().cpu()
                 )
                 rollout_real_batches.append(
-                    video_batch[:, T:].detach().cpu()
+                    video_batch[:, 1:].detach().cpu()
                 )
                 rollout_prev_batches.append(
-                    video_batch[:, T - 1 : 2 * T - 1].detach().cpu()
+                    video_batch[:, : 2 * T - 1].detach().cpu()
                 )
 
                 # Teacher-forced predictions are at frames T-1..2T-1 (T+1
@@ -805,15 +817,15 @@ def evaluate_model_rollout(
                         file_suffix="teacher_forced_comparison_grid.png",
                     )
 
-                    rollout_window, rollout_prediction_start = (
-                        _prediction_boundary_window(
-                            video_batch.shape[1],
-                            T,
-                        )
-                    )
+                    # Render the full 2T-frame rollout so context extension
+                    # past the trained window of T frames is visible. The
+                    # rollout is seeded from frame 0 alone, so predictions
+                    # begin at frame 1.
+                    rollout_window = slice(0, video_batch.shape[1])
+                    rollout_prediction_start = 1
                     rollout_actions = _slice_actions_for_rollout_grid(
-                        actions_full[:num_visualized_samples, T - 1 :],
-                        T,
+                        actions_full[:num_visualized_samples],
+                        rollout_prediction_start,
                         rollout_window,
                     )
                     gt_rollout_images = convert_video_to_images(
@@ -1074,7 +1086,7 @@ def train_epoch(
                         pred = dynamics_model.predict_next_frame(
                             ctx,
                             action_tokens[:, t],
-                            max_steps=MAX_ROLLOUT_STEPS,
+                            max_steps=config.rollout_max_denoising_steps,
                             context_actions=ctx_actions if ctx_actions.shape[1] > 0 else None,
                         )
                         duplicate[:, t + 1] = pred
@@ -1088,7 +1100,7 @@ def train_epoch(
                     prediction_basis = dynamics_model.rollout(
                         video_batch[:, :1],
                         action_tokens,
-                        max_steps=MAX_ROLLOUT_STEPS,
+                        max_steps=config.rollout_max_denoising_steps,
                     )
                 keep_gt_mask = torch.rand(B, T, 1, 1, 1, device=device) < eps
                 video_prediction_basis = torch.where(
@@ -1100,6 +1112,10 @@ def train_epoch(
             else:
                 video_prediction_basis = video_batch[:, 1:]
                 rollout_calls_acc.append(0)
+
+            gaussian_noise = torch.randn_like(video_prediction_basis) * 0.02
+            video_prediction_basis = video_prediction_basis + gaussian_noise
+            clamp_video_prediction_basis = torch.clamp(video_prediction_basis, 0, 1.0)
 
             decoded, token_loss, action_tokens = dynamics_model(
                 video_batch[:, 1:],
@@ -1824,10 +1840,10 @@ def main(config: DynamicsModelTrainingConfig):
     logger.info("Training completed!")
     logger.info(f"Best loss achieved: {best_loss:.6f}")
 
-    if config.use_s3 and s3_manager:
-        logger.info(f"Checkpoints saved to S3 bucket: {s3_manager.bucket_name}")
-    else:
-        logger.info(f"Checkpoints saved to: {config.checkpoint_dir}")
+    # if config.use_s3 and s3_manager:
+        # logger.info(f"Checkpoints saved to S3 bucket: {s3_manager.bucket_name}")
+    # else:
+        # logger.info(f"Checkpoints saved to: {config.checkpoint_dir}")
 
     if logging_backend == "wandb":
         logger.info(f"Training metrics logged to Wandb project: {config.wandb_project}")

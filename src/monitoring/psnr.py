@@ -170,14 +170,15 @@ def compute_delta_psnr(
             random_last_action,
         )
 
-    reconstructed_inferred = model.inference(
-        video_batch,
-        inferred_last_action,
+    seed_video = video_batch[:, :-1]
+    reconstructed_inferred = model.rollout(
+        seed_video,
+        inferred_last_action.unsqueeze(1),
         max_steps=max_steps,
     )
-    reconstructed_random = model.inference(
-        video_batch,
-        random_last_action,
+    reconstructed_random = model.rollout(
+        seed_video,
+        random_last_action.unsqueeze(1),
         max_steps=max_steps,
     )
 

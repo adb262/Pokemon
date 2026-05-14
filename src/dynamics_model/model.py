@@ -458,17 +458,14 @@ class DynamicsModel(nn.Module):
     ) -> torch.Tensor:
         """Predict the next frame after the observed context.
 
-        ``context`` may contain between ``1`` and ``T - 1`` frames; longer
-        inputs are trimmed to the most recent ``T - 1`` frames. Shorter
-        contexts produce inference windows smaller than ``T`` frames, which
-        ``_inference_window`` handles via its variable-length path (used by
-        autoregressive rollouts that start from a short seed).
+        ``context`` may contain one or more frames. Dynamics conditioning is
+        trimmed to the most recent ``T - 1`` frames, while decoding uses the
+        tokenizer checkpoint's own rolling frame window.
 
         ``context_actions`` (optional, shape ``(B, K - 2)`` where ``K`` is
         the resulting inference-window length, i.e. ``min(T - 1, context
-        length) + 1``) is forwarded to ``_inference_window``; pass
-        GT-derived action tokens to keep the action conditioning
-        teacher-forced.
+        length) + 1``) is forwarded to ``predict_next_frame_codes``; pass
+        GT-derived action tokens to keep action conditioning teacher-forced.
         """
         max_context = self.num_images_in_video - 1
         num_frames = context.shape[1]
@@ -479,16 +476,163 @@ class DynamicsModel(nn.Module):
             )
 
         context_window = context[:, -max_context:]
-        # ``_inference_window`` masks the final slot before decoding, so this
-        # placeholder frame is only used to hold the mask-token position.
-        placeholder = context_window[:, -1:].clone()
-        inference_window = torch.cat([context_window, placeholder], dim=1)
-        decoded_window = self._inference_window(
-            inference_window,
+        next_codes = self.predict_next_frame_codes(
+            context_window,
             action,
             max_steps=max_steps,
             context_actions=context_actions,
         )
+        return self.decode_next_frame_with_tokenizer_window(context, next_codes)
+
+    @torch.no_grad()
+    def predict_next_frame_codes(
+        self,
+        context: torch.Tensor,
+        action: torch.Tensor,
+        max_steps: int = 10,
+        context_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict next-frame tokenizer codes without decoding the dynamics window."""
+        max_context = self.num_images_in_video - 1
+        num_frames = context.shape[1]
+        if num_frames < 1:
+            raise ValueError(
+                "predict_next_frame_codes requires at least 1 context frame, "
+                f"got {num_frames}"
+            )
+
+        context_window = context[:, -max_context:]
+        placeholder = context_window[:, -1:].clone()
+        inference_window = torch.cat([context_window, placeholder], dim=1)
+
+        targets = self.tokenizer.quantized_value_to_codes(
+            self.tokenizer.encode(inference_window)
+        ).long()
+        batch_size, _, num_patches = targets.shape
+
+        action_token = action.long().to(targets.device)
+        if action_token.dim() == 1:
+            action_token = action_token.unsqueeze(1)
+
+        targets[:, -1, :] = self.tokenizer.get_mask_token_idx()
+
+        expected_context = inference_window.shape[1] - 2
+        if context_actions is None:
+            if expected_context > 0:
+                action_video_encoded = self.action_model.encode(inference_window[:, :-1])
+                context_action_tokens = self.action_model.get_action_sequence(
+                    action_video_encoded
+                ).long()
+            else:
+                context_action_tokens = torch.empty(
+                    batch_size, 0, dtype=torch.long, device=targets.device
+                )
+        else:
+            if context_actions.shape != (batch_size, expected_context):
+                raise ValueError(
+                    f"context_actions must have shape (B, {expected_context}), "
+                    f"got {tuple(context_actions.shape)}"
+                )
+            context_action_tokens = context_actions.long().to(targets.device)
+
+        action_tokens = torch.cat([context_action_tokens, action_token], dim=1)
+        action_embeddings = self.action_embedding(action_tokens.long())
+
+        step = 0
+        mask_locations = torch.full(
+            (batch_size, num_patches), True, dtype=torch.bool, device=targets.device
+        )
+        while step < max_steps:
+            x = self.tokenizer_embedding(targets.long())
+            x[:, :-1, :] += action_embeddings.unsqueeze(2)
+            x = self.decoder(x)
+            logits = self.vocab_head(x)
+
+            if not mask_locations.any():
+                break
+
+            ratio_remaining = self.cosine_scheduler(max_steps, step + 1, targets.device)
+            target_still_masked = int(num_patches * ratio_remaining)
+            current_masked = int(mask_locations.sum(dim=1).amax().item())
+            tokens_to_update = max(0, current_masked - target_still_masked)
+
+            probs = self.softmax(logits[:, -1])
+            mask_flat = mask_locations.view(-1)
+            probs_flat = probs.view(-1, probs.size(-1))
+            samples_flat = torch.full(
+                (batch_size * num_patches,),
+                -100,
+                device=targets.device,
+                dtype=torch.long,
+            )
+            if mask_flat.any():
+                probs_masked = probs_flat[mask_flat]
+                probs_masked = probs_masked / (
+                    probs_masked.sum(-1, keepdim=True) + 1e-9
+                )
+                sampled_masked = torch.multinomial(
+                    probs_masked, 1, replacement=False
+                ).squeeze(-1)
+                samples_flat[mask_flat] = sampled_masked
+
+            samples = samples_flat.view(batch_size, num_patches)
+            sampled_scores = probs.gather(
+                -1, samples.clamp_min(0).unsqueeze(-1)
+            ).squeeze(-1)
+            sampled_scores[samples < 0] = -1
+
+            if tokens_to_update > 0:
+                _, top_positions = torch.topk(
+                    sampled_scores, tokens_to_update, dim=-1
+                )
+                top_tokens = samples.gather(1, top_positions)
+
+                targets_last = targets[:, -1, :]
+                targets_last = targets_last.scatter(1, top_positions, top_tokens)
+                targets[:, -1, :] = targets_last
+
+                mask_locations = mask_locations.scatter(
+                    1, top_positions, torch.zeros_like(top_positions, dtype=torch.bool)
+                )
+
+            step += 1
+
+        return targets[:, -1, :]
+
+    def build_tokenizer_decode_history(
+        self,
+        generated_pixels: torch.Tensor,
+    ) -> torch.Tensor:
+        tokenizer_window = self.tokenizer.decoder.num_images_in_video
+        if tokenizer_window < 2:
+            raise ValueError(
+                "Tokenizer decoder window must be at least 2 frames for rollout, "
+                f"got {tokenizer_window}"
+            )
+
+        previous_context_frames = tokenizer_window - 1
+        history = generated_pixels[:, -previous_context_frames:]
+        pad_frames = previous_context_frames - history.shape[1]
+
+        if pad_frames > 0:
+            seed_padding = generated_pixels[:, :1].expand(
+                -1, pad_frames, -1, -1, -1
+            )
+            history = torch.cat([seed_padding, history], dim=1)
+
+        return history
+
+    @torch.no_grad()
+    def decode_next_frame_with_tokenizer_window(
+        self,
+        generated_pixels: torch.Tensor,
+        next_codes: torch.Tensor,
+    ) -> torch.Tensor:
+        tokenizer_history = self.build_tokenizer_decode_history(generated_pixels)
+        quantized_context = self.tokenizer.encode(tokenizer_history)
+        context_codes = self.tokenizer.quantized_value_to_codes(quantized_context)
+        all_codes = torch.cat([context_codes, next_codes.unsqueeze(1)], dim=1)
+        decoded_window = self.tokenizer.decode_from_codes(all_codes)
         return decoded_window[:, -1]
 
     @torch.no_grad()
@@ -501,20 +645,16 @@ class DynamicsModel(nn.Module):
         of shape ``(B, K)``, produces ``(B, S + K, C, H, W)`` by generating
         one new frame per action. ``S`` may be as small as ``1``.
 
-        At each step we append a fully-masked slot to the end of the
-        already-generated sequence and run MaskGIT over the last
-        ``min(generated_frames, T - 1)`` real frames plus the new masked
-        slot. While the generated sequence is shorter than ``T`` frames the
-        inference window grows one frame per step; once it reaches ``T``
-        frames the window starts sliding. No synthetic padding is ever fed
-        to the model — the first few predictions simply run over a shorter
-        spatiotemporal context.
+        At each step the dynamics model predicts next-frame tokenizer codes
+        from the dynamics context window. Those codes are decoded through the
+        tokenizer checkpoint's own decoder window, which can be shorter than
+        the dynamics context.
 
         Within-seed action tokens are derived once from the GT seed pixels
         and concatenated with the user-supplied rollout ``actions`` to form
         a unified transition sequence. At each step we slice the relevant
         within-window context actions from this sequence and feed them to
-        ``_inference_window``, so the action encoder is never run on
+        ``predict_next_frame_codes``, so the action encoder is never run on
         previously-predicted frames.
         """
         original_num_frames = video.shape[1]
@@ -567,9 +707,8 @@ class DynamicsModel(nn.Module):
         generated = video
         for step in range(num_rollout_steps):
             # After ``step`` predictions we have ``S + step`` real frames.
-            # The next prediction uses the last ``context_size`` of them as
-            # its context (capped at ``T - 1``), with a fresh masked slot
-            # appended inside ``predict_next_frame``. The ``context_size - 1``
+            # The next code prediction uses the last ``context_size`` frames as
+            # dynamics context (capped at ``T - 1``). The ``context_size - 1``
             # transitions inside that window come from ``unified_actions``
             # at offsets ``[start, start + context_size - 1)``.
             current_num_frames = generated.shape[1]
@@ -578,11 +717,15 @@ class DynamicsModel(nn.Module):
             context_actions = unified_actions[
                 :, start : start + (context_size - 1)
             ]
-            next_frame = self.predict_next_frame(
-                generated,
+            context = generated[:, -context_size:]
+            next_codes = self.predict_next_frame_codes(
+                context,
                 action_sequence[:, step],
                 max_steps=max_steps,
                 context_actions=context_actions,
+            )
+            next_frame = self.decode_next_frame_with_tokenizer_window(
+                generated, next_codes
             )
             generated = torch.cat([generated, next_frame.unsqueeze(1)], dim=1)
 

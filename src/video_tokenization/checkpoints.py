@@ -12,6 +12,48 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+_ORIG_MOD_MARKER = "._orig_mod."
+
+
+def _strip_orig_mod(key: str) -> str:
+    return key.replace(_ORIG_MOD_MARKER, ".")
+
+
+def adapt_state_dict_to_model(
+    state_dict: dict[str, torch.Tensor], model: torch.nn.Module
+) -> dict[str, torch.Tensor]:
+    """Map checkpoint keys onto the layout expected by ``model``.
+
+    ``torch.compile`` wraps compiled submodules in ``OptimizedModule`` and
+    inserts ``._orig_mod.`` into those parameters' state-dict keys. Checkpoints
+    saved from compiled tokenizer submodules need those markers stripped when
+    loading into an uncompiled model, while the reverse is needed if the target
+    model is compiled.
+    """
+    model_keys = list(model.state_dict().keys())
+    if set(state_dict.keys()) == set(model_keys):
+        return state_dict
+
+    canonical_to_model_key = {_strip_orig_mod(key): key for key in model_keys}
+
+    adapted: dict[str, torch.Tensor] = {}
+    rewritten = 0
+    for key, value in state_dict.items():
+        target_key = canonical_to_model_key.get(_strip_orig_mod(key), key)
+        if target_key != key:
+            rewritten += 1
+        adapted[target_key] = value
+
+    if rewritten:
+        logger.info(
+            "Adapted %d/%d tokenizer state_dict keys to match model layout "
+            "(torch.compile '_orig_mod' canonicalization)",
+            rewritten,
+            len(state_dict),
+        )
+    return adapted
+
+
 def _model_state_dtype(state_dict: dict[str, torch.Tensor]) -> str:
     for tensor in state_dict.values():
         if tensor.is_floating_point():
@@ -71,6 +113,7 @@ def load_checkpoint(
 ) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.LRScheduler]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_state_dict = checkpoint["model_state_dict"]
+    model_state_dict = adapt_state_dict_to_model(model_state_dict, model)
     model.load_state_dict(model_state_dict)
     model_dtype = _dtype_from_name(
         checkpoint.get("model_dtype", _model_state_dtype(model_state_dict))
@@ -105,6 +148,7 @@ def load_model_from_checkpoint(
     )
 
     model = create_model(config)
+    model_state_dict = adapt_state_dict_to_model(model_state_dict, model)
     model.load_state_dict(model_state_dict)
     model.to(device=device, dtype=model_dtype)
     model.eval()

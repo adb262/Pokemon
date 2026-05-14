@@ -4,11 +4,29 @@ import logging
 import os
 from typing import Literal
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _make_frame_triptych(
+    expected: Image.Image,
+    predicted: Image.Image,
+    error: Image.Image,
+) -> Image.Image:
+    images = [expected.convert("RGB"), predicted.convert("RGB"), error.convert("RGB")]
+    width = sum(img.width for img in images)
+    height = max(img.height for img in images)
+    triptych = Image.new("RGB", (width, height), color=(0, 0, 0))
+    x_offset = 0
+    for img in images:
+        triptych.paste(img, (x_offset, 0))
+        x_offset += img.width
+    return triptych
 
 
 def convert_video_to_images(
@@ -320,6 +338,61 @@ def save_residual_comparison_images(
     plt.tight_layout()
     plt.savefig(f"{file_prefix}/{file_suffix}")
     plt.close(fig)
+
+
+def save_reconstruction_triptych_grid(
+    predicted_videos: list[list[Image.Image]],
+    expected_videos: list[list[Image.Image]],
+    error_videos: list[list[Image.Image]],
+    output_path: str,
+    title: str = "Each cell: GT | Reconstruction | Abs Err",
+    max_samples: int = 1,
+) -> str:
+    """Save a reconstruction grid where each cell is GT | prediction | error."""
+    if not predicted_videos:
+        raise ValueError("Cannot save reconstruction triptych grid for an empty batch")
+
+    num_samples = min(len(predicted_videos), max_samples)
+    num_frames = len(predicted_videos[0])
+    fig, axs = plt.subplots(
+        num_samples,
+        num_frames,
+        figsize=(max(8, num_frames * 4.0), num_samples * 2.2),
+    )
+    if num_samples == 1:
+        axs = np.expand_dims(axs, axis=0)
+    if num_frames == 1:
+        axs = np.expand_dims(axs, axis=1)
+
+    for sample_idx in range(num_samples):
+        if len(expected_videos[sample_idx]) != num_frames:
+            raise ValueError(
+                f"Sample {sample_idx}: expected {num_frames} GT frames, "
+                f"got {len(expected_videos[sample_idx])}"
+            )
+        if len(error_videos[sample_idx]) != num_frames:
+            raise ValueError(
+                f"Sample {sample_idx}: expected {num_frames} error frames, "
+                f"got {len(error_videos[sample_idx])}"
+            )
+
+        for frame_idx in range(num_frames):
+            triptych = _make_frame_triptych(
+                expected_videos[sample_idx][frame_idx],
+                predicted_videos[sample_idx][frame_idx],
+                error_videos[sample_idx][frame_idx],
+            )
+            axs[sample_idx, frame_idx].imshow(triptych, interpolation="nearest")
+            axs[sample_idx, frame_idx].axis("off")
+            title_prefix = f"Sample {sample_idx} " if num_samples > 1 else ""
+            axs[sample_idx, frame_idx].set_title(f"{title_prefix}Frame {frame_idx}")
+
+    fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path)
+    plt.close(fig)
+    return output_path
 
 
 def save_rollout_comparison_grid(

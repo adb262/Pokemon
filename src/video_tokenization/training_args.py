@@ -58,6 +58,8 @@ class VideoTokenizerTrainingConfig:
     bins: list[int] = field(default_factory=lambda: [8, 8, 6, 5])
     save_dir: str = "tokenization_results"
     max_comparison_images: int = 5
+    max_comparison_frames: int = 5
+    reconstruction_error_scale: float = 5.0
     # Reconstruction loss configuration. ``l2`` is the standard mean-squared
     # error between the input video and its reconstruction. ``clipped_l2``
     # floors the per-pixel MSE at ``l2_clip_c`` (interpreted in 0-255 pixel
@@ -85,9 +87,14 @@ class VideoTokenizerTrainingConfig:
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
     # Performance optimizations
+    scheduled_sampling: Literal["bengio_per_frame", "free_run_mix", "off"] = "bengio_per_frame"
     use_bf16: bool = True
     use_compile: bool = True
 
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None
+
+    def comparison_frame_count(self) -> int:
+        """Number of frames to render in train/eval comparison grids."""
+        return min(self.max_comparison_frames, self.num_images_in_video)

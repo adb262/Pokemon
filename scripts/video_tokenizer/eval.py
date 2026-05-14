@@ -14,7 +14,11 @@ from loss.loss_fns import next_frame_reconstruction_loss
 from monitoring.codebook_usage import compute_codebook_usage
 from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
 from monitoring.frechet_distance import compute_frechet_distance, compute_fvd
-from monitoring.videos import convert_video_to_images, save_comparison_images
+from monitoring.videos import (
+    convert_video_to_images,
+    save_comparison_images,
+    save_reconstruction_triptych_grid,
+)
 from video_tokenization.checkpoints import load_checkpoint
 from video_tokenization.create_tokenizer import create_model
 from video_tokenization.model import VideoTokenizer
@@ -35,11 +39,13 @@ def eval_model(
     global_step: int | None = None,
     max_comparison_images: int = 5,
     max_comparison_frames: int = 5,
+    reconstruction_error_scale: float = 5.0,
 ):
     model.eval()
     total_loss = 0.0
     total_samples = 0
     saved_image_paths: list[str] = []
+    saved_triptych_paths: list[str] = []
 
     # Collect real and predicted next frames across the eval set
     real_next_frames_batches: list[torch.Tensor] = []
@@ -72,9 +78,25 @@ def eval_model(
                 vis_frames = min(max_comparison_frames, video_batch.shape[1])
                 predicted_videos = convert_video_to_images(decoded[:, :vis_frames])
                 expected_videos = convert_video_to_images(video_batch[:, :vis_frames])
+                error_videos = convert_video_to_images(
+                    decoded[:, :vis_frames] - video_batch[:, :vis_frames],
+                    value_mode="magnitude",
+                    residual_scale=reconstruction_error_scale,
+                )
                 image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
                 save_comparison_images(predicted_videos, expected_videos, image_path)
+                triptych_path = (
+                    f"{eval_dir}/batch_{batch_idx}/reconstruction_triptych_grid.png"
+                )
+                save_reconstruction_triptych_grid(
+                    predicted_videos,
+                    expected_videos,
+                    error_videos,
+                    triptych_path,
+                    title="Tokenizer reconstruction: GT | Recon | Abs Err",
+                )
                 saved_image_paths.append(image_path)
+                saved_triptych_paths.append(triptych_path)
                 logger.info(f"Saved comparison image to {image_path}")
 
             total_loss += loss.item() * video_batch.size(0)
@@ -141,6 +163,12 @@ def eval_model(
         wandb_logger.log_image_batches(
             key_prefix="eval/comparison",
             image_paths=saved_image_paths,
+            batch_size=5,
+            step=global_step,
+        )
+        wandb_logger.log_image_batches(
+            key_prefix="eval/reconstruction_triptych",
+            image_paths=saved_triptych_paths,
             batch_size=5,
             step=global_step,
         )

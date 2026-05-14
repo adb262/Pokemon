@@ -3,6 +3,7 @@
 # from beartype.claw import beartype_all
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +21,12 @@ from data.s3.s3_utils import default_s3_manager
 from loss.loss_fns import clipped_l2_reconstruction_loss, reconstruction_loss
 from monitoring.codebook_usage import compute_codebook_usage
 from monitoring.experiment_logger import ExperimentLogger, resolve_logging_backend
-from monitoring.videos import convert_video_to_images, save_comparison_images
+from monitoring.videos import (
+    convert_video_to_images,
+    save_comparison_images,
+    save_reconstruction_triptych_grid,
+)
+from schedulers.inverse_sigmoid_decay import inverse_sigmoid_decay
 from scripts.video_tokenizer.eval import eval_model
 from torch_utilities.initialize import init_weights
 from video_tokenization.checkpoints import save_checkpoint
@@ -38,8 +44,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-VISUALIZATION_SEQUENCE_FRAMES = 5
 
 
 @dataclass
@@ -102,6 +106,62 @@ def build_reconstruction_criterion(
     )
 
 
+@torch.no_grad()
+def build_scheduled_sampling_input(
+    model: VideoTokenizer,
+    video_batch: torch.Tensor,
+    config: VideoTokenizerTrainingConfig,
+    global_step: int,
+    total_steps: int,
+) -> tuple[torch.Tensor, float, int]:
+    """Create the tokenizer input basis for scheduled sampling.
+
+    The reconstruction target remains the ground-truth ``video_batch``. The
+    returned tensor is only the encoder/decoder input, mixing ground-truth
+    frames with no-grad reconstructions from the current model.
+    """
+    eps = inverse_sigmoid_decay(global_step / max(total_steps, 1), decay_rate=10.0)
+    num_frames = video_batch.shape[1]
+    num_scheduled_frames = max(num_frames - 1, 0)
+
+    if config.scheduled_sampling == "bengio_per_frame":
+        use_gt = torch.rand(num_scheduled_frames, device=video_batch.device) < eps
+        scheduled_input = video_batch.clone()
+        sampling_passes = 0
+
+        for frame_idx in range(num_scheduled_frames):
+            if bool(use_gt[frame_idx]):
+                continue
+
+            quantized = model.encode(scheduled_input)
+            decoded = model.decode(quantized)
+            scheduled_input[:, frame_idx + 1] = decoded[:, frame_idx + 1]
+            sampling_passes += 1
+
+        return scheduled_input, eps, sampling_passes
+
+    if config.scheduled_sampling == "free_run_mix":
+        quantized = model.encode(video_batch)
+        decoded = model.decode(quantized)
+
+        keep_gt_mask = torch.rand(
+            video_batch.shape[0],
+            num_frames,
+            1,
+            1,
+            1,
+            device=video_batch.device,
+        ) < eps
+        keep_gt_mask[:, 0] = True
+        scheduled_input = torch.where(keep_gt_mask, video_batch, decoded)
+        return scheduled_input, eps, num_scheduled_frames
+
+    if config.scheduled_sampling == "off":
+        return video_batch, eps, 0
+
+    raise ValueError(f"Unknown scheduled_sampling mode: {config.scheduled_sampling!r}")
+
+
 def train_epoch(
     model: VideoTokenizer,
     dataloader: VideoWindowLoader,
@@ -114,6 +174,7 @@ def train_epoch(
     config: VideoTokenizerTrainingConfig,
     experiment_logger: ExperimentLogger,
     early_stopping_state: EarlyStoppingState,
+    total_steps: int,
     start_batch: int = 0,
     save_dir: str = "tokenization_results",
 ):
@@ -133,6 +194,8 @@ def train_epoch(
     accumulated_loss_gpu = torch.tensor(0.0, device=device)
     microbatch_count = 0
     logged_codebook_tokens: list[torch.Tensor] = []
+    sampling_eps_acc: list[float] = []
+    sampling_passes_acc: list[int] = []
     saved_on_last_step = False
     use_amp = config.use_bf16 and device.type == "cuda"
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp)
@@ -143,7 +206,20 @@ def train_epoch(
         video_batch = video_batch.to(device, non_blocking=True)
 
         with amp_ctx:
-            quantized = model.encode(video_batch)
+            current_global_step = epoch * (num_batches // accumulation_steps) + (
+                batch_idx // accumulation_steps
+            )
+            scheduled_input, sampling_eps, sampling_passes = build_scheduled_sampling_input(
+                model,
+                video_batch,
+                config,
+                current_global_step,
+                total_steps,
+            )
+            sampling_eps_acc.append(sampling_eps)
+            sampling_passes_acc.append(sampling_passes)
+
+            quantized = model.encode(scheduled_input)
             decoded = model.decode(quantized)
             codebook_tokens = model.quantized_value_to_codes(quantized.detach())
             logged_codebook_tokens.append(codebook_tokens.detach())
@@ -176,6 +252,8 @@ def train_epoch(
                 codebook_token_window, model.get_vocab_size()
             )
             batch_time = time.time() - batch_start_time
+            avg_sampling_eps = sum(sampling_eps_acc) / len(sampling_eps_acc)
+            avg_sampling_passes = sum(sampling_passes_acc) / len(sampling_passes_acc)
 
             global_step = epoch * (num_batches // accumulation_steps) + (
                 batch_idx // accumulation_steps
@@ -187,6 +265,8 @@ def train_epoch(
                 "train/batch_time": batch_time,
                 "train/epoch": epoch,
                 "train/batch": batch_idx,
+                "train/scheduled_sampling_eps": avg_sampling_eps,
+                "train/scheduled_sampling_passes": avg_sampling_passes,
             }
             training_metrics.update(
                 {
@@ -205,12 +285,16 @@ def train_epoch(
                     f"Codebook: unique={int(codebook_usage['num_unique'])}/{model.get_vocab_size()} "
                     f"({codebook_usage['usage_fraction']:.2%}), "
                     f"ppl={codebook_usage['perplexity']:.2f}, "
+                    f"eps={avg_sampling_eps:.3f}, "
+                    f"sampling_passes={avg_sampling_passes:.2f}/{max(video_batch.shape[1] - 1, 0)}, "
                     f"Time: {batch_time:.2f}s"
                 )
 
             accumulated_loss_gpu.zero_()
             microbatch_count = 0
             logged_codebook_tokens = []
+            sampling_eps_acc = []
+            sampling_passes_acc = []
 
             # Save checkpoint + eval periodically (based on cumulative optimizer steps)
             if global_step > 0 and global_step % config.eval_interval == 0:
@@ -222,17 +306,36 @@ def train_epoch(
                 # save step (eval iterates multiple batches; train only has
                 # the current batch), so we always emit one image here and
                 # never accumulate across an epoch.
-                vis_frames = min(VISUALIZATION_SEQUENCE_FRAMES, video_batch.shape[1])
+                vis_frames = min(config.comparison_frame_count(), video_batch.shape[1])
                 predicted_videos = convert_video_to_images(decoded[:, :vis_frames])
                 expected_videos = convert_video_to_images(video_batch[:, :vis_frames])
+                error_videos = convert_video_to_images(
+                    decoded[:, :vis_frames] - video_batch[:, :vis_frames],
+                    value_mode="magnitude",
+                    residual_scale=config.reconstruction_error_scale,
+                )
                 comparison_path = f"{save_dir}/train/epoch_{epoch}/batch_{batch_idx}/comparison_grid.png"
                 save_comparison_images(
                     predicted_videos, expected_videos, comparison_path
+                )
+                triptych_path = f"{save_dir}/train/epoch_{epoch}/batch_{batch_idx}/reconstruction_triptych_grid.png"
+                save_reconstruction_triptych_grid(
+                    predicted_videos,
+                    expected_videos,
+                    error_videos,
+                    triptych_path,
+                    title="Train tokenizer reconstruction: GT | Recon | Abs Err",
                 )
 
                 experiment_logger.log_image_batches(
                     key_prefix="train/comparison",
                     image_paths=[comparison_path],
+                    batch_size=config.max_comparison_images,
+                    step=global_step,
+                )
+                experiment_logger.log_image_batches(
+                    key_prefix="train/reconstruction_triptych",
+                    image_paths=[triptych_path],
                     batch_size=config.max_comparison_images,
                     step=global_step,
                 )
@@ -247,7 +350,8 @@ def train_epoch(
                     save_dir=config.save_dir,
                     global_step=global_step,
                     max_comparison_images=config.max_comparison_images,
-                    max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
+                    max_comparison_frames=config.comparison_frame_count(),
+                    reconstruction_error_scale=config.reconstruction_error_scale,
                 )
 
                 improved = early_stopping_state.update(
@@ -523,7 +627,8 @@ def main(config: VideoTokenizerTrainingConfig):
         save_dir=config.save_dir,
         global_step=0,
         max_comparison_images=config.max_comparison_images,
-        max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
+        max_comparison_frames=config.comparison_frame_count(),
+        reconstruction_error_scale=config.reconstruction_error_scale,
     )
     logger.info(f"Test loss: {test_loss:.6f}")
 
@@ -547,6 +652,7 @@ def main(config: VideoTokenizerTrainingConfig):
                 config,
                 experiment_logger,
                 early_stopping_state,
+                total_steps,
                 epoch_start_batch,
                 config.save_dir,
             )
@@ -574,7 +680,8 @@ def main(config: VideoTokenizerTrainingConfig):
                 save_dir=config.save_dir,
                 global_step=global_step,
                 max_comparison_images=config.max_comparison_images,
-                max_comparison_frames=VISUALIZATION_SEQUENCE_FRAMES,
+                max_comparison_frames=config.comparison_frame_count(),
+                reconstruction_error_scale=config.reconstruction_error_scale,
             )
             logger.info(f"Epoch {epoch} eval loss: {eval_loss:.6f}")
 
@@ -654,8 +761,6 @@ def main(config: VideoTokenizerTrainingConfig):
         if config._temp_tensorboard_dir and os.path.exists(
             config._temp_tensorboard_dir
         ):
-            import shutil
-
             shutil.rmtree(config._temp_tensorboard_dir)
 
     logger.info("Training completed!")
@@ -663,7 +768,8 @@ def main(config: VideoTokenizerTrainingConfig):
 
     if config.use_s3 and s3_manager:
         logger.info(
-            f"Checkpoints and logs saved to S3 bucket: {s3_manager.bucket_name}"
+            "Checkpoints and logs saved to S3 bucket: "
+            f"{config.s3_bucket or os.environ.get('S3_BUCKET_NAME', '<unknown>')}"
         )
     else:
         logger.info(
