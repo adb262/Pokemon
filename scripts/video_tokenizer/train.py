@@ -434,9 +434,10 @@ def main(config: VideoTokenizerTrainingConfig):
     )
 
     if config.use_compile and device.type == "cuda":
-        
-        model: VideoTokenizer = torch.compile(model, mode="reduce-overhead", dynamic=True)  # type: ignore[assignment]
-        logger.info("torch.compile enabled on tokenizer model")
+        logger.info(
+            "torch.compile skipped for tokenizer model so checkpoints keep strict, "
+            "canonical state_dict keys"
+        )
 
     if experiment_logger:
         experiment_logger.watch(model, log="all", log_freq=config.log_interval * 10)

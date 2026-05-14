@@ -12,6 +12,25 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def _model_state_dtype(state_dict: dict[str, torch.Tensor]) -> str:
+    for tensor in state_dict.values():
+        if tensor.is_floating_point():
+            return str(tensor.dtype).removeprefix("torch.")
+    return "float32"
+
+
+def _dtype_from_name(dtype_name: str) -> torch.dtype:
+    dtype_by_name = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    if dtype_name not in dtype_by_name:
+        raise ValueError(f"Unsupported checkpoint model_dtype: {dtype_name!r}")
+    return dtype_by_name[dtype_name]
+
+
 def save_checkpoint(
     model: VideoTokenizer,
     optimizer: optim.Optimizer,
@@ -23,9 +42,11 @@ def save_checkpoint(
     best_loss: float,
     dataloader_state: dict,
 ):
+    model_state_dict = model.state_dict()
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_state_dict,
+        "model_dtype": _model_state_dtype(model_state_dict),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "loss": loss,
@@ -49,7 +70,12 @@ def load_checkpoint(
     device: torch.device,
 ) -> tuple[VideoTokenizer, optim.Optimizer, optim.lr_scheduler.LRScheduler]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model_state_dict = checkpoint["model_state_dict"]
+    model.load_state_dict(model_state_dict)
+    model_dtype = _dtype_from_name(
+        checkpoint.get("model_dtype", _model_state_dtype(model_state_dict))
+    )
+    model.to(device=device, dtype=model_dtype)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     return model, optimizer, scheduler
@@ -73,15 +99,14 @@ def load_model_from_checkpoint(
         if hasattr(config, key):
             setattr(config, key, value)
 
-    model = create_model(config)
-    missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    if missing:
-        # Optionally print or log for debugging
-        logger.warning(f"Missing keys when loading model checkpoint: {missing}")
-    if unexpected:
-        logger.warning(f"Unexpected keys when loading model checkpoint: {unexpected}")
+    model_state_dict = checkpoint["model_state_dict"]
+    model_dtype = _dtype_from_name(
+        checkpoint.get("model_dtype", _model_state_dtype(model_state_dict))
+    )
 
-    model.to(device)
+    model = create_model(config)
+    model.load_state_dict(model_state_dict)
+    model.to(device=device, dtype=model_dtype)
     model.eval()
 
     return model, config
