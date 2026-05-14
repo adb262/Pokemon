@@ -72,7 +72,7 @@ class PatchEmbeddingConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, num_frames, c, h, w)
-        logger.info(f"x shape in patch embedding conv: {x.shape}")
+        logger.debug(f"x shape in patch embedding conv: {x.shape}")
         b, t, c, h, w = x.shape
 
         # 1. Merge Batch and Time so Conv2d can process all frames at once

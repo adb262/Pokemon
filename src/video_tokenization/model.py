@@ -10,7 +10,7 @@ from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrame
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class VideoTokenizerEncoder(nn.Module):
@@ -192,7 +192,6 @@ class VideoTokenizer(nn.Module):
 
     def decode_from_codes(self, x: torch.Tensor) -> torch.Tensor:
         codes = self.fsq.indexes_to_codes(x)
-        logger.info(f"codes shape: {codes.shape}")
         return self.decoder(codes)
 
     def quantized_value_to_codes(self, x: torch.Tensor) -> torch.Tensor:

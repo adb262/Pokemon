@@ -11,7 +11,7 @@ from quantization.fsq import FiniteScalarQuantizer
 from quantization.nsvq import NSVQ
 from torch_utilities.crop_center_patches import get_center_patch_indices
 from torch_utilities.initialize import init_weights
-from torch_utilities.pixel_shuffle_frame_reconstruction import PixelShuffleFrameHead
+from torch_utilities.pixel_shuffle_frame_reconstruction import UpsampleConvFrameHead
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class LatentActionVQVAE(nn.Module):
         embedding_dim: int,
         quantizer_type: Literal["nsvq", "fsq"] = "fsq",
         bins: list[int] = [8],  # vocab size of 8
+        zero_init_output_head: bool = False,
     ):
         super(LatentActionVQVAE, self).__init__()
         self.num_images_in_video = num_images_in_video
@@ -113,7 +114,7 @@ class LatentActionVQVAE(nn.Module):
             use_spatial_transformer=True,
             use_temporal_transformer=True,
         )
-        self.patch_to_pixels = PixelShuffleFrameHead(
+        self.patch_to_pixels = UpsampleConvFrameHead(
             embed_dim=d_model,
             patch_size=patch_height,
             channels=channels,
@@ -135,8 +136,9 @@ class LatentActionVQVAE(nn.Module):
         )
 
         # This will act as a glorified embedding layer for the action
+        # Beware, do not add a layer norm here. It will cause the action to be normalized to 0
+        # when len(bins) is 1.
         self.action_projection = nn.Sequential(
-            nn.LayerNorm(len(bins)),
             nn.Linear(len(bins), 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, d_model)
@@ -148,6 +150,12 @@ class LatentActionVQVAE(nn.Module):
         params = sum(p.numel() for p in self.parameters())
         logger.debug(f"LatentActionVQVAE initialized. Num params: {params}")
         self.apply(init_weights)
+        if zero_init_output_head:
+            self.zero_init_output_head()
+
+    def zero_init_output_head(self) -> None:
+        """Make the decoder initially emit zero-valued residuals."""
+        self.patch_to_pixels.zero_init_output()
 
     def decode(self, video: torch.Tensor, quantized: torch.Tensor) -> torch.Tensor:
         # Trim off the final image from the video for decoder input

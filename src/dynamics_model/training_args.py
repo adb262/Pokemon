@@ -29,13 +29,13 @@ class DynamicsModelTrainingConfig:
     )
 
     log_interval: int = 10
-    save_interval: int = 500
-    eval_interval: int = 1000
+    save_interval: int = 600
+    eval_interval: int = 200
     checkpoint_dir: str = "dynamics_model_checkpoints"
     save_dir: str = "dynamics_model_results"
 
     # Action model configuration
-    action_bins: list[int] = field(default_factory=lambda: [6])
+    action_bins: list[int] = field(default_factory=lambda: [6, 3])
     action_d_model: int = 256
     action_num_transformer_layers: int = 4
     action_num_heads: int = 2
@@ -50,14 +50,14 @@ class DynamicsModelTrainingConfig:
     # frame-to-frame residuals (and we reconstruct next frames as
     # ``prev + residual``). When False, the decoder output is treated as the
     # next frames directly and residual-specific plots/metrics are skipped.
-    predict_action_residuals: bool = True
+    predict_action_residuals: bool = False
     action_decoder_loss: Literal["l2", "clipped_l2"] = "l2"
     action_l2_clip_c: float = 10.0
     dynamics_token_loss: Literal["ce", "clipped_ce"] = "ce"
     dynamics_ce_clip_c: float = 0.03
 
     action_learning_rate: float = 5e-5
-    dynamics_learning_rate: float = 5e-5
+    dynamics_learning_rate: float = 1e-4
 
     # Pretrained tokenizer
     tokenizer_checkpoint_path: str = ""
@@ -89,5 +89,5 @@ class DynamicsModelTrainingConfig:
     dataset_limit: int = 500000
 
     # Rollout evaluation
-    rollout_max_steps: int = 10
-    rollout_eval_batches: int = 5
+    rollout_max_steps: int = 25
+    rollout_eval_batches: int = 1

@@ -81,39 +81,37 @@ def next_frame_reconstruction_loss(
 def clipped_l2_reconstruction_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
-    min_l2_distance_pixels: float = 10.0,
+    l2_clip_c: float = 10.0,
 ) -> torch.Tensor:
-    """Train only on pixels whose 0-255 error is larger than the threshold."""
+    """L2 loss clipped below C, with C expressed in 0-255 pixel units."""
     per_pixel_loss = F.mse_loss(predicted, target, reduction="none")
-    pixel_distance = (predicted - target).abs() * 255.0
-    keep = pixel_distance > min_l2_distance_pixels
-    keep_float = keep.float()
-    return (per_pixel_loss * keep_float).sum() / keep_float.sum().clamp_min(1.0)
+    clip_c = per_pixel_loss.new_tensor(l2_clip_c / (255.0**2))
+    return torch.maximum(per_pixel_loss, clip_c).mean()
 
 
 def clipped_next_frame_reconstruction_loss(
     video: torch.Tensor,
     decoded: torch.Tensor,
-    min_l2_distance_pixels: float = 10.0,
+    l2_clip_c: float = 10.0,
 ) -> torch.Tensor:
     target_frames = video[:, 1:, :, :, :]
     return clipped_l2_reconstruction_loss(
         decoded,
         target_frames,
-        min_l2_distance_pixels=min_l2_distance_pixels,
+        l2_clip_c=l2_clip_c,
     )
 
 
 def clipped_next_frame_reconstruction_residual_loss(
     video: torch.Tensor,
     decoded: torch.Tensor,
-    min_l2_distance_pixels: float = 10.0,
+    l2_clip_c: float = 10.0,
 ) -> torch.Tensor:
     target_residuals = compute_target_residuals(video)
     return clipped_l2_reconstruction_loss(
         decoded,
         target_residuals,
-        min_l2_distance_pixels=min_l2_distance_pixels,
+        l2_clip_c=l2_clip_c,
     )
 
 
@@ -163,7 +161,7 @@ def clipped_cross_entropy_loss(
     predicted_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
     ignore_index: int = -100,
-    max_confidence: float = 0.97,
+    ce_clip_c: float = 0.03,
 ) -> torch.Tensor:
     per_position_loss = F.cross_entropy(
         predicted_tokens.transpose(1, 2),
@@ -172,22 +170,23 @@ def clipped_cross_entropy_loss(
         reduction="none",
     )
 
-    # Drop positions where the model is already very confident on any vocab entry.
-    max_probs = predicted_tokens.softmax(dim=-1).max(dim=-1).values
-    overconfident = max_probs > max_confidence
     valid = target_tokens != ignore_index
-    keep = valid & ~overconfident
+    clipped_loss = torch.maximum(
+        per_position_loss,
+        per_position_loss.new_tensor(ce_clip_c),
+    )
 
-    return (per_position_loss * keep.float()).sum() / keep.float().sum().clamp_min(1.0)
+    valid_float = valid.float()
+    return (clipped_loss * valid_float).sum() / valid_float.sum().clamp_min(1.0)
 
 
 def clipped_l2_loss(
     predicted: torch.Tensor,
     target: torch.Tensor,
-    min_l2_distance_pixels: float = 10,
+    l2_clip_c: float = 10.0,
 ) -> torch.Tensor:
     return clipped_l2_reconstruction_loss(
         predicted,
         target,
-        min_l2_distance_pixels=min_l2_distance_pixels,
+        l2_clip_c=l2_clip_c,
     )

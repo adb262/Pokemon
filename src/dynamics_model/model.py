@@ -122,7 +122,7 @@ class DynamicsModel(nn.Module):
                 return clipped_loss_fn(
                     video,
                     decoded,
-                    min_l2_distance_pixels=action_l2_clip_c,
+                    l2_clip_c=action_l2_clip_c,
                 )
 
             return action_loss
@@ -204,7 +204,7 @@ class DynamicsModel(nn.Module):
             token_loss = clipped_cross_entropy_loss(
                 predicted_tokens=predicted_tokens,
                 target_tokens=target_tokens,
-                max_confidence=1.0 - self.dynamics_ce_clip_c,
+                ce_clip_c=self.dynamics_ce_clip_c,
             )
         else:
             raise ValueError(f"Unknown dynamics_token_loss: {self.dynamics_token_loss!r}")

@@ -30,6 +30,7 @@ def save_checkpoint(
     dataloader_state: dict,
     action_model: LatentActionVQVAE,
     is_best: bool = False,
+    global_step: int | None = None,
 ):
     """Save comprehensive model checkpoint.
 
@@ -52,6 +53,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "loss": loss,
         "best_loss": best_loss,
+        "global_step": global_step,
         "config": config.__dict__,
         "dataloader_state": dataloader_state,
         "timestamp": timestamp,
@@ -85,6 +87,7 @@ def save_checkpoint(
         "model_state_dict": action_model.state_dict(),
         "loss": loss,
         "best_loss": best_loss,
+        "global_step": global_step,
         "config": config.__dict__,
         "timestamp": timestamp,
     }
