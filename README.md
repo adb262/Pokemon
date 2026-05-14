@@ -134,6 +134,32 @@ Pokemon has a lot of issues. For one, it's mostly an animated game. There are su
 
 ## Pong Experiments
 Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
+
+Pong tokenizer
+```
+CUDA_VISIBLE_DEVICES=4 python -m scripts.video_tokenizer.train \
+  --dataset_type atari_pong \
+  --atari_pong_data_dir data/atari_pong \
+  --atari_pong_require_full_gameplay \
+  --image_size 128 \
+  --patch_size 4 \
+  --num_images_in_video 5 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 8 \
+  --num_epochs 1000 \
+  --dataset_limit 1_000_000 \
+  --bins 8 8 6 5 \
+  --save_dir fsq_tokenizer_atari_pong \
+  --checkpoint_dir fsq_tokenizer_atari_pong \
+  --logging-backend tensorboard \
+  --tensorboard_dir runs \
+  --experiment_name fsq_tokenizer_atari_pong_5_frames \
+  > fsq_tokenizer_atari_pong.log 2>&1
+```
+
+TODO:
+- []: Rerun ablations with new upsamplers
+
 ![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
 Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262 (fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt)
 ```
@@ -176,3 +202,4 @@ CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train --dataset_type ata
 CUDA_VISIBLE_DEVICES=4 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 1000 --dataset_limit 100 --save_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_clipped_residual_new_non_zero --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --predict-action-residuals --action-decoder-loss clipped_l2 --action-l2-clip-c 10 --dynamics-token-loss clipped_ce --dynamics-ce-clip-c 0.03 --experiment-name clipped_residual_new_head  > naive_residual_clipped_new_head.log 2>&1
 
 Retrain decoder
+

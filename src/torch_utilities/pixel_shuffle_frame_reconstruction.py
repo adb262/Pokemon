@@ -46,13 +46,13 @@ class PixelShuffleFrameHead(nn.Module):
 class UpsampleConvFrameHead(nn.Module):
     """Decode patch-grid tokens with resize-conv blocks instead of subpixel shuffle."""
 
-    def __init__(self, embed_dim, patch_size=8, channels=3, H=128, W=128):
+    def __init__(self, embed_dim: int, hidden_dim: int, patch_size: int, channels: int, H: int, W: int):
         super().__init__()
         self.H = H
         self.W = W
         self.Hp, self.Wp = H // patch_size, W // patch_size
-        hidden_dim = min(128, max(channels * 16, embed_dim // 4))
 
+        self.pre_norm = nn.RMSNorm(embed_dim)
         self.grid_net = nn.Sequential(
             nn.Conv2d(embed_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
@@ -76,6 +76,7 @@ class UpsampleConvFrameHead(nn.Module):
     def forward(self, tokens):  # [B, T, P, E]
         B, T, P, E = tokens.shape
         logger.debug(f"tokens shape: {tokens.shape}")
+        x = self.pre_norm(tokens)
         x = rearrange(
             tokens, "b t (hp wp) e -> (b t) e hp wp", hp=self.Hp, wp=self.Wp
         )

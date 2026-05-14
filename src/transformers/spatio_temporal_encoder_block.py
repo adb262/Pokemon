@@ -7,6 +7,8 @@ from x_transformers.x_transformers import (
     apply_rotary_pos_emb,
 )
 
+from activations.swiglu import SwiGLU
+
 logger = logging.getLogger(__name__)
 # logger.setLevel(logging.INFO)
 
@@ -42,14 +44,15 @@ class SpatioTemporalEncoderBlock(nn.Module):
         logger.debug(
             f"Creating spatial and temporal transformer attention layers. Using {d_model} as the dimension."
         )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.spatial_ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model)
-        )
-        self.temporal_ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model)
-        )
+
+        self.pre_spatial_attn_norm = nn.RMSNorm(d_model)
+        self.pre_spatial_ffn_norm = nn.RMSNorm(d_model)
+        self.pre_temporal_attn_norm = nn.RMSNorm(d_model)
+        self.pre_temporal_ffn_norm = nn.RMSNorm(d_model)
+
+        self.spatial_ffn = SwiGLU(d_model, 4 * d_model)
+        self.temporal_ffn = SwiGLU(d_model, 4 * d_model)
+
         self.spatial_rotary_emb = (
             RotaryEmbedding(dim=d_model // num_heads)
             if use_spatial_transformer
@@ -75,11 +78,11 @@ class SpatioTemporalEncoderBlock(nn.Module):
         logger.debug(
             f"x shape: {x.shape}. num_frames: {num_frames}, num_patches: {num_patches}, d_model: {d_model}. self.num_images_in_video: {self.num_images_in_video}"
         )
-        x = self.norm1(x)
 
         if self.use_spatial_transformer:
+            x_spatial_in = self.pre_spatial_attn_norm(x)
             # Issue with batch size > 1. Move to reshape
-            x_spatial_in = x.reshape(
+            x_spatial_in = x_spatial_in.reshape(
                 batch_size * num_frames, num_patches, d_model
             ).contiguous()
             logger.debug(f"x_spatial_in shape: {x_spatial_in.shape}")
@@ -97,11 +100,11 @@ class SpatioTemporalEncoderBlock(nn.Module):
             logger.debug(f"x_spatial_out shape: {x_spatial_out.shape}")
             x = x + x_spatial_out.view(batch_size, num_frames, num_patches, d_model)
             logger.debug(f"spatial_attention_output shape: {x.shape}")
-            x = x + self.spatial_ffn(x)
+            x = x + self.spatial_ffn(self.pre_spatial_ffn_norm(x))
 
         if self.use_temporal_transformer:
-            x = self.norm2(x)
-            x_temp = x.permute(0, 2, 1, 3).contiguous()
+            x_temp_in = self.pre_temporal_attn_norm(x)
+            x_temp = x_temp_in.permute(0, 2, 1, 3).contiguous()
             logger.debug(f"x_temp (after permute) shape: {x_temp.shape}")
             x_temp = x_temp.reshape(batch_size * num_patches, num_frames, d_model)
             logger.debug(f"x_temp (after view) shape: {x_temp.shape}")
@@ -133,6 +136,6 @@ class SpatioTemporalEncoderBlock(nn.Module):
                 f"temporal_attention_output (before permute) shape: {temporal_attention_output.shape}"
             )
             x = x + temporal_attention_output
-            x = x + self.temporal_ffn(x)
+            x = x + self.temporal_ffn(self.pre_temporal_ffn_norm(x))
 
         return x

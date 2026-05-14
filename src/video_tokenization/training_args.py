@@ -40,6 +40,7 @@ class VideoTokenizerTrainingConfig:
     seed_cache: bool = False
     # Wandb Configuration
     use_wandb: bool = True
+    logging_backend: Literal["wandb", "tensorboard", "none"] = "wandb"
     wandb_project: str = "pokemon-vqvae"
     wandb_entity: Optional[str] = None
     wandb_tags: Optional[list] = None

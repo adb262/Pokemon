@@ -116,6 +116,7 @@ class LatentActionVQVAE(nn.Module):
         )
         self.patch_to_pixels = UpsampleConvFrameHead(
             embed_dim=d_model,
+            hidden_dim=d_model // 2,
             patch_size=patch_height,
             channels=channels,
             H=image_height,
