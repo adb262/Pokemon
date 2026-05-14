@@ -217,7 +217,7 @@ class LatentActionVQVAE(nn.Module):
         x_encoded_mean = self.action_head(self.pre_action_norm(residuals))
 
         logger.debug(f"x_encoded_mean shape: {x_encoded_mean.shape}")
-        quantized = self.quantizer(x_encoded_mean)
+        quantized = self.quantizer(x_encoded_mean.float())
 
         # quantized, indices, commitment_loss = self.quantizer(action_continuous)
         logger.debug(f"quantized shape: {quantized.shape}")
@@ -276,8 +276,7 @@ class LatentActionVQVAE(nn.Module):
             target_images, "b t p d -> (b t) p d"
         )  # (B*(T-1), P, D)
 
-        # pass to NSVQ
-        quantized = self.quantizer(first_images, target_images)
+        quantized = self.quantizer(first_images.float(), target_images.float())
 
         return quantized
 
@@ -291,7 +290,7 @@ class LatentActionVQVAE(nn.Module):
             raise ValueError(f"Invalid quantizer type: {self.quantizer_type}")
 
     def get_action_sequence(self, quantized: torch.Tensor) -> torch.Tensor:
-        return self.quantizer.quantized_value_to_codes(quantized)
+        return self.quantizer.quantized_value_to_codes(quantized.float())
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         actions = self.encode(video)

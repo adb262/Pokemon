@@ -146,17 +146,17 @@ CUDA_VISIBLE_DEVICES=7 python -m scripts.video_tokenizer.train \
   --num_images_in_video 5 \
   --batch_size 32 \
   --num_epochs 3 \
-  --dataset_limit 1_000_000 \
+  --dataset_limit 100_000 \
   --bins 8 8 6 5 \
-  --save_dir fsq_tokenizer_atari_pong_large_ds_clipped \
-  --checkpoint_dir fsq_tokenizer_atari_pong_large_ds_clipped \
+  --save_dir fsq_tokenizer_atari_pong_large_ds_clipped_bf16 \
+  --checkpoint_dir fsq_tokenizer_atari_pong_large_ds_clipped_bf16 \
   --logging-backend tensorboard \
   --tensorboard_dir tokenizer_runs \
   --experiment_name fsq_tokenizer_atari_pong_5_frames_large_ds_clipped \
   --reconstruction_loss_type clipped_l2 --l2_clip_c 10.0 \
   --early_stopping_patience 10 \
   --early_stopping_min_delta 1e-5 \
-  > fsq_tokenizer_atari_pong_ds_clipped.log 2>&1
+  > fsq_tokenizer_atari_pong_ds_clipped_bf16.log 2>&1
 ```
 
 TODO:
@@ -219,4 +219,7 @@ Retrain decoder
 
 dynamics_model_pong_w_tokenizer_v2 has some crazy results from pre-action model updates. Might be worth reverting action _model to 04-28-upgrade_video_tokenizer_with_swiglu_rmsnorm_nonlinear_upsampler. TBD, need to train the others to same extent.
 
-CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 8 --gradient_accumulation_steps 6 --num_epochs 2 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_256_scheduled >> dynamics_model_pong_w_tokenizer_v2_256_scheduled.log 2>&1
+CUDA_VISIBLE_DEVICES=6 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 32 --num_epochs 2 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt >> dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt.log 2>&1
+
+
+CUDA_VISIBLE_DEVICES=3 python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong_large_ds/checkpoint_epoch2_batch31250.pt --image_size 84 --patch_size 4 --num_images_in_video 5 --batch_size 32 --num_epochs 2 --dataset_limit 1_000_000 --save_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action --checkpoint_dir dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action --action_d_model 128 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 32 --logging-backend tensorboard --tensorboard-dir runs --atari_pong_require_full_gameplay --experiment-name dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action --dynamics_d_model 512 > dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action.log 2>&1

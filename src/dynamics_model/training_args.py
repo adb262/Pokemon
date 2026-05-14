@@ -15,7 +15,7 @@ class DynamicsModelTrainingConfig:
     num_images_in_video: int = 5
     frame_spacing: int = 1
     num_unique_frames: Optional[int] = None
-    batch_size: int = 4
+    batch_size: int = 32
     gradient_accumulation_steps: int = 1
     num_epochs: int = 3
     warmup_steps: int = 100
@@ -29,8 +29,8 @@ class DynamicsModelTrainingConfig:
     )
 
     log_interval: int = 10
-    save_interval: int = 500
-    eval_interval: int = 500
+    save_interval: int = 1000
+    eval_interval: int = 1000
     checkpoint_dir: str = "dynamics_model_checkpoints"
     save_dir: str = "dynamics_model_results"
 
@@ -91,3 +91,13 @@ class DynamicsModelTrainingConfig:
     # Rollout evaluation
     rollout_max_steps: int = 5
     rollout_eval_batches: int = 1
+    # Run rollout eval only once every N eval-suite invocations, i.e. every
+    # ``eval_interval * rollout_every_n_evals`` optimizer steps. Standard
+    # (non-rollout) eval still runs every ``eval_interval`` steps. Defaults
+    # to 1, which matches the previous behavior of rolling out on every eval.
+    rollout_every_n_evals: int = 5
+
+    # Performance optimizations
+    scheduled_sampling: Literal["bengio_per_frame", "free_run_mix", "off"] = "bengio_per_frame"
+    use_bf16: bool = True
+    use_compile: bool = True

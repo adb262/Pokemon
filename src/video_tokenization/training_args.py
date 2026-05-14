@@ -84,6 +84,10 @@ class VideoTokenizerTrainingConfig:
     # ``early_stopping_min_delta``. ``patience <= 0`` disables early stopping.
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
+    # Performance optimizations
+    use_bf16: bool = True
+    use_compile: bool = True
+
     # Temporary attributes for S3 operations
     _temp_log_file: Optional[str] = None
     _temp_tensorboard_dir: Optional[str] = None

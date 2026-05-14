@@ -147,12 +147,9 @@ class DynamicsModel(nn.Module):
         logger.debug(f"video shape: {video.shape}")
         # x is of shape (batch_size, num_images_in_video, num_patches)
         with torch.no_grad():
-            # x is of shape (batch_size, num_images_in_video, num_patches)
             targets = self.tokenizer.quantized_value_to_codes(
                 self.tokenizer.encode(video_prediction_basis)
             ).long()
-
-            # Get targets for the original video, not the prediction basis
             original_targets = self.tokenizer.quantized_value_to_codes(
                 self.tokenizer.encode(video)
             ).long()
@@ -206,7 +203,7 @@ class DynamicsModel(nn.Module):
 
         return x, token_loss, action_tokens
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _inference_window(
         self,
         video: torch.Tensor,
@@ -239,7 +236,6 @@ class DynamicsModel(nn.Module):
             )
 
         with torch.no_grad():
-            # (B, N, P) codebook indices; last frame's entries will be masked below.
             targets = self.tokenizer.quantized_value_to_codes(
                 self.tokenizer.encode(video)
             ).long()
@@ -360,7 +356,7 @@ class DynamicsModel(nn.Module):
 
         return self.tokenizer.decode_from_codes(targets.float())
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def inference(
         self, video: torch.Tensor, action: torch.Tensor, max_steps: int = 25
     ) -> torch.Tensor:
@@ -428,9 +424,22 @@ class DynamicsModel(nn.Module):
             )  # (B, num_windows)
             batched_actions = batched_actions.reshape(batch_size * num_windows)
 
-        decoded_windows = self._inference_window(
-            windows, batched_actions, max_steps=max_steps
-        )  # (B * num_windows, T, C, H, W)
+        max_batch = 64
+        total = windows.shape[0]
+        if total <= max_batch:
+            decoded_windows = self._inference_window(
+                windows, batched_actions, max_steps=max_steps
+            )
+        else:
+            decoded_chunks = []
+            for i in range(0, total, max_batch):
+                chunk = self._inference_window(
+                    windows[i : i + max_batch],
+                    batched_actions[i : i + max_batch],
+                    max_steps=max_steps,
+                )
+                decoded_chunks.append(chunk)
+            decoded_windows = torch.cat(decoded_chunks, dim=0)
 
         predicted_last = decoded_windows[:, -1].reshape(
             batch_size, num_windows, *video.shape[2:]
@@ -439,7 +448,7 @@ class DynamicsModel(nn.Module):
         context = video[:, : window_size - 1]  # (B, T-1, C, H, W)
         return torch.cat([context, predicted_last], dim=1)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def predict_next_frame(
         self,
         context: torch.Tensor,
@@ -482,7 +491,7 @@ class DynamicsModel(nn.Module):
         )
         return decoded_window[:, -1]
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def rollout(
         self, video: torch.Tensor, actions: torch.Tensor, max_steps: int = 10
     ) -> torch.Tensor:

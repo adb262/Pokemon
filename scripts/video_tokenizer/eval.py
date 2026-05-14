@@ -34,6 +34,7 @@ def eval_model(
     save_dir: str = "tokenization_results",
     global_step: int | None = None,
     max_comparison_images: int = 5,
+    max_comparison_frames: int = 5,
 ):
     model.eval()
     total_loss = 0.0
@@ -68,8 +69,9 @@ def eval_model(
             # View as (b, num_frames, h, w, c)
             # Decoded is the residual, must add the previous frame to get the predicted frame
             if len(saved_image_paths) < max_comparison_images:
-                predicted_videos = convert_video_to_images(decoded)
-                expected_videos = convert_video_to_images(video_batch)
+                vis_frames = min(max_comparison_frames, video_batch.shape[1])
+                predicted_videos = convert_video_to_images(decoded[:, :vis_frames])
+                expected_videos = convert_video_to_images(video_batch[:, :vis_frames])
                 image_path = f"{eval_dir}/batch_{batch_idx}/comparison_grid.png"
                 save_comparison_images(predicted_videos, expected_videos, image_path)
                 saved_image_paths.append(image_path)

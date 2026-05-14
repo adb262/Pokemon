@@ -46,6 +46,16 @@ class ResumableDataLoader:
         self.current_batch = start_batch
 
     def __iter__(self) -> Iterator[torch.Tensor]:
+        # If the previous iteration ran to completion, ``current_batch``
+        # points past the last batch of the epoch. Re-iterating from there
+        # would tell the sampler to skip the entire epoch and silently yield
+        # zero batches, which is what callers that don't manage epoch state
+        # (e.g. ``eval_model``) see as ``avg_loss=inf`` on the second eval.
+        # Auto-reset to a fresh pass in that case while still honoring
+        # mid-epoch resume positions.
+        num_batches = len(self.dataloader)
+        if self.current_batch >= num_batches:
+            self.current_batch = 0
         start_batch = self.current_batch
         if self.sampler is not None:
             self.sampler.set_epoch(self.current_epoch)
