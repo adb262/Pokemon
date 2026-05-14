@@ -89,7 +89,7 @@ class DynamicsModelTrainingConfig:
     dataset_limit: int = 500000
 
     # Rollout evaluation
-    rollout_max_steps: int = 5
+    rollout_max_denoising_steps: int = 5
     rollout_eval_batches: int = 1
     # Run rollout eval only once every N eval-suite invocations, i.e. every
     # ``eval_interval * rollout_every_n_evals`` optimizer steps. Standard

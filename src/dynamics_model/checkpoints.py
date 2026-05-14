@@ -18,6 +18,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_ORIG_MOD_MARKER = "._orig_mod."
+
+
+def _strip_orig_mod(key: str) -> str:
+    return key.replace(_ORIG_MOD_MARKER, ".")
+
+
+def adapt_state_dict_to_model(
+    state_dict: dict, model: torch.nn.Module
+) -> dict:
+    """Map checkpoint keys onto the layout the target ``model`` expects.
+
+    ``torch.compile`` wraps submodules in ``OptimizedModule`` (the training
+    script compiles ``model.decoder``, ``action_model.encoder``, and
+    ``action_model.decoder_transformer``), which inserts ``._orig_mod.`` into
+    the wrapped submodule's parameter names. As a result, checkpoints saved
+    during training can carry ``._orig_mod.`` in their keys while the
+    "canonical" checkpoints (and the uncompiled model used at inference) do
+    not.
+
+    To load either flavor into either flavor of model, we canonicalize every
+    state-dict key by stripping ``._orig_mod.`` and look up the matching key
+    on the model. The model's own ``state_dict`` keys are the source of truth
+    for whether ``_orig_mod`` is present, so this adapts in both directions:
+
+    - canonical checkpoint (no ``_orig_mod``) → compiled model: inserts
+      ``_orig_mod`` to match the model's wrapped submodule keys.
+    - non-canonical checkpoint (with ``_orig_mod``) → uncompiled model:
+      strips ``_orig_mod`` to match the canonical key layout.
+    - matching layouts on both sides: returned unchanged.
+    """
+    model_keys = list(model.state_dict().keys())
+    if set(state_dict.keys()) == set(model_keys):
+        return state_dict
+
+    canonical_to_model_key = {_strip_orig_mod(k): k for k in model_keys}
+
+    adapted: dict = {}
+    rewritten = 0
+    for key, value in state_dict.items():
+        target_key = canonical_to_model_key.get(_strip_orig_mod(key), key)
+        if target_key != key:
+            rewritten += 1
+        adapted[target_key] = value
+
+    if rewritten:
+        logger.info(
+            "Adapted %d/%d state_dict keys to match model layout "
+            "(torch.compile '_orig_mod' canonicalization)",
+            rewritten,
+            len(state_dict),
+        )
+    return adapted
+
+
 def save_checkpoint(
     model: DynamicsModel,
     optimizer: optim.Optimizer,
@@ -117,7 +172,8 @@ def load_checkpoint(
 ) -> tuple[DynamicsModel, optim.Optimizer, optim.lr_scheduler.LRScheduler, dict]:
     """Load model checkpoint"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = adapt_state_dict_to_model(checkpoint["model_state_dict"], model)
+    model.load_state_dict(state_dict)
     optimizer_state_loaded = False
     try:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

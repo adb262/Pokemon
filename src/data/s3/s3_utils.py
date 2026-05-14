@@ -453,4 +453,71 @@ def get_s3_manager_from_env() -> S3Manager:
     )
 
 
-default_s3_manager = get_s3_manager_from_env()
+class _DefaultS3ManagerProxy:
+    """Create the default S3 manager only when an S3 operation is requested."""
+
+    def __init__(self) -> None:
+        self._manager: Optional[S3Manager] = None
+
+    def _get_manager(self) -> S3Manager:
+        if self._manager is None:
+            self._manager = get_s3_manager_from_env()
+        return self._manager
+
+    def upload_file(
+        self,
+        local_path: Union[str, Path],
+        s3_key: str,
+        extra_args: Optional[Dict] = None,
+    ) -> bool:
+        return self._get_manager().upload_file(local_path, s3_key, extra_args)
+
+    def download_file(self, s3_key: str, local_path: Union[str, Path]) -> bool:
+        return self._get_manager().download_file(s3_key, local_path)
+
+    def upload_bytes(
+        self, data: bytes, s3_key: str, content_type: Optional[str] = None
+    ) -> bool:
+        return self._get_manager().upload_bytes(data, s3_key, content_type)
+
+    def download_bytes(self, s3_key: str) -> Optional[bytes]:
+        return self._get_manager().download_bytes(s3_key)
+
+    def list_objects(self, prefix: str = "", suffix: str = "") -> List[str]:
+        return self._get_manager().list_objects(prefix, suffix)
+
+    def object_exists(self, s3_key: str) -> bool:
+        return self._get_manager().object_exists(s3_key)
+
+    def delete_object(self, s3_key: str) -> bool:
+        return self._get_manager().delete_object(s3_key)
+
+    def upload_json(self, data: Dict[str, Any], s3_key: str) -> bool:
+        return self._get_manager().upload_json(data, s3_key)
+
+    def download_json(self, s3_key: str) -> Optional[Dict[str, Any]]:
+        return self._get_manager().download_json(s3_key)
+
+    def upload_pytorch_model(
+        self, model_state_dict: Dict[str, Any], s3_key: str
+    ) -> bool:
+        return self._get_manager().upload_pytorch_model(model_state_dict, s3_key)
+
+    def download_pytorch_model(
+        self, s3_key: str, map_location: str = "cpu"
+    ) -> Optional[Dict[str, Any]]:
+        return self._get_manager().download_pytorch_model(s3_key, map_location)
+
+    def upload_image(
+        self, image: Image.Image, s3_key: str, format: str = "PNG"
+    ) -> bool:
+        return self._get_manager().upload_image(image, s3_key, format)
+
+    def download_image(self, s3_key: str) -> Optional[Image.Image]:
+        return self._get_manager().download_image(s3_key)
+
+    def get_object_info(self, s3_key: str) -> Optional[Dict[str, Any]]:
+        return self._get_manager().get_object_info(s3_key)
+
+
+default_s3_manager = _DefaultS3ManagerProxy()

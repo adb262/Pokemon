@@ -1,7 +1,31 @@
+import logging
+
 import torch
+
+from dynamics_model.checkpoints import adapt_state_dict_to_model
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.model import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _compile_action_model_for_checkpoint_load(model: LatentActionVQVAE) -> None:
+    """Wrap the same submodules training compiles, so checkpoint keys align.
+
+    The training script wraps ``model.encoder`` and ``model.decoder_transformer``
+    with ``torch.compile``, which inserts ``._orig_mod.`` into those submodules'
+    ``state_dict`` keys. Compiling here before ``load_state_dict`` makes the
+    model's expected keys match checkpoints that were saved while compiled
+    (e.g. ``checkpoint_epoch1_batch12749`` from
+    ``dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action``).
+    Canonical (already-stripped) checkpoints still load correctly because
+    ``adapt_state_dict_to_model`` re-inserts ``_orig_mod`` to match.
+    """
+    model.encoder = torch.compile(model.encoder, dynamic=True)  # type: ignore[assignment]
+    model.decoder_transformer = torch.compile(  # type: ignore[assignment]
+        model.decoder_transformer, dynamic=True
+    )
 
 
 def create_action_model(
@@ -51,7 +75,15 @@ def create_action_model_from_dynamics_config(
     )
 
     if config.action_model_checkpoint_path:
+        _compile_action_model_for_checkpoint_load(model)
         checkpoint = torch.load(config.action_model_checkpoint_path)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = adapt_state_dict_to_model(
+            checkpoint["model_state_dict"], model
+        )
+        model.load_state_dict(state_dict)
+        logger.info(
+            "Loaded action model weights from %s",
+            config.action_model_checkpoint_path,
+        )
 
     return model

@@ -6,6 +6,7 @@ from monitoring.videos.visualize import (
     convert_video_to_images,
     save_comparison_images,
     save_comparison_images_next_frame,
+    save_reconstruction_triptych_grid,
     save_residual_comparison_images,
     save_rollout_comparison_grid,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "convert_video_to_images",
     "save_comparison_images",
     "save_comparison_images_next_frame",
+    "save_reconstruction_triptych_grid",
     "save_residual_comparison_images",
     "save_rollout_comparison_grid",
 ]
