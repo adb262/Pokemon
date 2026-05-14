@@ -108,7 +108,7 @@ class OpenWorldRunningDatasetCreator:
         return (
             f"{self.dataset_dir}_{stage}_{formatted_split}"
             f"_{self.num_frames_in_video}_frames"
-            f"_spacing_{self.frame_spacing}_v3.json"
+            f"_spacing_{self.frame_spacing}_{self.limit}v3.json"
         )
 
     def _filter_to_correct_num_frames(self, dataset: OpenWorldVideoLog) -> OpenWorldVideoLog:

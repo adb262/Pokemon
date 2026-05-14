@@ -7,6 +7,7 @@ from latent_action_model.model import LatentActionVQVAE
 from loss.loss_fns import (
     changed_patch_weighted_token_cross_entropy_loss,
     next_frame_reconstruction_loss,
+    next_frame_reconstruction_loss_l1,
 )
 from torch_utilities.initialize import init_weights
 from transformers.spatio_temporal_transformer import SpatioTemporalTransformer
@@ -69,7 +70,7 @@ class DynamicsModel(nn.Module):
         )
         self.softmax = nn.Softmax(dim=-1)
         self.changed_patch_loss_weight = 30.0
-        self.action_loss_fn = next_frame_reconstruction_loss
+        self.action_loss_fn = next_frame_reconstruction_loss_l1
 
         # Only initialize the newly-created submodules. ``self.apply`` would
         # recurse into ``self.tokenizer`` and ``self.action_model`` and wipe
@@ -154,7 +155,7 @@ class DynamicsModel(nn.Module):
         # )
         # current_frame_tokens = rearrange(
         #     original_targets[:, -1:, :], "b t p -> b (t p)"
-        # )
+        # ) python -m scripts.dynamics_model.train --dataset_type atari_pong --atari_pong_data_dir data/atari_pong --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt --image_size 128 --patch_size 4 --num_images_in_video 5 --batch_size 4 --gradient_accumulation_steps 8 --num_epochs 10 --save_dir dynamics_model_atari_pong_action_103m_5_frames_l1_ --checkpoint_dir dynamics_model_atari_pong_action_103m_5_frames_l1 --action_d_model 512 --action_num_transformer_layers 8 --action_num_heads 8 --action_latent_dim 64
         # token_loss = changed_patch_weighted_token_cross_entropy_loss(
         #     predicted_tokens=predicted_tokens,
         #     target_tokens=target_tokens,

@@ -158,3 +158,4 @@ How can we improve?
 - Using latent prediction for our action model. Instead of pixel space movement, can we predict how the semantics of the frames change?
   - Could even just use a JEPA as the base model
 - I want to stick to unlabeled data as much as possible. I think labels are helpful but cut off our ability to look at any video and translate it.
+- Could programmatically boost the importance of the ball prediction

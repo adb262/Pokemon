@@ -21,7 +21,7 @@ from data.s3.s3_utils import S3Manager, default_s3_manager
 from latent_action_model.create_model import create_action_model
 from latent_action_model.model import LatentActionVQVAE
 from latent_action_model.training_args import VideoTrainingConfig
-from loss.loss_fns import next_frame_reconstruction_loss
+from loss.loss_fns import next_frame_reconstruction_loss, next_frame_reconstruction_loss_l1
 from monitoring.setup_wandb import setup_wandb
 from monitoring.videos import (
     convert_video_to_images,
@@ -635,7 +635,7 @@ def main(config: VideoTrainingConfig):
     )
 
     # Loss function
-    criterion = next_frame_reconstruction_loss
+    criterion = next_frame_reconstruction_loss_l1
     s3_manager = default_s3_manager
 
     # Resume from checkpoint if specified
