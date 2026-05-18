@@ -25,6 +25,10 @@ wandb/
 *.json
 
 data
+!scripts/data/
+scripts/data/*
+!scripts/data/generate_two_player_pong.py
+!scripts/data/visualize_two_player_pong_npz.py
 runs/
 tokenizer_runs/
 

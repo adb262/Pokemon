@@ -13,9 +13,12 @@ logger.setLevel(logging.INFO)
 
 
 _ORIG_MOD_MARKER = "._orig_mod."
+_ORIG_MOD_PREFIX = "_orig_mod."
 
 
 def _strip_orig_mod(key: str) -> str:
+    if key.startswith(_ORIG_MOD_PREFIX):
+        key = key[len(_ORIG_MOD_PREFIX):]
     return key.replace(_ORIG_MOD_MARKER, ".")
 
 

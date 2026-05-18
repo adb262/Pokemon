@@ -135,6 +135,62 @@ Pokemon has a lot of issues. For one, it's mostly an animated game. There are su
 ## Pong Experiments
 Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
 
+### Two-Player Pong Control Data
+Collect an isolated two-player Pong dataset with transition-aligned labels for both paddles:
+
+If Pong ROMs are missing in a fresh environment, install them once with:
+
+```
+uv run AutoROM --accept-license
+```
+
+```
+python -m scripts.data.generate_two_player_pong \
+  --output-dir data/two_player_pong_smoke \
+  --num-windows-train 8 \
+  --num-windows-val 4 \
+  --num-windows-test 4 \
+  --windows-per-file 4 \
+  --window-size 160 \
+  --overwrite
+```
+
+Scale-up example:
+
+```
+python -m scripts.data.generate_two_player_pong \
+  --output-dir data/two_player_pong \
+  --num-windows-train 100000 \
+  --num-windows-val 10000 \
+  --num-windows-test 10000 \
+  --windows-per-file 1024 \
+  --window-size 160 \
+  --max-episode-steps 1000 \
+  --policy random
+```
+
+Each shard is a standalone `.npz` with `frames` shaped `(N, T, 84, 84, 3)` and `dual_actions` shaped `(N, T - 1, 2)`, where labels are `0=nothing`, `1=up`, and `2=down`. Frames are grayscale Atari observations repeated across RGB channels to match the existing Pong training data, windows are filtered away from reset/serve-only spans with a ball-visibility check, and every stored transition is one PettingZoo/ALE step at `frame_spacing=1` with no frame skip. Before capture starts, the collector can send raw `FIRE` actions to get past the serve screen; once a sequence starts, `dual_actions[t]` and `raw_actions[t]` are the exact commands sent for `frames[t] -> frames[t + 1]`.
+
+Visualize labels from any shard:
+
+```
+python -m scripts.data.visualize_two_player_pong_npz \
+  data/two_player_pong_smoke/train/chunk_000000.npz \
+  --num-samples 4 \
+  --max-frames 16
+```
+
+Render frame-to-frame residuals instead of raw frames:
+
+```
+python -m scripts.data.visualize_two_player_pong_npz \
+  data/two_player_pong_smoke/train/chunk_000000.npz \
+  --num-samples 4 \
+  --max-frames 16 \
+  --show-residuals \
+  --residual-offset 4
+```
+
 Pong tokenizer
 ```
 CUDA_VISIBLE_DEVICES=7 python -m scripts.video_tokenizer.train \
@@ -199,3 +255,20 @@ Retrain decoder
 - Switch to RMSNorm
 
 dynamics_model_pong_w_tokenizer_v2 has some crazy results from pre-action model updates. Might be worth reverting action _model to 04-28-upgrade_video_tokenizer_with_swiglu_rmsnorm_nonlinear_upsampler. TBD, need to train the others to same extent.
+
+
+### Gold Models
+Dynamics Model
+```
+dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/checkpoint_latest.pt   
+```
+
+Action Model
+```
+dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/action_model/checkpoint_latest.pt
+```
+
+Tokenizer
+```
+post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt
+```
