@@ -54,6 +54,9 @@ RAW_ACTION_TO_NAME: dict[int, str] = {
     5: "DOWN",
 }
 FIRE_ACTION = 1
+LEFT_PADDLE_COLOR = np.asarray([213, 130, 74], dtype=np.uint8)
+RIGHT_PADDLE_COLOR = np.asarray([92, 186, 92], dtype=np.uint8)
+BALL_COLOR = np.asarray([236, 236, 236], dtype=np.uint8)
 LOG_LEVELS: dict[str, int] = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -210,19 +213,172 @@ def _bright_pixel_y_center(frame: np.ndarray, x_min: int, x_max: int) -> float |
     return float(y_positions.mean())
 
 
+def _component_y_center(
+    frame: np.ndarray,
+    x_min: int,
+    x_max: int,
+    *,
+    min_area: int,
+    max_area: int | None,
+    min_height: int,
+    max_height: int | None,
+    ignore_center_line: bool,
+) -> float | None:
+    grayscale = frame[:, :, 0]
+    height, width = grayscale.shape
+    region = grayscale[:, x_min:x_max].copy()
+
+    if ignore_center_line:
+        center_x = width // 2 - x_min
+        center_margin = max(width // 42, 1)
+        left = max(center_x - center_margin, 0)
+        right = min(center_x + center_margin + 1, region.shape[1])
+        if left < right:
+            region[:, left:right] = 0
+
+    bright_mask = (region >= 80).astype(np.uint8)
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        bright_mask,
+        connectivity=8,
+    )
+    best_label: int | None = None
+    best_area = -1
+    y_min = max(height // 8, 1)
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        component_height = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+        top = int(stats[label_idx, cv2.CC_STAT_TOP])
+        if top < y_min:
+            continue
+        if area < min_area:
+            continue
+        if max_area is not None and area > max_area:
+            continue
+        if component_height < min_height:
+            continue
+        if max_height is not None and component_height > max_height:
+            continue
+        if area > best_area:
+            best_area = area
+            best_label = label_idx
+
+    if best_label is None:
+        return None
+    return float(centroids[best_label][1])
+
+
+def _paddle_y_center(frame: np.ndarray, x_min: int, x_max: int) -> float | None:
+    return _component_y_center(
+        frame,
+        x_min,
+        x_max,
+        min_area=6,
+        max_area=None,
+        min_height=4,
+        max_height=None,
+        ignore_center_line=False,
+    )
+
+
+def _ball_y_center(frame: np.ndarray) -> float | None:
+    height, width, _channels = frame.shape
+    return _component_y_center(
+        frame,
+        width // 7,
+        min(width - width // 7, width),
+        min_area=1,
+        max_area=20,
+        min_height=1,
+        max_height=6,
+        ignore_center_line=True,
+    )
+
+
+def _raw_color_component_y_center(
+    frame: np.ndarray,
+    color: np.ndarray,
+    *,
+    x_min: int,
+    x_max: int,
+    y_min: int,
+    min_area: int,
+    max_area: int | None,
+) -> float | None:
+    mask = np.all(frame == color, axis=-1)
+    if x_min > 0:
+        mask[:, :x_min] = False
+    if x_max < frame.shape[1]:
+        mask[:, x_max:] = False
+    if y_min > 0:
+        mask[:y_min, :] = False
+
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
+    best_label: int | None = None
+    best_area = -1
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        if max_area is not None and area > max_area:
+            continue
+        if area > best_area:
+            best_area = area
+            best_label = label_idx
+
+    if best_label is None:
+        return None
+    return float(centroids[best_label][1])
+
+
+def _raw_tracking_centers(
+    frame: np.ndarray,
+) -> tuple[float | None, float | None, float | None]:
+    height, width, _channels = frame.shape
+    left_paddle_y = _raw_color_component_y_center(
+        frame,
+        LEFT_PADDLE_COLOR,
+        x_min=0,
+        x_max=width // 3,
+        y_min=height // 6,
+        min_area=16,
+        max_area=None,
+    )
+    right_paddle_y = _raw_color_component_y_center(
+        frame,
+        RIGHT_PADDLE_COLOR,
+        x_min=(2 * width) // 3,
+        x_max=width,
+        y_min=height // 6,
+        min_area=16,
+        max_area=None,
+    )
+    ball_y = _raw_color_component_y_center(
+        frame,
+        BALL_COLOR,
+        x_min=1,
+        x_max=width - 1,
+        y_min=height // 6,
+        min_area=1,
+        max_area=32,
+    )
+    return left_paddle_y, ball_y, right_paddle_y
+
+
 def tracking_labels(frame: np.ndarray, deadzone: int) -> tuple[int, int]:
     height, width, _channels = frame.shape
-    left_paddle_y = _bright_pixel_y_center(frame, 0, max(width // 4, 1))
-    right_paddle_y = _bright_pixel_y_center(
-        frame,
-        min((3 * width) // 4, width - 1),
-        width,
-    )
-    ball_y = _bright_pixel_y_center(
-        frame,
-        width // 4,
-        max((3 * width) // 4, width // 4 + 1),
-    )
+    if height > 100:
+        left_paddle_y, ball_y, right_paddle_y = _raw_tracking_centers(frame)
+    else:
+        left_paddle_y = _paddle_y_center(frame, 0, max(width // 4, 1))
+        right_paddle_y = _paddle_y_center(
+            frame,
+            min((3 * width) // 4, width - 1),
+            width,
+        )
+        ball_y = _ball_y_center(frame)
     if ball_y is None:
         ball_y = height / 2.0
 
@@ -274,6 +430,7 @@ def collect_episode(
 ) -> Episode:
     episode_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     observations = _reset_env(env, episode_seed)
+    current_policy_frame = observations[AGENT_ORDER[0]]
     current_frame = preprocess_frame(observations[AGENT_ORDER[0]], args.frame_size)
     frames = [current_frame]
     dual_actions: list[tuple[int, int]] = []
@@ -288,7 +445,7 @@ def collect_episode(
         if force_fire:
             labels = (0, 0)
         else:
-            labels = choose_dual_labels(args, rng, current_frame, previous_labels)
+            labels = choose_dual_labels(args, rng, current_policy_frame, previous_labels)
         raw_pair = labels_to_raw_actions(labels, force_fire=force_fire)
 
         # PettingZoo Pong's first agent controls the right screen paddle, while
@@ -306,7 +463,8 @@ def collect_episode(
         if AGENT_ORDER[0] not in observations:
             break
 
-        current_frame = preprocess_frame(observations[AGENT_ORDER[0]], args.frame_size)
+        current_policy_frame = observations[AGENT_ORDER[0]]
+        current_frame = preprocess_frame(current_policy_frame, args.frame_size)
         dual_actions.append(labels)
         raw_actions.append(raw_pair)
         frames.append(current_frame)
@@ -337,6 +495,7 @@ def collect_sequence(
     """
     episode_seed = int(rng.integers(0, np.iinfo(np.int32).max))
     observations = _reset_env(env, episode_seed)
+    current_policy_frame = observations[AGENT_ORDER[0]]
     current_frame = preprocess_frame(observations[AGENT_ORDER[0]], args.frame_size)
     previous_labels = (0, 0)
     active_start_offset: int | None = None
@@ -361,7 +520,8 @@ def collect_sequence(
         observations, done = _step_env(env, action_by_agent)
         if done or AGENT_ORDER[0] not in observations:
             return None
-        current_frame = preprocess_frame(observations[AGENT_ORDER[0]], args.frame_size)
+        current_policy_frame = observations[AGENT_ORDER[0]]
+        current_frame = preprocess_frame(current_policy_frame, args.frame_size)
 
     if active_start_offset is None:
         return None
@@ -371,7 +531,7 @@ def collect_sequence(
     raw_actions: list[tuple[int, int]] = []
 
     while len(frames) < args.window_size:
-        labels = choose_dual_labels(args, rng, current_frame, previous_labels)
+        labels = choose_dual_labels(args, rng, current_policy_frame, previous_labels)
         raw_pair = labels_to_raw_actions(labels, force_fire=False)
 
         action_by_agent = {}
@@ -388,7 +548,8 @@ def collect_sequence(
 
         dual_actions.append(labels)
         raw_actions.append(raw_pair)
-        current_frame = preprocess_frame(observations[AGENT_ORDER[0]], args.frame_size)
+        current_policy_frame = observations[AGENT_ORDER[0]]
+        current_frame = preprocess_frame(current_policy_frame, args.frame_size)
         frames.append(current_frame)
         previous_labels = labels
 
