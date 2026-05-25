@@ -436,7 +436,7 @@ def evaluate(
         actions = batch["actions"].to(device, non_blocking=True)
         video_token_latents = compute_video_token_latents(dynamics_model, video)
         target_actions = compute_target_actions(action_model, video)
-        logits = model(video_token_latents, actions)
+        logits = model(video_token_latents[:, :-1, :, :], actions)
         loss = model.compute_loss(logits, target_actions)
         num_tokens = target_actions.numel()
         total_loss += loss.item() * num_tokens
@@ -635,7 +635,7 @@ def main(config: ActionMappingTrainingConfig) -> None:
                     target_actions = compute_target_actions(action_model, video)
 
                 with amp_ctx:
-                    logits = model(video_token_latents, actions)
+                    logits = model(video_token_latents[:, :-1, :, :], actions)
                     loss = model.compute_loss(logits, target_actions)
 
                 accumulation_boundary = (

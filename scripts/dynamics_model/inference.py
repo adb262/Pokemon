@@ -16,13 +16,21 @@ import tyro
 from data.data_loaders.factory import build_datasets
 from data.data_loaders.video_window_loader import VideoWindowLoader
 from data.datasets.cache import Cache
-from dynamics_model.checkpoints import adapt_state_dict_to_model
+from dynamics_model.checkpoints import (
+    adapt_state_dict_to_model,
+    remove_tokenizer_state_dict_entries,
+)
 from dynamics_model.create_model import create_dynamics_model
 from dynamics_model.training_args import DynamicsModelTrainingConfig
 from latent_action_model.create_model import create_action_model_from_dynamics_config
 from scripts.dynamics_model.rollout_strategies import (
     ROLLOUT_STRATEGIES,
     rollout_with_strategy,
+)
+from scripts.video_tokenizer.post_train_tokenizer import (
+    PostTrainTokenizerConfig,
+    _get_rolling_gt_action_tokens,
+    rollout_with_trainable_decoder,
 )
 from video_tokenization.checkpoints import load_model_from_checkpoint
 
@@ -60,6 +68,7 @@ class InteractiveInferenceArgs:
         "spam_actions_grid",
         "compare_denoising_steps",
         "compare_rollout_strategies",
+        "visualize_denoising_trace",
     ] = "interactive"
     device: str = BASE_CONFIG.device
     num_images_in_video: int = BASE_CONFIG.num_images_in_video
@@ -223,7 +232,17 @@ def _load_dynamics_model(
         checkpoint = torch.load(config.dynamics_model_checkpoint_path, map_location=device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         state_dict = adapt_state_dict_to_model(state_dict, dynamics_model)
+        state_dict, skipped_tokenizer_keys = remove_tokenizer_state_dict_entries(
+            state_dict
+        )
+        if skipped_tokenizer_keys:
+            logger.info(
+                "Skipped %d tokenizer keys from dynamics checkpoint so %s remains active",
+                skipped_tokenizer_keys,
+                config.tokenizer_checkpoint_path,
+            )
         missing, unexpected = dynamics_model.load_state_dict(state_dict, strict=False)
+        missing = [key for key in missing if not key.startswith("tokenizer.")]
         if missing:
             logger.warning(
                 "Missing %d keys when loading dynamics checkpoint (first 5: %s)",
@@ -1146,6 +1165,441 @@ def _save_denoising_step_metrics_csv(
     return summary
 
 
+def _frame_metrics_after_seed(
+    real_video: torch.Tensor,
+    generated_video: torch.Tensor,
+    rollout_seed_frames: int,
+) -> tuple[list[int], torch.Tensor, torch.Tensor]:
+    frame_numbers = list(range(rollout_seed_frames, real_video.shape[0]))
+    generated_frames = generated_video[rollout_seed_frames:]
+    real_frames = real_video[rollout_seed_frames:]
+    mse = (generated_frames - real_frames).pow(2).mean(dim=(1, 2, 3))
+    psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+    return frame_numbers, mse, psnr
+
+
+def _plot_denoising_seed_compare_metrics(
+    real_video: torch.Tensor,
+    generated_by_condition: dict[str, dict[int, torch.Tensor]],
+    seed_frames_by_condition: dict[str, int],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    for condition, generated_by_step in generated_by_condition.items():
+        seed_frames = seed_frames_by_condition[condition]
+        linestyle = "-" if seed_frames == 1 else "--"
+        for step_count in sorted(generated_by_step):
+            frame_numbers, mse, psnr = _frame_metrics_after_seed(
+                real_video,
+                generated_by_step[step_count],
+                seed_frames,
+            )
+            label = f"{step_count} steps, {condition}"
+            axes[0].plot(
+                frame_numbers,
+                mse.detach().cpu().tolist(),
+                marker="o",
+                linestyle=linestyle,
+                label=label,
+            )
+            axes[1].plot(
+                frame_numbers,
+                psnr.detach().cpu().tolist(),
+                marker="o",
+                linestyle=linestyle,
+                label=label,
+            )
+
+    axes[0].set_ylabel("MSE vs GT (log)")
+    axes[0].set_yscale("log")
+    axes[0].set_title("Denoising-step rollout error: seeded context vs true AR")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8)
+    axes[1].set_ylabel("PSNR vs GT")
+    axes[1].set_xlabel("Frame index")
+    axes[1].grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_denoising_seed_compare_summary_csv(
+    real_video: torch.Tensor,
+    generated_by_condition: dict[str, dict[int, torch.Tensor]],
+    seed_frames_by_condition: dict[str, int],
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, float | int | str]] = []
+    for condition, generated_by_step in generated_by_condition.items():
+        seed_frames = seed_frames_by_condition[condition]
+        for step_count in sorted(generated_by_step):
+            _frame_numbers, mse, psnr = _frame_metrics_after_seed(
+                real_video,
+                generated_by_step[step_count],
+                seed_frames,
+            )
+            rows.append(
+                {
+                    "condition": condition,
+                    "denoising_steps": step_count,
+                    "mean_mse": float(mse.mean().item()),
+                    "final_mse": float(mse[-1].item()),
+                    "mean_psnr": float(psnr.mean().item()),
+                    "final_psnr": float(psnr[-1].item()),
+                }
+            )
+
+    with output_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "condition",
+                "denoising_steps",
+                "mean_mse",
+                "final_mse",
+                "mean_psnr",
+                "final_psnr",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _post_train_style_rollout(
+    model,
+    real_video: torch.Tensor,
+    seed_frames: int,
+    total_frames: int,
+    max_steps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Mirror post_train_rollout_mp4.py's rolling decoder/action-token path."""
+    post_train_config = PostTrainTokenizerConfig(
+        post_train_frames=total_frames,
+        dynamics_context_frames=model.num_images_in_video,
+        rollout_seed_frames=seed_frames,
+        max_denoising_steps=max_steps,
+        device=str(device),
+    )
+    use_amp = device.type == "cuda"
+    rollout_decoded, _recon_decoded, _gt_future = rollout_with_trainable_decoder(
+        model,
+        model.tokenizer,
+        real_video[:, :total_frames],
+        post_train_config,
+        use_amp,
+    )
+    return torch.cat(
+        [real_video[:, :seed_frames], rollout_decoded],
+        dim=1,
+    )
+
+
+def _committed_patch_mask_to_frame(
+    committed_mask: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    patch_height: int,
+    patch_width: int,
+) -> torch.Tensor:
+    patch_rows = image_height // patch_height
+    patch_cols = image_width // patch_width
+    expected_patches = patch_rows * patch_cols
+    if committed_mask.numel() != expected_patches:
+        raise ValueError(
+            "Committed mask patch count does not match image geometry: "
+            f"mask={committed_mask.numel()} patches={expected_patches}"
+        )
+    mask = committed_mask.float().view(1, 1, patch_rows, patch_cols)
+    mask = torch.nn.functional.interpolate(
+        mask,
+        size=(image_height, image_width),
+        mode="nearest",
+    )[0]
+    return mask.repeat(3, 1, 1)
+
+
+def _apply_patch_visibility_mask(
+    frame: torch.Tensor,
+    committed_mask: torch.Tensor,
+    *,
+    image_height: int,
+    image_width: int,
+    patch_height: int,
+    patch_width: int,
+    hidden_value: float = 1.0,
+) -> torch.Tensor:
+    mask_frame = _committed_patch_mask_to_frame(
+        committed_mask,
+        image_height=image_height,
+        image_width=image_width,
+        patch_height=patch_height,
+        patch_width=patch_width,
+    )
+    visible = frame.detach().float().cpu().clamp(0, 1)
+    hidden = torch.full_like(visible, hidden_value)
+    return torch.where(mask_frame.bool(), visible, hidden)
+
+
+@torch.no_grad()
+def _predict_next_frame_denoising_trace(
+    model,
+    generated_pixels: torch.Tensor,
+    context_pixels: torch.Tensor,
+    action: torch.Tensor,
+    context_actions: torch.Tensor | None,
+    max_steps: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[float]]:
+    max_context = model.num_images_in_video - 1
+    context_window = context_pixels[:, -max_context:]
+    placeholder = context_window[:, -1:].clone()
+    inference_window = torch.cat([context_window, placeholder], dim=1)
+
+    targets = model.tokenizer.quantized_value_to_codes(
+        model.tokenizer.encode(inference_window)
+    ).long()
+    batch_size, _, num_patches = targets.shape
+    fallback_next_codes = targets[:, -1, :].clone()
+
+    action_token = action.long().to(targets.device)
+    if action_token.dim() == 1:
+        action_token = action_token.unsqueeze(1)
+
+    targets[:, -1, :] = model.tokenizer.get_mask_token_idx()
+    expected_context = inference_window.shape[1] - 2
+    if context_actions is not None:
+        context_action_tokens = context_actions.long().to(targets.device)
+        if context_action_tokens.shape != (batch_size, expected_context):
+            raise ValueError(
+                f"context_actions must have shape (B, {expected_context}), "
+                f"got {tuple(context_action_tokens.shape)}"
+            )
+    elif expected_context > 0:
+        action_video_encoded = model.action_model.encode(inference_window[:, :-1])
+        context_action_tokens = model.action_model.get_action_sequence(
+            action_video_encoded
+        ).long()
+    else:
+        context_action_tokens = torch.empty(
+            batch_size, 0, dtype=torch.long, device=targets.device
+        )
+
+    action_tokens = torch.cat([context_action_tokens, action_token], dim=1)
+    action_embeddings = model.action_embedding(action_tokens.long())
+
+    trace_frames: list[torch.Tensor] = []
+    trace_committed_only_frames: list[torch.Tensor] = []
+    trace_masks: list[torch.Tensor] = []
+    committed_fractions: list[float] = []
+    mask_locations = torch.full(
+        (batch_size, num_patches), True, dtype=torch.bool, device=targets.device
+    )
+    for step in range(max_steps):
+        x = model.tokenizer_embedding(targets.long())
+        x[:, :-1, :] += action_embeddings.unsqueeze(2)
+        x = model.decoder(x)
+        logits = model.vocab_head(x)
+
+        if mask_locations.any():
+            ratio_remaining = model.cosine_scheduler(
+                max_steps, step + 1, targets.device
+            )
+            target_still_masked = int(num_patches * ratio_remaining)
+            current_masked = int(mask_locations.sum(dim=1).amax().item())
+            tokens_to_update = max(0, current_masked - target_still_masked)
+
+            probs = model.softmax(logits[:, -1])
+            mask_flat = mask_locations.view(-1)
+            probs_flat = probs.view(-1, probs.size(-1))
+            samples_flat = torch.full(
+                (batch_size * num_patches,),
+                -100,
+                device=targets.device,
+                dtype=torch.long,
+            )
+            if mask_flat.any():
+                probs_masked = probs_flat[mask_flat]
+                probs_masked = probs_masked / (
+                    probs_masked.sum(-1, keepdim=True) + 1e-9
+                )
+                sampled_masked = torch.multinomial(
+                    probs_masked, 1, replacement=False
+                ).squeeze(-1)
+                samples_flat[mask_flat] = sampled_masked
+
+            samples = samples_flat.view(batch_size, num_patches)
+            sampled_scores = probs.gather(
+                -1, samples.clamp_min(0).unsqueeze(-1)
+            ).squeeze(-1)
+            sampled_scores[samples < 0] = -1
+
+            if tokens_to_update > 0:
+                _, top_positions = torch.topk(
+                    sampled_scores, tokens_to_update, dim=-1
+                )
+                top_tokens = samples.gather(1, top_positions)
+                targets_last = targets[:, -1, :]
+                targets_last = targets_last.scatter(1, top_positions, top_tokens)
+                targets[:, -1, :] = targets_last
+                mask_locations = mask_locations.scatter(
+                    1, top_positions, torch.zeros_like(top_positions, dtype=torch.bool)
+                )
+
+        committed_mask = ~mask_locations
+        visual_codes = fallback_next_codes.clone()
+        targets_last = targets[:, -1, :]
+        visual_codes[committed_mask] = targets_last[committed_mask]
+        decoded_frame = model.decode_next_frame_with_tokenizer_window(
+            generated_pixels,
+            visual_codes,
+        )
+        decoded_frame_cpu = decoded_frame[0].detach().cpu()
+        committed_mask_cpu = committed_mask[0].detach().cpu()
+        trace_frames.append(decoded_frame_cpu)
+        trace_committed_only_frames.append(
+            _apply_patch_visibility_mask(
+                decoded_frame_cpu,
+                committed_mask_cpu,
+                image_height=generated_pixels.shape[-2],
+                image_width=generated_pixels.shape[-1],
+                patch_height=model.tokenizer.encoder.patch_height,
+                patch_width=model.tokenizer.encoder.patch_width,
+            )
+        )
+        trace_masks.append(committed_mask_cpu)
+        committed_fractions.append(float(committed_mask.float().mean().item()))
+
+    return trace_frames, trace_committed_only_frames, trace_masks, committed_fractions
+
+
+def _visualize_denoising_trace(
+    model,
+    test_dataloader: VideoWindowLoader,
+    args: InteractiveInferenceArgs,
+    device: torch.device,
+) -> None:
+    if args.max_steps < 1:
+        raise ValueError("max_steps must be at least 1")
+    rollout_seed_frames = (
+        args.rollout_seed_frames
+        if args.rollout_seed_frames is not None
+        else model.num_images_in_video
+    )
+    if rollout_seed_frames < 1:
+        raise ValueError("rollout_seed_frames must be at least 1")
+
+    batch = next(iter(test_dataloader))
+    if batch.dim() != 5:
+        raise ValueError("Expected batch shape (B, T, C, H, W)")
+    target_frame_idx = rollout_seed_frames
+    if batch.shape[1] <= target_frame_idx:
+        raise ValueError(
+            f"Loader returned {batch.shape[1]} frames; need at least "
+            f"{target_frame_idx + 1}"
+        )
+
+    if args.compare_sample_index is None:
+        sample_idx = random.randint(0, batch.size(0) - 1)
+    else:
+        if not 0 <= args.compare_sample_index < batch.size(0):
+            raise ValueError(
+                f"compare_sample_index must be in [0, {batch.size(0) - 1}], "
+                f"got {args.compare_sample_index}"
+            )
+        sample_idx = args.compare_sample_index
+
+    real_video = batch[
+        sample_idx : sample_idx + 1, : target_frame_idx + 1
+    ].to(device)
+    generated_pixels = real_video[:, :rollout_seed_frames]
+    ctx_size = min(generated_pixels.shape[1], model.num_images_in_video - 1)
+    context_pixels = generated_pixels[:, -ctx_size:]
+    context_actions, next_action = _get_rolling_gt_action_tokens(
+        model,
+        real_video,
+        target_frame_idx,
+        ctx_size,
+    )
+
+    trace_frames, trace_committed_only_frames, trace_masks, committed_fractions = (
+        _predict_next_frame_denoising_trace(
+            model,
+            generated_pixels,
+            context_pixels,
+            next_action,
+            context_actions,
+            args.max_steps,
+        )
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    labeled_frames = []
+    labeled_committed_only_frames = []
+    labeled_masks = []
+    image_height = real_video.shape[-2]
+    image_width = real_video.shape[-1]
+    patch_height = model.tokenizer.encoder.patch_height
+    patch_width = model.tokenizer.encoder.patch_width
+    for step_idx, (frame, mask, committed_fraction) in enumerate(
+        zip(trace_frames, trace_masks, committed_fractions),
+        start=1,
+    ):
+        label = f"step {step_idx}/{args.max_steps}\n{committed_fraction:.0%} filled"
+        labeled_frames.append(_add_label_strip(frame, label))
+        labeled_committed_only_frames.append(
+            _add_label_strip(trace_committed_only_frames[step_idx - 1], label)
+        )
+        mask_frame = _committed_patch_mask_to_frame(
+            mask,
+            image_height=image_height,
+            image_width=image_width,
+            patch_height=patch_height,
+            patch_width=patch_width,
+        )
+        labeled_masks.append(_add_label_strip(mask_frame, label))
+
+    gt_labeled = _add_label_strip(real_video[0, target_frame_idx].detach().cpu(), "GT target")
+    prev_labeled = _add_label_strip(generated_pixels[0, -1].detach().cpu(), "prev frame")
+    frame_grid = torch.stack([prev_labeled, *labeled_frames, gt_labeled], dim=0)
+    committed_only_grid = torch.stack(
+        [prev_labeled, *labeled_committed_only_frames, gt_labeled],
+        dim=0,
+    )
+    mask_grid = torch.stack(labeled_masks, dim=0)
+    frame_path = output_dir / "denoising_trace_frames.png"
+    committed_only_path = output_dir / "denoising_trace_committed_only.png"
+    mask_path = output_dir / "denoising_trace_committed_masks.png"
+    vutils.save_image(frame_grid, frame_path, nrow=min(4, frame_grid.shape[0]), padding=2)
+    vutils.save_image(
+        committed_only_grid,
+        committed_only_path,
+        nrow=min(4, committed_only_grid.shape[0]),
+        padding=2,
+    )
+    vutils.save_image(mask_grid, mask_path, nrow=min(5, mask_grid.shape[0]), padding=2)
+    _save_frames_as_video(
+        torch.stack(trace_frames, dim=0),
+        output_dir / "denoising_trace_frames.mp4",
+        display_scale=4,
+    )
+    _save_frames_as_video(
+        torch.stack(trace_committed_only_frames, dim=0),
+        output_dir / "denoising_trace_committed_only.mp4",
+        display_scale=4,
+    )
+    print(
+        "Denoising trace complete: "
+        f"sample_idx={sample_idx} seed_frames={rollout_seed_frames} "
+        f"target_frame_idx={target_frame_idx} action={int(next_action[0].item())} "
+        f"steps={args.max_steps} frames={frame_path} "
+        f"committed_only={committed_only_path} masks={mask_path}"
+    )
+
+
 def _compare_denoising_steps(
     model,
     test_dataloader: VideoWindowLoader,
@@ -1190,34 +1644,34 @@ def _compare_denoising_steps(
     real_video = batch[
         sample_idx : sample_idx + 1, : args.rollout_total_frames
     ].to(device)
-    action_sequence = _get_action_sequence(model, real_video)
-    expected_actions = args.rollout_total_frames - rollout_seed_frames
-    gt_actions = action_sequence[
-        :, rollout_seed_frames - 1 : args.rollout_total_frames - 1
-    ]
-    if gt_actions.shape[1] != expected_actions:
-        raise ValueError(
-            f"Expected {expected_actions} GT actions, got {gt_actions.shape[1]}"
-        )
+    seed_conditions = [(f"{rollout_seed_frames} seed frames", rollout_seed_frames)]
+    if rollout_seed_frames != 1:
+        seed_conditions.append(("1 seed frame (true AR)", 1))
 
-    seed_video = real_video[:, :rollout_seed_frames]
-    generated_by_step: dict[int, torch.Tensor] = {}
-    for step_count in args.compare_denoising_steps:
-        with torch.no_grad():
-            generated = _rollout_with_context_policy(
-                model,
-                seed_video,
-                gt_actions,
-                step_count,
-                args.rollout_pin_first_gt_context,
-            )
-        generated_by_step[step_count] = generated[0].detach().cpu()
+    generated_by_condition: dict[str, dict[int, torch.Tensor]] = {}
+    seed_frames_by_condition: dict[str, int] = {}
+    for condition, seed_frames in seed_conditions:
+        generated_by_step: dict[int, torch.Tensor] = {}
+        for step_count in args.compare_denoising_steps:
+            with torch.no_grad():
+                generated = _post_train_style_rollout(
+                    model,
+                    real_video,
+                    seed_frames,
+                    args.rollout_total_frames,
+                    max_steps=step_count,
+                    device=device,
+                )
+            generated_by_step[step_count] = generated[0].detach().cpu()
+        generated_by_condition[condition] = generated_by_step
+        seed_frames_by_condition[condition] = seed_frames
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     real_cpu = real_video[0].detach().cpu()
     _save_frames_as_video(real_cpu, output_dir / "denoising_steps_gt.mp4")
+    generated_by_step = generated_by_condition[seed_conditions[0][0]]
     for step_count, generated in generated_by_step.items():
         _save_frames_as_video(
             generated,
@@ -1237,6 +1691,20 @@ def _compare_denoising_steps(
         generated_by_step,
         rollout_seed_frames,
         csv_path,
+    )
+    seed_compare_plot_path = output_dir / "denoising_steps_seed_compare.png"
+    _plot_denoising_seed_compare_metrics(
+        real_cpu,
+        generated_by_condition,
+        seed_frames_by_condition,
+        seed_compare_plot_path,
+    )
+    seed_compare_csv_path = output_dir / "denoising_steps_seed_compare_summary.csv"
+    _save_denoising_seed_compare_summary_csv(
+        real_cpu,
+        generated_by_condition,
+        seed_frames_by_condition,
+        seed_compare_csv_path,
     )
 
     video_rows = [("GT", real_cpu)]
@@ -1259,9 +1727,10 @@ def _compare_denoising_steps(
         f"sample_idx={sample_idx} seed_frames={rollout_seed_frames} "
         f"total_frames={args.rollout_total_frames} "
         f"steps={args.compare_denoising_steps} "
-        f"actions={gt_actions[0].detach().cpu().tolist()} "
-        f"plot={plot_path} csv={csv_path} video={comparison_path} "
-        f"error_video={error_video_path}"
+        f"plot={plot_path} csv={csv_path} "
+        f"seed_compare_plot={seed_compare_plot_path} "
+        f"seed_compare_csv={seed_compare_csv_path} "
+        f"video={comparison_path} error_video={error_video_path}"
     )
     print("Denoising-step post-seed metrics:")
     for step_count in sorted(metrics_summary):
@@ -1521,6 +1990,7 @@ def main():
         "spam_actions_grid",
         "compare_denoising_steps",
         "compare_rollout_strategies",
+        "visualize_denoising_trace",
     )
     dataloader_frames = (
         2 * model.num_images_in_video
@@ -1545,6 +2015,8 @@ def main():
         _compare_denoising_steps(model, test_dataloader, args, device)
     elif args.mode == "compare_rollout_strategies":
         _compare_rollout_strategies(model, test_dataloader, args, device)
+    elif args.mode == "visualize_denoising_trace":
+        _visualize_denoising_trace(model, test_dataloader, args, device)
     else:
         _interactive_loop(model, test_dataloader, config, args, device)
 

@@ -63,18 +63,22 @@ class FiniteScalarQuantizer(BaseQuantizer):
 
     def quantize(self, z):
         """Quanitzes z, returns quantized zhat, same shape as z."""
-        logger.debug(
-            f"Devices: {z.device}, {self._levels_np.device}"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Devices: {z.device}, {self._levels_np.device}"
+            )
 
-        logger.debug(f"z shape after project_in: {z.shape}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"z shape after project_in: {z.shape}")
         quantized = round_ste(self.bound(z))
         half_width = self._levels_np.to(z.device) // 2  # type: ignore[operator]
         # Renormalize to [-1, 1]. return quantized / half_width
-        logger.debug(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Quantized: {quantized.shape}, Half width: {half_width.shape}")
         zhat_normalized = quantized / half_width
         codes = self.quantized_value_to_codes(zhat_normalized)
-        logger.debug(f"Codebook indices: {codes}. z: {z}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Codebook indices: {codes}. z: {z}")
         return zhat_normalized
 
     def _scale_and_shift(self, zhat_normalized: torch.Tensor) -> torch.Tensor:

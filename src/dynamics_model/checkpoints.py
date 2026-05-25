@@ -73,6 +73,18 @@ def adapt_state_dict_to_model(
     return adapted
 
 
+def remove_tokenizer_state_dict_entries(state_dict: dict) -> tuple[dict, int]:
+    """Drop tokenizer weights so a separately loaded tokenizer remains authoritative."""
+    filtered_state_dict = {}
+    removed_count = 0
+    for key, value in state_dict.items():
+        if _strip_orig_mod(key).startswith("tokenizer."):
+            removed_count += 1
+            continue
+        filtered_state_dict[key] = value
+    return filtered_state_dict, removed_count
+
+
 def save_checkpoint(
     model: DynamicsModel,
     optimizer: optim.Optimizer,
