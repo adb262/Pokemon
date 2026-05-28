@@ -77,6 +77,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PostTrainTokenizerConfig:
     tokenizer_checkpoint_path: str = ""
+    dynamics_tokenizer_checkpoint_path: Optional[str] = None
     dynamics_model_checkpoint_path: str = ""
     action_model_checkpoint_path: Optional[str] = None
 
@@ -153,6 +154,11 @@ class PostTrainTokenizerConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_bf16: bool = True
     use_compile: bool = True
+    eval_only: bool = False
+    compare_tokenizer_checkpoint_path: Optional[str] = None
+    tokenizer_label: str = "post-trained"
+    compare_tokenizer_label: str = "Base Tokenizer"
+    comparison_eval_batches: Optional[int] = None
 
     # Early stopping
     early_stopping_patience: int = 0
@@ -239,8 +245,13 @@ class EarlyStoppingState:
 # ---------------------------------------------------------------------------
 
 def _build_dynamics_config(config: PostTrainTokenizerConfig) -> DynamicsModelTrainingConfig:
+    dynamics_tokenizer_checkpoint_path = (
+        config.dynamics_tokenizer_checkpoint_path
+        if config.dynamics_tokenizer_checkpoint_path is not None
+        else config.tokenizer_checkpoint_path
+    )
     return DynamicsModelTrainingConfig(
-        tokenizer_checkpoint_path=config.tokenizer_checkpoint_path,
+        tokenizer_checkpoint_path=dynamics_tokenizer_checkpoint_path,
         dynamics_model_checkpoint_path=config.dynamics_model_checkpoint_path,
         action_model_checkpoint_path=config.action_model_checkpoint_path,
         num_images_in_video=config.dynamics_context_frames,
@@ -284,9 +295,14 @@ def load_frozen_dynamics_stack(
 ) -> DynamicsModel:
     """Load the full dynamics stack with a *separate* frozen tokenizer copy."""
     dynamics_cfg = _build_dynamics_config(config)
+    tokenizer_checkpoint_path = (
+        config.dynamics_tokenizer_checkpoint_path
+        if config.dynamics_tokenizer_checkpoint_path is not None
+        else config.tokenizer_checkpoint_path
+    )
 
     frozen_tokenizer, _ = load_model_from_checkpoint(
-        config.tokenizer_checkpoint_path, device
+        tokenizer_checkpoint_path, device
     )
     _freeze_module(frozen_tokenizer)
 
@@ -330,19 +346,23 @@ def load_frozen_dynamics_stack(
 # ---------------------------------------------------------------------------
 
 def _build_rolling_tokenizer_history(
-    video_batch: torch.Tensor,
     generated_pixels: torch.Tensor,
-    frame_idx: int,
     context_frames: int,
 ) -> torch.Tensor:
     """Return the generated-frame history for a tokenizer rolling window."""
+    if generated_pixels.shape[1] < 1:
+        raise ValueError("Tokenizer history requires at least one generated frame")
+    if context_frames < 2:
+        raise ValueError(
+            f"Tokenizer decoder window must contain at least 2 frames, got {context_frames}"
+        )
+
     previous_context_frames = context_frames - 1
-    start_idx = max(0, frame_idx - previous_context_frames)
-    history = generated_pixels[:, start_idx:frame_idx]
+    history = generated_pixels[:, -previous_context_frames:]
     pad_frames = previous_context_frames - history.shape[1]
 
     if pad_frames > 0:
-        seed_padding = video_batch[:, :1].expand(-1, pad_frames, -1, -1, -1)
+        seed_padding = generated_pixels[:, :1].expand(-1, pad_frames, -1, -1, -1)
         history = torch.cat([seed_padding, history], dim=1)
 
     return history
@@ -377,7 +397,7 @@ def _build_rolling_gt_action_window(
 def _get_rolling_gt_action_tokens(
     dynamics_model: DynamicsModel,
     video_batch: torch.Tensor,
-    frame_idx: int,
+    target_frame_idx: int,
     context_size: int,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Encode GT actions from the same fixed-size rolling windows used in training.
@@ -398,7 +418,7 @@ def _get_rolling_gt_action_tokens(
 
     action_window = _build_rolling_gt_action_window(
         video_batch,
-        frame_idx,
+        target_frame_idx,
         action_window_frames,
     )
     action_encoded = dynamics_model.action_model.encode(action_window)
@@ -457,6 +477,11 @@ def _dynamics_predict_next_frame_codes(
             )
     else:
         context_action_tokens = context_actions.long().to(targets.device)
+        if context_action_tokens.shape != (batch_size, expected_context):
+            raise ValueError(
+                f"context_actions must have shape (B, {expected_context}), "
+                f"got {tuple(context_action_tokens.shape)}"
+            )
 
     action_tokens = torch.cat([context_action_tokens, action_token], dim=1)
     action_embeddings = dynamics_model.action_embedding(action_tokens.long())
@@ -586,9 +611,7 @@ def rollout_with_trainable_decoder(
         recon_decoded_frames.append(decoded_recon_window[:, -1])
 
         tokenizer_history = _build_rolling_tokenizer_history(
-            video_batch,
             generated_pixels,
-            frame_idx,
             tokenizer_ctx,
         )
         with amp_ctx:
@@ -790,6 +813,103 @@ def _save_per_frame_metrics_csv(
     return output_path
 
 
+def _save_comparison_metrics_plot(
+    metrics_by_label: dict[str, list[float]],
+    output_path: str,
+    first_frame_idx: int,
+    dynamics_context_frames: int,
+    action_window_frames: int,
+) -> str:
+    rollout_steps = None
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+
+    for label, mse_by_frame in metrics_by_label.items():
+        if rollout_steps is None:
+            rollout_steps = list(range(1, len(mse_by_frame) + 1))
+        mse_for_plot = [max(m, 1e-12) for m in mse_by_frame]
+        psnr_values = [_safe_psnr_from_mse(m) for m in mse_by_frame]
+        axs[0].plot(rollout_steps, mse_for_plot, marker="o", label=label)
+        axs[1].plot(rollout_steps, psnr_values, marker="o", label=label)
+
+    axs[0].set_title("MSE by rollout step")
+    axs[0].set_xlabel("Rollout step (target frame advances by 1)")
+    axs[0].set_ylabel("MSE")
+    axs[0].set_yscale("log")
+    axs[0].yaxis.set_major_formatter(LogFormatterSciNotation())
+    axs[1].set_title("PSNR by rollout step")
+    axs[1].set_xlabel("Rollout step (target frame advances by 1)")
+    axs[1].set_ylabel("PSNR (dB)")
+
+    first_full_dynamics_step = max(1, dynamics_context_frames - first_frame_idx)
+    first_full_action_step = max(1, action_window_frames - first_frame_idx)
+    full_window_labels_by_step: dict[int, list[str]] = {}
+    for step, label in (
+        (first_full_dynamics_step, "dynamics"),
+        (first_full_action_step, "action"),
+    ):
+        full_window_labels_by_step.setdefault(step, []).append(label)
+
+    for ax in axs:
+        ax.secondary_xaxis(
+            "top",
+            functions=(
+                lambda step: step + first_frame_idx - 1,
+                lambda frame: frame - first_frame_idx + 1,
+            ),
+        ).set_xlabel("Target frame index")
+        for step, labels in full_window_labels_by_step.items():
+            if rollout_steps is not None and 1 <= step <= len(rollout_steps):
+                ax.axvline(step, linestyle="--", linewidth=1, alpha=0.35)
+                label = " + ".join(labels)
+                label += " window full" if len(labels) == 1 else " windows full"
+                ax.text(
+                    step,
+                    0.98,
+                    label,
+                    rotation=90,
+                    va="top",
+                    ha="right",
+                    transform=ax.get_xaxis_transform(),
+                    fontsize=8,
+                    alpha=0.7,
+                )
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    fig.suptitle("Pre/post tokenizer comparison with rolling dynamics context", fontsize=11)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _save_comparison_metrics_csv(
+    metrics_by_label: dict[str, list[float]],
+    output_path: str,
+    first_frame_idx: int,
+) -> str:
+    rows = []
+    for label, mse_by_frame in metrics_by_label.items():
+        for offset, mse in enumerate(mse_by_frame):
+            rows.append(
+                {
+                    "label": label,
+                    "rollout_step": offset + 1,
+                    "target_frame_idx": first_frame_idx + offset,
+                    "mse": mse,
+                    "psnr": _safe_psnr_from_mse(mse),
+                }
+            )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -927,6 +1047,140 @@ def post_train_epoch(
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def collect_rollout_mse_by_frame(
+    trainable_tokenizer: VideoTokenizer,
+    dynamics_model: DynamicsModel,
+    test_dataloader: VideoWindowLoader,
+    device: torch.device,
+    config: PostTrainTokenizerConfig,
+    max_batches: Optional[int] = None,
+) -> list[float]:
+    trainable_tokenizer.eval()
+    use_amp = config.use_bf16 and device.type == "cuda"
+    rollout_frame_sse = None
+    rollout_frame_count = None
+
+    for batch_idx, video_batch in enumerate(test_dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+        video_batch = video_batch.to(device, non_blocking=True)
+        total_frames = min(config.post_train_frames, video_batch.shape[1])
+        video_batch = video_batch[:, :total_frames]
+
+        rollout_decoded, _, gt_future = rollout_with_trainable_decoder(
+            dynamics_model, trainable_tokenizer, video_batch, config, use_amp,
+        )
+
+        diff = (rollout_decoded.float().clamp(0, 1) - gt_future.float().clamp(0, 1)) ** 2
+        frame_sse = diff.sum(dim=(0, 2, 3, 4)).detach().cpu()
+        frame_count = torch.full(
+            (diff.shape[1],),
+            diff.shape[0] * diff.shape[2] * diff.shape[3] * diff.shape[4],
+            dtype=torch.float64,
+        )
+        if rollout_frame_sse is None or rollout_frame_count is None:
+            rollout_frame_sse = frame_sse.double()
+            rollout_frame_count = frame_count
+        else:
+            rollout_frame_sse += frame_sse.double()
+            rollout_frame_count += frame_count
+
+    if rollout_frame_sse is None or rollout_frame_count is None:
+        raise ValueError("No batches were available for rollout comparison")
+
+    trainable_tokenizer.train()
+    if not config.train_encoder:
+        trainable_tokenizer.encoder.eval()
+
+    return (
+        rollout_frame_sse / torch.clamp(rollout_frame_count, min=1)
+    ).tolist()
+
+
+@torch.no_grad()
+def compare_tokenizer_rollout_metrics(
+    primary_tokenizer: VideoTokenizer,
+    comparison_tokenizer: VideoTokenizer,
+    dynamics_model: DynamicsModel,
+    test_dataloader: VideoWindowLoader,
+    device: torch.device,
+    config: PostTrainTokenizerConfig,
+) -> tuple[str, str]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"{config.save_dir}/tokenizer_comparison/{timestamp}"
+    tokenizers_by_label = {
+        config.tokenizer_label: primary_tokenizer,
+        config.compare_tokenizer_label: comparison_tokenizer,
+    }
+    accumulators: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = {
+        label: (None, None) for label in tokenizers_by_label
+    }
+    use_amp = config.use_bf16 and device.type == "cuda"
+
+    for batch_idx, video_batch in enumerate(test_dataloader):
+        if (
+            config.comparison_eval_batches is not None
+            and batch_idx >= config.comparison_eval_batches
+        ):
+            break
+
+        video_batch = video_batch.to(device, non_blocking=True)
+        total_frames = min(config.post_train_frames, video_batch.shape[1])
+        video_batch = video_batch[:, :total_frames]
+
+        for label, tokenizer in tokenizers_by_label.items():
+            tokenizer.eval()
+            rollout_decoded, _, gt_future = rollout_with_trainable_decoder(
+                dynamics_model, tokenizer, video_batch, config, use_amp,
+            )
+            diff = (
+                rollout_decoded.float().clamp(0, 1)
+                - gt_future.float().clamp(0, 1)
+            ) ** 2
+            frame_sse = diff.sum(dim=(0, 2, 3, 4)).detach().cpu()
+            frame_count = torch.full(
+                (diff.shape[1],),
+                diff.shape[0] * diff.shape[2] * diff.shape[3] * diff.shape[4],
+                dtype=torch.float64,
+            )
+            rollout_frame_sse, rollout_frame_count = accumulators[label]
+            if rollout_frame_sse is None or rollout_frame_count is None:
+                accumulators[label] = (frame_sse.double(), frame_count)
+            else:
+                accumulators[label] = (
+                    rollout_frame_sse + frame_sse.double(),
+                    rollout_frame_count + frame_count,
+                )
+
+    metrics_by_label: dict[str, list[float]] = {}
+    for label, (rollout_frame_sse, rollout_frame_count) in accumulators.items():
+        if rollout_frame_sse is None or rollout_frame_count is None:
+            raise ValueError("No batches were available for rollout comparison")
+        metrics_by_label[label] = (
+            rollout_frame_sse / torch.clamp(rollout_frame_count, min=1)
+        ).tolist()
+
+    plot_path = f"{output_dir}/pre_post_mse_psnr_comparison.png"
+    csv_path = f"{output_dir}/pre_post_mse_psnr_comparison.csv"
+    _save_comparison_metrics_plot(
+        metrics_by_label,
+        plot_path,
+        config.rollout_seed_frames,
+        config.dynamics_context_frames,
+        dynamics_model.action_model.num_images_in_video,
+    )
+    _save_comparison_metrics_csv(
+        metrics_by_label,
+        csv_path,
+        config.rollout_seed_frames,
+    )
+    logger.info("Saved tokenizer comparison plot to %s", plot_path)
+    logger.info("Saved tokenizer comparison CSV to %s", csv_path)
+    return plot_path, csv_path
+
 
 @torch.no_grad()
 def eval_post_trained_decoder(
@@ -1234,6 +1488,15 @@ def main(config: PostTrainTokenizerConfig) -> None:
         raise ValueError("tokenizer_checkpoint_path is required")
     if not config.dynamics_model_checkpoint_path:
         raise ValueError("dynamics_model_checkpoint_path is required")
+    if (
+        config.compare_tokenizer_checkpoint_path is not None
+        and config.dynamics_tokenizer_checkpoint_path is None
+    ):
+        config.dynamics_tokenizer_checkpoint_path = config.compare_tokenizer_checkpoint_path
+        logger.info(
+            "Using comparison tokenizer checkpoint for the frozen dynamics tokenizer: %s",
+            config.dynamics_tokenizer_checkpoint_path,
+        )
 
     dynamics_ckpt_config = _load_checkpoint_config(
         config.dynamics_model_checkpoint_path
@@ -1373,6 +1636,36 @@ def main(config: PostTrainTokenizerConfig) -> None:
     test_info = test_dataloader.get_dataset_info()
     logger.info("Train dataset: %s", train_info)
     logger.info("Test dataset: %s", test_info)
+
+    if config.compare_tokenizer_checkpoint_path is not None:
+        logger.info(
+            "Loading comparison tokenizer from %s",
+            config.compare_tokenizer_checkpoint_path,
+        )
+        comparison_tokenizer, _ = load_model_from_checkpoint(
+            config.compare_tokenizer_checkpoint_path, device
+        )
+        compare_tokenizer_rollout_metrics(
+            trainable_tokenizer,
+            comparison_tokenizer,
+            dynamics_model,
+            test_dataloader,
+            device,
+            config,
+        )
+        if experiment_logger:
+            experiment_logger.finish()
+        return
+
+    if config.eval_only:
+        eval_loss = eval_post_trained_decoder(
+            trainable_tokenizer, dynamics_model, test_dataloader,
+            device, 0, config, experiment_logger, global_step=0,
+        )
+        logger.info("Eval-only loss: %.6f", eval_loss)
+        if experiment_logger:
+            experiment_logger.finish()
+        return
 
     # Optimizer
     optimizer = optim.AdamW(trainable_params, lr=config.learning_rate, weight_decay=1e-4)
