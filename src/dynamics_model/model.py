@@ -209,6 +209,7 @@ class DynamicsModel(nn.Module):
         context: torch.Tensor,
         action: torch.Tensor,
         max_steps: int = 10,
+        decode_tokenizer: VideoTokenizer | None = None,
         context_actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the next frame after the observed context.
@@ -216,11 +217,6 @@ class DynamicsModel(nn.Module):
         ``context`` may contain one or more frames. Dynamics conditioning is
         trimmed to the most recent ``T - 1`` frames, while decoding uses the
         tokenizer checkpoint's own rolling frame window.
-
-        ``context_actions`` (optional, shape ``(B, K - 2)`` where ``K`` is
-        the resulting inference-window length, i.e. ``min(T - 1, context
-        length) + 1``) is forwarded to ``predict_next_frame_codes``; pass
-        GT-derived action tokens to keep action conditioning teacher-forced.
         """
         max_context = self.num_images_in_video - 1
         num_frames = context.shape[1]
@@ -237,7 +233,11 @@ class DynamicsModel(nn.Module):
             max_steps=max_steps,
             context_actions=context_actions,
         )
-        return self.decode_next_frame_with_tokenizer_window(context, next_codes)
+        return self.decode_next_frame_with_tokenizer_window(
+            context,
+            next_codes,
+            decode_tokenizer=decode_tokenizer,
+        )
 
     @torch.no_grad()
     def predict_next_frame_codes(
@@ -272,23 +272,46 @@ class DynamicsModel(nn.Module):
         targets[:, -1, :] = self.tokenizer.get_mask_token_idx()
 
         expected_context = inference_window.shape[1] - 2
-        if context_actions is None:
-            if expected_context > 0:
-                action_video_encoded = self.action_model.encode(inference_window[:, :-1])
-                context_action_tokens = self.action_model.get_action_sequence(
-                    action_video_encoded
-                ).long()
-            else:
+        if context_actions is not None:
+            context_action_tokens = context_actions.long().to(targets.device)
+            if context_action_tokens.dim() == 1:
+                if batch_size != 1:
+                    raise ValueError(
+                        "context_actions with shape (K,) is only valid for "
+                        f"batch size 1, got {batch_size}"
+                    )
+                context_action_tokens = context_action_tokens.unsqueeze(0)
+            if context_action_tokens.dim() != 2:
+                raise ValueError(
+                    "context_actions must have shape (B, K); got tensor with "
+                    f"shape {tuple(context_action_tokens.shape)}"
+                )
+            if context_action_tokens.shape[0] != batch_size:
+                raise ValueError(
+                    "context_actions batch dimension must match context batch "
+                    f"size: {context_action_tokens.shape[0]} vs {batch_size}"
+                )
+            if context_action_tokens.shape[1] < expected_context:
+                raise ValueError(
+                    "context_actions must cover every transition inside the "
+                    f"context window: got {context_action_tokens.shape[1]}, "
+                    f"need {expected_context}"
+                )
+            if expected_context == 0:
                 context_action_tokens = torch.empty(
                     batch_size, 0, dtype=torch.long, device=targets.device
                 )
+            else:
+                context_action_tokens = context_action_tokens[:, -expected_context:]
+        elif expected_context > 0:
+            action_video_encoded = self.action_model.encode(inference_window[:, :-1])
+            context_action_tokens = self.action_model.get_action_sequence(
+                action_video_encoded
+            ).long()
         else:
-            if context_actions.shape != (batch_size, expected_context):
-                raise ValueError(
-                    f"context_actions must have shape (B, {expected_context}), "
-                    f"got {tuple(context_actions.shape)}"
-                )
-            context_action_tokens = context_actions.long().to(targets.device)
+            context_action_tokens = torch.empty(
+                batch_size, 0, dtype=torch.long, device=targets.device
+            )
 
         action_tokens = torch.cat([context_action_tokens, action_token], dim=1)
         action_embeddings = self.action_embedding(action_tokens.long())
@@ -357,8 +380,10 @@ class DynamicsModel(nn.Module):
     def build_tokenizer_decode_history(
         self,
         generated_pixels: torch.Tensor,
+        decode_tokenizer: VideoTokenizer | None = None,
     ) -> torch.Tensor:
-        tokenizer_window = self.tokenizer.decoder.num_images_in_video
+        tokenizer = self.tokenizer if decode_tokenizer is None else decode_tokenizer
+        tokenizer_window = tokenizer.decoder.num_images_in_video
         if tokenizer_window < 2:
             raise ValueError(
                 "Tokenizer decoder window must be at least 2 frames for rollout, "
@@ -368,13 +393,11 @@ class DynamicsModel(nn.Module):
         previous_context_frames = tokenizer_window - 1
         history = generated_pixels[:, -previous_context_frames:]
         pad_frames = previous_context_frames - history.shape[1]
-
         if pad_frames > 0:
             seed_padding = generated_pixels[:, :1].expand(
                 -1, pad_frames, -1, -1, -1
             )
             history = torch.cat([seed_padding, history], dim=1)
-
         return history
 
     @torch.no_grad()
@@ -382,42 +405,24 @@ class DynamicsModel(nn.Module):
         self,
         generated_pixels: torch.Tensor,
         next_codes: torch.Tensor,
+        decode_tokenizer: VideoTokenizer | None = None,
     ) -> torch.Tensor:
-        tokenizer_history = self.build_tokenizer_decode_history(generated_pixels)
-        quantized_context = self.tokenizer.encode(tokenizer_history)
-        context_codes = self.tokenizer.quantized_value_to_codes(quantized_context)
+        tokenizer = self.tokenizer if decode_tokenizer is None else decode_tokenizer
+        tokenizer_history = self.build_tokenizer_decode_history(
+            generated_pixels,
+            decode_tokenizer=tokenizer,
+        )
+        quantized_context = tokenizer.encode(tokenizer_history)
+        context_codes = tokenizer.quantized_value_to_codes(quantized_context)
         all_codes = torch.cat([context_codes, next_codes.unsqueeze(1)], dim=1)
-        decoded_window = self.tokenizer.decode_from_codes(all_codes)
+        decoded_window = tokenizer.decode_from_codes(all_codes)
         return decoded_window[:, -1]
 
-    @torch.no_grad()
-    def rollout(
-        self, video: torch.Tensor, actions: torch.Tensor, max_steps: int = 10
+    def normalize_rollout_actions(
+        self,
+        video: torch.Tensor,
+        actions: torch.Tensor,
     ) -> torch.Tensor:
-        """Generate future frames autoregressively from an initial context.
-
-        Given a seed ``video`` of shape ``(B, S, C, H, W)`` and ``actions``
-        of shape ``(B, K)``, produces ``(B, S + K, C, H, W)`` by generating
-        one new frame per action. ``S`` may be as small as ``1``.
-
-        At each step the dynamics model predicts next-frame tokenizer codes
-        from the dynamics context window. Those codes are decoded through the
-        tokenizer checkpoint's own decoder window, which can be shorter than
-        the dynamics context.
-
-        Within-seed action tokens are derived once from the GT seed pixels
-        and concatenated with the user-supplied rollout ``actions`` to form
-        a unified transition sequence. At each step we slice the relevant
-        within-window context actions from this sequence and feed them to
-        ``predict_next_frame_codes``, so the action encoder is never run on
-        previously-predicted frames.
-        """
-        original_num_frames = video.shape[1]
-        if original_num_frames < 1:
-            raise ValueError(
-                f"rollout requires at least 1 seed frame, got {original_num_frames}"
-            )
-
         action_sequence = actions.long().to(video.device)
         if action_sequence.dim() == 1:
             if video.shape[0] != 1:
@@ -436,43 +441,85 @@ class DynamicsModel(nn.Module):
                 "rollout actions batch dimension must match video batch size: "
                 f"{action_sequence.shape[0]} vs {video.shape[0]}"
             )
+        return action_sequence
 
-        batch_size = video.shape[0]
-        num_rollout_steps = action_sequence.shape[1]
-        max_context = self.num_images_in_video - 1
+    @torch.no_grad()
+    def rollout(
+        self,
+        video: torch.Tensor,
+        actions: torch.Tensor,
+        max_steps: int = 10,
+        decode_tokenizer: VideoTokenizer | None = None,
+        seed_context_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Generate future frames autoregressively from an initial context.
 
-        # Pre-compute the within-seed transitions from the GT seed pixels.
-        # A 1-frame seed has no internal transitions, so ``seed_action_tokens``
-        # is an empty (B, 0) tensor in that case.
-        if original_num_frames >= 2:
-            seed_action_encoded = self.action_model.encode(video)
-            seed_action_tokens = self.action_model.get_action_sequence(
-                seed_action_encoded
-            ).long()
-        else:
-            seed_action_tokens = torch.empty(
-                batch_size, 0, dtype=torch.long, device=video.device
+        Given a seed ``video`` of shape ``(B, S, C, H, W)`` and ``actions``
+        of shape ``(B, K)``, produces ``(B, S + K, C, H, W)`` by generating
+        one new frame per action. ``S`` may be as small as ``1``.
+
+        At each step, the dynamics model sees at most ``num_images_in_video - 1``
+        prior frames plus a masked next-frame placeholder, matching training's
+        ``num_images_in_video`` window. The decode tokenizer sees its own
+        rolling decoder window, which may be shorter than the dynamics window.
+        Seed context action tokens are provided by the caller or inferred once
+        from the seed video, then preserved alongside rollout actions.
+        """
+        original_num_frames = video.shape[1]
+        if original_num_frames < 1:
+            raise ValueError(
+                f"rollout requires at least 1 seed frame, got {original_num_frames}"
             )
 
-        # Indexed by transition number across the full rolled-out sequence:
-        # entries ``0..S-2`` are the within-seed actions, entries ``S-1..``
-        # are the user-supplied rollout actions.
-        unified_actions = torch.cat([seed_action_tokens, action_sequence], dim=1)
+        action_sequence = self.normalize_rollout_actions(video, actions)
+        num_rollout_steps = action_sequence.shape[1]
+        max_context = self.num_images_in_video - 1
+        seed_action_sequence: torch.Tensor | None = None
+        if seed_context_actions is not None:
+            seed_action_sequence = self.normalize_rollout_actions(
+                video,
+                seed_context_actions,
+            )
+            expected_seed_actions = original_num_frames - 1
+            if seed_action_sequence.shape[1] < expected_seed_actions:
+                raise ValueError(
+                    "seed_context_actions must include every transition inside "
+                    f"the seed video: got {seed_action_sequence.shape[1]}, "
+                    f"need {expected_seed_actions}"
+                )
+            if expected_seed_actions == 0:
+                seed_action_sequence = torch.empty(
+                    video.shape[0], 0, dtype=torch.long, device=video.device
+                )
+            else:
+                seed_action_sequence = seed_action_sequence[:, -expected_seed_actions:]
+        else:
+            if original_num_frames >= 2:
+                seed_action_encoded = self.action_model.encode(video)
+                seed_action_sequence = self.action_model.get_action_sequence(
+                    seed_action_encoded
+                ).long()
+            else:
+                seed_action_sequence = torch.empty(
+                    video.shape[0], 0, dtype=torch.long, device=video.device
+                )
+        full_action_history = torch.cat(
+            [seed_action_sequence, action_sequence], dim=1
+        )
 
         generated = video
         for step in range(num_rollout_steps):
             # After ``step`` predictions we have ``S + step`` real frames.
             # The next code prediction uses the last ``context_size`` frames as
-            # dynamics context (capped at ``T - 1``). The ``context_size - 1``
-            # transitions inside that window come from ``unified_actions``
-            # at offsets ``[start, start + context_size - 1)``.
+            # dynamics context (capped at ``T - 1``).
             current_num_frames = generated.shape[1]
             context_size = min(current_num_frames, max_context)
-            start = current_num_frames - context_size
-            context_actions = unified_actions[
-                :, start : start + (context_size - 1)
-            ]
+            context_start = current_num_frames - context_size
             context = generated[:, -context_size:]
+            context_actions = full_action_history[
+                :,
+                context_start : current_num_frames - 1,
+            ]
             next_codes = self.predict_next_frame_codes(
                 context,
                 action_sequence[:, step],
@@ -480,7 +527,9 @@ class DynamicsModel(nn.Module):
                 context_actions=context_actions,
             )
             next_frame = self.decode_next_frame_with_tokenizer_window(
-                generated, next_codes
+                generated,
+                next_codes,
+                decode_tokenizer=decode_tokenizer,
             )
             generated = torch.cat([generated, next_frame.unsqueeze(1)], dim=1)
 

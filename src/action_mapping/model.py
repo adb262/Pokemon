@@ -20,9 +20,6 @@ class ActionMappingModel(nn.Module):
         self.num_output_actions = num_output_actions
         self.loss_fn = nn.CrossEntropyLoss()
         self.max_sequence_length = max_sequence_length
-        self.max_transition_length = max_sequence_length - 1
-        if self.max_transition_length < 1:
-            raise ValueError("max_sequence_length must be at least 2")
 
         self.mapping_head = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -30,9 +27,19 @@ class ActionMappingModel(nn.Module):
             nn.GELU(),
             nn.Linear(4 * d_model, num_output_actions),
         )
+        self.action_projection = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+        )
+        self.video_token_latents_projection = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+        )
         self.action_embedding = nn.Embedding(num_input_actions, d_model)
         self.spatio_temporal_transformer = SpatioTemporalTransformer(
-            num_images_in_video=self.max_transition_length,
+            num_images_in_video=max_sequence_length,
             num_heads=num_heads,
             d_model=d_model,
             num_layers=num_layers,
@@ -53,10 +60,10 @@ class ActionMappingModel(nn.Module):
                 f"got {tuple(actions_taken.shape)}"
             )
         video_token_latents = video_token_latents[:, -self.max_sequence_length:, :, :]
-        actions_taken = actions_taken[:, -self.max_transition_length:].long()
+        actions_taken = actions_taken[:, -self.max_sequence_length:].long()
 
         action_embeddings = self.action_embedding(actions_taken)
-        video_token_latents = video_token_latents[:, :-1, :, :] + action_embeddings.unsqueeze(2)
+        video_token_latents = self.video_token_latents_projection(video_token_latents) + self.action_projection(action_embeddings).unsqueeze(2)
         video_token_latents = self.spatio_temporal_transformer(video_token_latents)
 
         x = video_token_latents.mean(dim=2)
@@ -64,7 +71,7 @@ class ActionMappingModel(nn.Module):
         return x
 
     def compute_loss(self, logits: torch.Tensor, target_actions: torch.Tensor) -> torch.Tensor:
-        target_actions = target_actions[:, -self.max_transition_length:].long()
+        target_actions = target_actions[:, -self.max_sequence_length:].long()
         if logits.shape[:2] != target_actions.shape:
             raise ValueError(
                 "logits and target_actions must agree on batch/time dimensions: "

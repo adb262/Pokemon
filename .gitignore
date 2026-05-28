@@ -35,3 +35,4 @@ tokenizer_runs/
 .commands.txt
 dynamics_model*
 post_trained/*
+action_mapping_runs/*
