@@ -279,8 +279,3 @@ Action Mapping Model
 ```
 action_mapping_2_layer_no_foresight/checkpoint_epoch4_step4535.pt
 ```
-
-# Ground truth is still weird
-
-
-uv run python -m scripts.action_mapping.train   --dynamics-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/checkpoint_latest.pt   --action-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/action_model/checkpoint_latest.pt   --tokenizer-checkpoint-path post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt   --data-dir data/two_player_pong   --num-heads 2   --num-layers 2   --logging-backend tensorboard --max_sequence_length 16 --checkpoint_dir action_mapping_2_layer_no_foresight --experiment_name action_mapping_2_layer_no_foresight
