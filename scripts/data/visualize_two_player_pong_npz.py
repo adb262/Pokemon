@@ -86,12 +86,17 @@ def make_residual_frames(
         raise ValueError(
             f"Need more than {residual_offset} frames to render residuals"
         )
-    residuals = np.abs(
-        frames[:, residual_offset:].astype(np.int16)
-        - frames[:, :-residual_offset].astype(np.int16)
+    signed_residuals = (
+        frames[:, residual_offset:, :, :, 0].astype(np.int16)
+        - frames[:, :-residual_offset, :, :, 0].astype(np.int16)
     ).astype(np.float32)
-    residuals *= residual_scale
-    return np.clip(residuals, 0, 255).astype(np.uint8)
+    negative = np.clip(-signed_residuals * residual_scale, 0, 255)
+    positive = np.clip(signed_residuals * residual_scale, 0, 255)
+
+    residual_rgb = np.zeros((*signed_residuals.shape, 3), dtype=np.uint8)
+    residual_rgb[..., 0] = negative.astype(np.uint8)
+    residual_rgb[..., 2] = positive.astype(np.uint8)
+    return residual_rgb
 
 
 def validate_actions(dual_actions: np.ndarray, frames: np.ndarray) -> None:

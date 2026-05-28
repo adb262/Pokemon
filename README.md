@@ -191,6 +191,8 @@ python -m scripts.data.visualize_two_player_pong_npz \
   --residual-offset 4
 ```
 
+Residuals are signed: red means the pixel got darker, blue means it got brighter.
+
 Pong tokenizer
 ```
 CUDA_VISIBLE_DEVICES=7 python -m scripts.video_tokenizer.train \
