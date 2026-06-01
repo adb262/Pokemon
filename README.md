@@ -1,281 +1,432 @@
-# Pokemon IDM
+# Pokémon → Pong World Model
 
-The goal of this is to train a viable latent action IDM that understands the action space of pokemon. This IDM is completely self-supervised and is implemented with a VQVAE using the NSVQ paper. Ultimately, I am working on using to a flow matching diffusion transformer to generate the subsequent frames.
+A self-supervised **action-controllable video world model**, in the spirit of [Genie](https://arxiv.org/abs/2402.15391). Given a few frames of gameplay and an action, the model predicts the next frame — without ever being told what the actions *are* during pretraining. Actions are discovered automatically from raw video.
 
-Because many pairs of frames are the same, I modified the reconstruction loss to focus more when the pixels change. This acts as a form of regularization and focus, preventing us from just reconstructing the original image.
+The project began on Pokémon (hence the name) and now uses **Pong** as a clean, controllable testbed for proving out the full pipeline end to end. You can play a fully model-generated game of Pong with your keyboard — every frame is hallucinated by the dynamics model.
 
-## Data Collection
+> **Status:** research codebase under active development. The pipeline works end to end on Pong; Pokémon-scale training is ongoing. Expect rough edges.
 
-We can scrape a bunch of youtube videos with the following:
+---
+
+## Table of contents
+
+- [What this is](#what-this-is)
+- [How it works](#how-it-works)
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Quickstart: play the world model](#quickstart-play-the-world-model)
+- [The full pipeline](#the-full-pipeline)
+  - [1. Data](#1-data)
+  - [2. Video tokenizer](#2-video-tokenizer)
+  - [3. Dynamics model + latent action model](#3-dynamics-model--latent-action-model-joint)
+  - [4. Post-train the tokenizer (optional)](#4-post-train-the-tokenizer-optional)
+  - [5. Action mapping](#5-action-mapping)
+- [Inference & evaluation](#inference--evaluation)
+- [Configuration, logging & storage](#configuration-logging--storage)
+- [Gold checkpoints](#gold-checkpoints)
+- [Results](#results)
+- [Glossary](#glossary)
+- [Roadmap](#roadmap)
+- [References](#references)
+
+---
+
+## What this is
+
+The goal is to learn the *dynamics* of a game purely from watching it. Concretely, the system learns four things:
+
+1. **A compressed visual vocabulary** — a tokenizer that turns frames into a small set of discrete codes and back into pixels.
+2. **A latent action space** — a self-supervised "inverse dynamics model" (IDM) that infers *what changed* between two consecutive frames and quantizes it into a discrete latent action. No action labels required.
+3. **A dynamics model** — given past frames and a latent action, predict the next frame's tokens.
+4. **An action mapping** (Pong only) — a small supervised bridge that maps *real* controller inputs (paddle up/down) onto the learned latent action space, so a human can actually drive the simulator.
+
+Put together, these let you start from a few seed frames and then **interactively generate gameplay** by feeding in actions.
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+  pixels["RGB frames"]
+  VT["Video Tokenizer - FSQ VQ-VAE"]
+  codes["Discrete frame codes"]
+  LAM["Latent Action Model - self-supervised IDM"]
+  act["Latent action codes"]
+  DM["Dynamics Model - MaskGIT-style"]
+  nextcodes["Next-frame codes"]
+  dec["Tokenizer decoder"]
+  out["Predicted pixels"]
+  AM["Action Mapping - Pong only"]
+  real["Real controls: up / down / noop"]
+
+  pixels --> VT
+  VT --> codes
+  codes --> DM
+  pixels --> LAM
+  LAM --> act
+  act --> DM
+  DM --> nextcodes
+  nextcodes --> dec
+  dec --> out
+  codes --> AM
+  real --> AM
+  AM --> act
 ```
-python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16 --use_s3
-```
 
-To download from a specific YouTube video or playlist URL:
-```
-python -m src.data.scraping.pokemon_dataset_pipeline --scrape --clean --extract --summary --video_url "https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5" --game_name "Pokemon Emerald" --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16
-```
-Our end state is to have groups (starting with "pairs" i.e. group of 2) from which we can learn our latent actions. This means that we need to pair up frame x and frame x+1. Eventually, I will roll out support for larger groups, since the learning dynamics should be smoother.
+**Component-by-component:**
 
-## Training
+| Component | Code | Role | In → Out |
+|---|---|---|---|
+| **Video tokenizer** | `src/video_tokenization/model.py` | Patchify → spatio-temporal transformer → **Finite Scalar Quantization (FSQ)** → decoder. Compresses frames into discrete codes and reconstructs pixels. | frames → codes → frames |
+| **Latent action model (IDM)** | `src/latent_action_model/model.py` | Encodes the residual between consecutive frames, pools it, and quantizes into a discrete latent action (FSQ by default, NSVQ optional). Fully self-supervised. | frames → per-transition latent action codes |
+| **Dynamics model** | `src/dynamics_model/model.py` | Embeds tokenizer codes + latent action embeddings, and predicts the masked next-frame codes. Trained MaskGIT-style with random masking; at inference it **iteratively unmasks** with a cosine schedule. | (codes, action) → next-frame codes |
+| **Action mapping** | `src/action_mapping/model.py` | Small transformer that maps real Pong joint actions (0–8) onto latent action codes, using a frozen tokenizer + dynamics stack. | (codes, real action) → latent action code |
 
-Starting with the Finite State Quantization (FSQ) for our tokenizer, we want to understand the impact of the quantization bins. Ideally, we are able to overfit on a small set first. So, we run two experiments:
-- **Sending information through a straw**: We restrict our bins to be 2 2 2 2, meaning that we will lose a lot of information in our tokenization. Our vocab size is only 16 here.
-- **Light Quantization**: Use bins 16 12 12 12, allowing vocabulary size of 36,864.
+> **Note on "flow matching":** earlier notes describe the dynamics model as a flow-matching diffusion transformer. The *implemented* dynamics model is masked discrete-token prediction with iterative unmasking (MaskGIT-style). The README reflects what the code does today.
 
-We expect to see an enormous delta, but it is much smaller than anticipated. So, let's try removing quantization entirely. Our encoder/decoder should just learn the identify function. 
+**Quantization choices** live in `src/quantization/`:
+- `fsq.py` — Finite Scalar Quantization (Mentzer et al., 2023). No learned codebook; vocabulary = product of per-dimension `bins` (e.g. `8 8 6 5` → 1,920 codes). Used by both the tokenizer and the LAM by default.
+- `nsvq.py` — Noise-Substitution VQ, a learned-codebook alternative the LAM can optionally use.
 
-Ablation results (see below):
+---
 
-![FSQ Ablation Results](public/fsq_ablation.png)
-
-## Training Video Tokenizer
-Local training
-```python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 2  --save_dir fsq_full_train --checkpoint_dir full_train --bins 8 8 6 5 --local_cache_dir ''```
-
-S3 
-```
-python -m scripts.video_tokenizer.train --frames_dir pokemon_frames/pokemon_emerald --num_images_in_video 5 --batch_size 2  --save_dir fsq_full_train --checkpoint_dir full_train --bins 8 8 6 5 --use_s3 true
-```
-
-### TODOS
-
-- [ ] Flow Matching Transformer
-- [ ] Larger group dynamics (not just pairs)
-- [ ] Do we really need video tokenization or would frame tokenization suffice?
-- [X] Use additive embeddings
-- [X] Move to single action per frame
-- [ ] When char is moving, everything should be moving. Filter to frames where the residual is every frame or nothing
-- [ ] Use EMA codebook updates
-- [ ] Just look at center of the frames to determine action
-    - [ ] Can't because some frames are un-cropped
-- [ ] Deal with codebook collapse (tried resetting but just collapses elsewhere; might want to focus on center frame, only care about the char)
-- [ ] Use more homogeneous data
-- [ ] Handle emergence of no-action quantization; successfully classify when there is no action
-- [ ] Test out JEPA style learning
-- [ ] Test out DiT
-- [ ] Test out BPTT using Gumbel Softmax for iterative decoding (bridge train/inference gap)
-- [ ] Fix data leakage between train/test (the test set can be interspersed with segments from training)
-- [ ] Trim out the borders present
-
-#### Data
-
-- [x] Process parallelism
-- [x] Loss is wrong
-- [ ] Koga gym is known poisonous bc of teleportation
-- [ ] Horrible Heart Gold/Soul Silver
-- [ ] When we enter into trainer battle
-- [ ] We cannot tell when the frame is exactly the same
-
-
-## Data Scripts
-
-```
-python -m scripts.data.sync_dataset_to_s3 --source pokemon_frames/pokemon_emerald_train_0_9_5_frames.json --bucket [bucket_name] --verbose
-```
-
-## Observations
-
-### Latent Action Model
-During training, the easiest way to minimize the loss early is to just regurgitate the previous frame. Over time, this transitions to learning a sort of middle ground between the previous and next frame. This manifests as somewhat of a motion blur, where you see the previous frame and the current frame together. Below is an example of this phenomena. This is from epoch 50 over a dataset of only 100 frame transitions
-
-![FSQ Ablation Results](public/lam_frame_blurring_epoch_50.png)
-
-Eventually we overfit and learn the exact next frame. I am working on experiments of this at scale.
-
-
-### Video Tokenizer
-
-We first train a 12 million parameter tokenizer. We select Finite Scalar Quantization (Mentzer, 2023) because of the simplicity and the empirical lack of quality degradation when scaling vocab size. This tokenizer is trained with 2 heads, 2 encoder layers, 2 decoder layers, d_model = 256, image shape = 260x260, patch_size = 8, and a vocab size of 1,920. Our results are _decent_, but we certainly are leaving a lot on the table. 
-![2k Vocab Results](public/tokenizer_2k_vocab_260_pixel_8_patch.png)
-
-In the genie papers, they train a 200 million parameter encoder with vocab size of 1k. Their tokenizer views images as 160x90, using a patch size of 4. It is worthwhile for us to run some ablations over the different image qualities and vocab sizes.
-![Tokenizer Shape Ablation](public/tokenizer_scaling_image_size_impact_eval_loss.png)
-![Tokenizer Shape Ablation Frechet](public/tokenizer_scaling_image_size_impact_frechet.png)
-
-As expected, increasing vocabulary size improves performance. However, this also creates a more difficult learning objective downstream. We see that the largest delta actually comes from scaling the image quality. There is a ~20% improvement in frechet distance simply by dropping from 260x260 with a patch size of 8 to 128x128 with a patch size of 4. As a result, we opt to use this moving forward.
-![2k Vocab Results with 128x128/patch size of 4](public/tokenizer_2k_vocab_128_pixel_4_patch.png)
-
-These results are empirically a bit better, but they still don't pass the eye test. We want to feel like we're actually in the game, and the video tokenizer decoder is integral to the reconstruction performance of our dynamics model downstream. So, we'd like to see the impact of scaling the tokenizer itself. We opt for a 50m and 100m model by scaling d_model to 512 and using num heads = 8, setting encoder/decoder layers to 4 and 8 respectively. 
-![Tokenizer Scaling Ablation](public/tokenizer_scaling_params_placeholder.png)
-
-Something is clearly not right with our 100m tokenizer... Let's take a look
-![Tokenizer 100m Quality Issues](public/tokenizer_100m_quality_issues.png)
-
-It seems that we converge on some local minima. Let's take a look at our gradients:
-![Tokenizer 100m Gradients](public/tokenizer_100m_gradient_sparsity.png)
-The gradients are only active during the first ~5k steps. Since we're using gradient accumulation of 16, This means we really only take 300 steps before converging to our local minima. Let's try adding some better weight initialization, dropping our learning rate, and adding a warmup.
-
-I'm reasonably happy with the 50m model performance and it comes at a pretty cheap latency hit. Here are some eval samples:
-![Tokenizer 50m quality](public/tokenizer_50m_quality.png)
-
-Genie explores scaling the decoder separately. Since the decoder is essentially the bottleneck for reconstruction fidelity, this is worthwhile to pursue. I may come back to this.
-
-- 12M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/lhek7ncp
-- 50M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/mu0wmzo3
-- 100M Tokenizer: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/t0e7zv8b
-
-
-**You'll notice that a lot of the frames have not been trimmed. I originally removed these artifacts but decided that they actually may improve diversity of generation over time.
-
-- The lookup table only looks at users current action...
-- Train over variable lengths
-
-
-## TODOs
-- [X]: Update data loader to create an n length sequence of frames, where n >> num_images_in_video, split this up into k samples where each len(sample) == num_images_in_video, k = n - (num_images_in_video - 1). This is because each sequence must be of length num_images_in_video, so we cannot use the first (num_images_in_video - 1) frames as training data. Importantly, we must shuffle our dataset post collection, such that we have a reasonable data mixture for our dynamics model.
-- []: Use data from https://www.youtube.com/playlist?list=PL7RjQqHgsQeQsxpfp_rPZJR-44YATOPZ5
-- [X]: Update our MaskGiT implementationm
-- []: Switch to Zarr arrays
-
-
-## From Pokemon to Pong
-Pokemon has a lot of issues. For one, it's mostly an animated game. There are substantially more frames spent with inaction than there are in open world navigation. For our basic repro, we want the simplest possible environment. We'd love to have just the sprite running around but our data is flooded with cut scenes and dialogue. Initial attempts at algorithmic filtering were crushed by edge cases and variants. The next step would be: either spend money to have the frames labeled by a VLLM (navigable/not navigable), OR train a model on a small set of data. This is extremely feasible, but I'm interested in proving that the pipeline works first. So, Pong is a natural, simple environment. There are still cases of inactivity here, but filtering is quite a bit easier.
-
-## Pong Experiments
-Tried weighting based on white pixelation but that collapsed quickly. We were able to achieve near perfect reconstruction with the following checkpoint.
-
-### Two-Player Pong Control Data
-Collect an isolated two-player Pong dataset with transition-aligned labels for both paddles:
-
-If Pong ROMs are missing in a fresh environment, install them once with:
+## Repository layout
 
 ```
+src/
+  video_tokenization/     # FSQ video tokenizer model, training args, checkpoints
+  latent_action_model/    # Self-supervised IDM (encoder/decoder/quantizer)
+  dynamics_model/         # MaskGIT-style next-frame dynamics model
+  action_mapping/         # Real-controls → latent-action bridge
+  quantization/           # FSQ + NSVQ
+  transformers/           # Spatio-temporal transformer blocks
+  data/
+    datasets/             # atari_pong + open_world dataset readers/creators
+    data_loaders/         # window loaders, samplers, dataset factory
+    scraping/             # YouTube scraping pipeline (Pokémon)
+    s3/                   # S3 upload/sync helpers
+  monitoring/             # wandb/tensorboard logging, FVD/PSNR, video viz
+  schedulers/, loss/, activations/, torch_utilities/
+
+scripts/                  # CLI entry points (run with `python -m scripts...`)
+  video_tokenizer/        # train / eval / post_train / oracle_decode
+  dynamics_model/         # train / inference / rollout_strategies
+  latent_action_model/    # train / eval (stub)
+  action_mapping/         # train / interactive_inference
+  data/                   # generate_two_player_pong, download_atari_pong, sync, visualize
+
+public/                   # figures used in this README
+tests/                    # e.g. attention equivalence test
+```
+
+Training runs write checkpoints and logs into top-level directories named after the experiment (e.g. `dynamics_model_pong_w_tokenizer_v2_.../`). These are gitignored.
+
+---
+
+## Installation
+
+This project uses [`uv`](https://docs.astral.sh/uv/) and Python ≥ 3.12.
+
+```bash
+# Install dependencies into a local .venv
+uv sync
+
+# (Pong only) install the Atari ROMs once
 uv run AutoROM --accept-license
 ```
 
+Create a `.env` file in the repo root for optional integrations (S3 + HuggingFace). None of these are required for local Pong experiments except `HF_TOKEN` if you download the public Atari Pong dataset.
+
+```bash
+# .env
+HF_TOKEN=...                  # for downloading the HuggingFace Atari Pong dataset
+
+# Only needed if you use --use-s3 (Pokémon/open-world frame storage)
+S3_BUCKET_NAME=...
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_SESSION_TOKEN=...          # if using temporary/SSO credentials
+AWS_REGION=us-east-1           # defaults to us-east-1
+
+# Optional: local frame cache directory
+BT_RW_CACHE_DIR=...
 ```
-python -m scripts.data.generate_two_player_pong \
+
+Prefix commands with `uv run` (e.g. `uv run python -m scripts.dynamics_model.train ...`) so they use the project environment.
+
+---
+
+## Quickstart: play the world model
+
+If you have the [gold checkpoints](#gold-checkpoints), you can play Pong inside the model right now. Every frame you see is generated by the dynamics model.
+
+```bash
+uv run python -m scripts.action_mapping.interactive_inference \
+  --dynamics-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/checkpoint_latest.pt \
+  --action-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/action_model/checkpoint_latest.pt \
+  --tokenizer-checkpoint-path post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt \
+  --action-mapping-checkpoint-path action_mapping_2_layer_no_foresight/checkpoint_epoch4_step4535.pt \
+  --seed-data-dir data/two_player_pong \
+  --display-backend web
+```
+
+Then open **http://127.0.0.1:8766** in your browser.
+
+**Controls:** `w` / `s` move the left paddle, `i` / `k` move the right paddle, `r` resets, `q` / `Esc` quits. No key held = no-op. Use `--display-backend opencv` for a local window instead, and `--denoising-steps` to trade quality for latency.
+
+---
+
+## The full pipeline
+
+The stages are designed to be trained in order. The tokenizer is trained first and then frozen; the dynamics model and latent action model are trained jointly; action mapping is trained last on top of the frozen stack.
+
+### 1. Data
+
+Two dataset backends, selected with `--dataset-type`:
+
+**`atari_pong`** (recommended starting point). Public single-player Pong frames from HuggingFace (`p-doom/atari-pong-dataset`), stored as ArrayRecord shards of `uint8` `(seq_len, 84, 84, 3)` frames.
+
+```bash
+uv run python -m scripts.data.download_atari_pong --local_dir data/atari_pong
+```
+
+**`two_player_pong`** — generated locally via PettingZoo/ALE, used for **action mapping** because it has per-paddle action labels. Each shard is a standalone `.npz` with `frames (N, T, 84, 84, 3)` and `dual_actions (N, T-1, 2)` where labels are `0=nothing, 1=up, 2=down`.
+
+```bash
+# Small smoke dataset
+uv run python -m scripts.data.generate_two_player_pong \
   --output-dir data/two_player_pong_smoke \
-  --num-windows-train 8 \
-  --num-windows-val 4 \
-  --num-windows-test 4 \
-  --windows-per-file 4 \
-  --window-size 160 \
-  --overwrite
-```
+  --num-windows-train 8 --num-windows-val 4 --num-windows-test 4 \
+  --windows-per-file 4 --window-size 160 --overwrite
 
-Scale-up example:
-
-```
-python -m scripts.data.generate_two_player_pong \
+# Full-scale dataset
+uv run python -m scripts.data.generate_two_player_pong \
   --output-dir data/two_player_pong \
-  --num-windows-train 100000 \
-  --num-windows-val 10000 \
-  --num-windows-test 10000 \
-  --windows-per-file 1024 \
-  --window-size 160 \
-  --max-episode-steps 1000 \
-  --policy random
+  --num-windows-train 100000 --num-windows-val 10000 --num-windows-test 10000 \
+  --windows-per-file 1024 --window-size 160 --max-episode-steps 1000 --policy random
 ```
 
-Each shard is a standalone `.npz` with `frames` shaped `(N, T, 84, 84, 3)` and `dual_actions` shaped `(N, T - 1, 2)`, where labels are `0=nothing`, `1=up`, and `2=down`. Frames are grayscale Atari observations repeated across RGB channels to match the existing Pong training data, windows are filtered away from reset/serve-only spans with a ball-visibility check, and every stored transition is one PettingZoo/ALE step at `frame_spacing=1` with no frame skip. Before capture starts, the collector can send raw `FIRE` actions to get past the serve screen; once a sequence starts, `dual_actions[t]` and `raw_actions[t]` are the exact commands sent for `frames[t] -> frames[t + 1]`.
+Inspect a shard (raw frames or signed frame-to-frame residuals):
 
-Visualize labels from any shard:
-
-```
-python -m scripts.data.visualize_two_player_pong_npz \
-  data/two_player_pong_smoke/train/chunk_000000.npz \
-  --num-samples 4 \
-  --max-frames 16
+```bash
+uv run python -m scripts.data.visualize_two_player_pong_npz \
+  data/two_player_pong_smoke/train/chunk_000000.npz --num-samples 4 --max-frames 16
+# add --show-residuals --residual-offset 4 to see motion (red = darker, blue = brighter)
 ```
 
-Render frame-to-frame residuals instead of raw frames:
+**`pokemon`** (open-world). Frames scraped from YouTube via `src.data.scraping.pokemon_dataset_pipeline`, stored as PNG frames + JSON window logs, optionally synced to S3. See the [scraping section](#pokémon-data-scraping-advanced) below.
 
-```
-python -m scripts.data.visualize_two_player_pong_npz \
-  data/two_player_pong_smoke/train/chunk_000000.npz \
-  --num-samples 4 \
-  --max-frames 16 \
-  --show-residuals \
-  --residual-offset 4
-```
+### 2. Video tokenizer
 
-Residuals are signed: red means the pixel got darker, blue means it got brighter.
+Train the FSQ tokenizer that compresses frames into discrete codes. It's frozen for all downstream training.
 
-Pong tokenizer
-```
-CUDA_VISIBLE_DEVICES=7 python -m scripts.video_tokenizer.train \
+```bash
+uv run python -m scripts.video_tokenizer.train \
   --dataset_type atari_pong \
   --atari_pong_data_dir data/atari_pong \
   --atari_pong_require_full_gameplay \
-  --image_size 84 \
-  --patch_size 4 \
-  --num_images_in_video 5 \
-  --batch_size 32 \
-  --num_epochs 3 \
-  --dataset_limit 100_000 \
+  --image_size 84 --patch_size 4 \
+  --num_images_in_video 5 --batch_size 32 --num_epochs 3 \
   --bins 8 8 6 5 \
-  --save_dir fsq_tokenizer_atari_pong_large_ds_clipped_bf16 \
-  --checkpoint_dir fsq_tokenizer_atari_pong_large_ds_clipped_bf16 \
-  --logging-backend tensorboard \
-  --tensorboard_dir tokenizer_runs \
-  --experiment_name fsq_tokenizer_atari_pong_5_frames_large_ds_clipped \
   --reconstruction_loss_type clipped_l2 --l2_clip_c 10.0 \
-  --early_stopping_patience 10 \
-  --early_stopping_min_delta 1e-5 \
-  > fsq_tokenizer_atari_pong_ds_clipped_bf16.log 2>&1
+  --save_dir fsq_tokenizer_atari_pong \
+  --checkpoint_dir fsq_tokenizer_atari_pong \
+  --logging-backend tensorboard --tensorboard_dir tokenizer_runs \
+  --experiment_name fsq_tokenizer_atari_pong
 ```
 
-TODO:
-- []: Rerun ablations with new upsamplers
+Key knobs (`src/video_tokenization/training_args.py`): `--bins` (FSQ vocabulary), `--d_model`, `--num_transformer_layers`, `--num_heads`, `--image_size`, `--patch_size`, `--reconstruction_loss_type` (`l2` or `clipped_l2`), `--scheduled_sampling`, `--use_bf16`, `--early_stopping_patience`.
 
-![Pong Tokenizer Results](public/pong_tokenizer_50m_comparison_grid.png)
-Run here: https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/tsznmr1u?nw=nwuseradb262 (fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt)
-```
-CUDA_VISIBLE_DEVICES=5 python -m scripts.dynamics_model.train \
+### 3. Dynamics model + latent action model (joint)
+
+The dynamics model is trained jointly with the latent action model on top of the **frozen tokenizer**. The LAM discovers the latent action vocabulary while the dynamics model learns to predict the next frame conditioned on it.
+
+```bash
+uv run python -m scripts.dynamics_model.train \
   --dataset_type atari_pong \
   --atari_pong_data_dir data/atari_pong \
   --tokenizer_checkpoint_path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt \
-  --image_size 128 \
-  --patch_size 4 \
-  --num_images_in_video 5 \
-  --batch_size 4 \
+  --image_size 128 --patch_size 4 \
+  --num_images_in_video 5 --batch_size 4 \
   --save_dir dynamics_model_atari_pong \
   --checkpoint_dir dynamics_model_atari_pong
 ```
 
-Action space collapses consistently. This can be mitigated by ensuring that any pooling of our action encoder features happens after we take the residual. Otherwise, we're looking at frame level movement.
+Key knobs (`src/dynamics_model/training_args.py`): `--tokenizer_checkpoint_path` (**required**), `--action_bins` (latent action vocabulary), `--action_d_model`/`--dynamics_d_model`, `--mask_ratio_lower_bound`/`--mask_ratio_upper_bound`, `--dynamics_token_loss` (`ce` or `clipped_ce`), `--scheduled_sampling`, `--rollout_max_denoising_steps`. Resume with `--dynamics_model_checkpoint_path` / `--action_model_checkpoint_path`.
 
-How can we improve?
-- Running ablations on batch size
-- Predicting action chunks instead of singletons. We learn both a chunk action and a sequence of frames that follows it.
-  - Why? This improves our IID assumption.
-- Using latent prediction for our action model. Instead of pixel space movement, can we predict how the semantics of the frames change?
-  - Could even just use a JEPA as the base model
-- I want to stick to unlabeled data as much as possible. I think labels are helpful but cut off our ability to look at any video and translate it.
-- Could programmatically boost the importance of the ball prediction
-- LPIPS
+> A standalone LAM trainer also exists at `scripts/latent_action_model/train.py` for IDM-only experiments, but the dynamics trainer above is the main Pong path.
 
-  
-Retrain decoder
+### 4. Post-train the tokenizer (optional)
 
+Fine-tune the tokenizer **decoder** against the frozen dynamics + LAM stack using a rollout loss, which noticeably improves reconstruction fidelity during generation.
 
-- Early stopping for LAM
-- Norms and residuals fixed in LAM
-- Remove pre-norm on PatchEmbedding
-- Switch to RMSNorm
-
-dynamics_model_pong_w_tokenizer_v2 has some crazy results from pre-action model updates. Might be worth reverting action _model to 04-28-upgrade_video_tokenizer_with_swiglu_rmsnorm_nonlinear_upsampler. TBD, need to train the others to same extent.
-
-
-### Gold Models
-Dynamics Model
-```
-dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/checkpoint_latest.pt   
+```bash
+uv run python -m scripts.video_tokenizer.post_train_tokenizer \
+  --tokenizer-checkpoint-path fsq_tokenizer_atari_pong/checkpoint_epoch1_batch3000.pt \
+  --dynamics-model-checkpoint-path dynamics_model_atari_pong/checkpoint_latest.pt \
+  --action-model-checkpoint-path dynamics_model_atari_pong/action_model/checkpoint_latest.pt \
+  --checkpoint-dir post_train_tokenizer_500k
 ```
 
-Action Model
-```
-dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/action_model/checkpoint_latest.pt
+### 5. Action mapping
+
+Finally, learn the bridge from *real* Pong controls to latent actions so a human can drive the model. Requires the two-player Pong dataset and all three frozen checkpoints.
+
+```bash
+uv run python -m scripts.action_mapping.train \
+  --dynamics-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_.../checkpoint_latest.pt \
+  --action-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_.../action_model/checkpoint_latest.pt \
+  --tokenizer-checkpoint-path post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt \
+  --data-dir data/two_player_pong \
+  --num-heads 2 --num-layers 2 \
+  --max_sequence_length 16 \
+  --checkpoint_dir action_mapping_2_layer_no_foresight \
+  --experiment_name action_mapping_2_layer_no_foresight \
+  --logging-backend tensorboard
 ```
 
-Tokenizer
-```
-post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt
+`--max_sequence_length` must match the dynamics model's context window.
+
+---
+
+## Inference & evaluation
+
+**Interactive play (full stack):** see [Quickstart](#quickstart-play-the-world-model).
+
+**Dynamics-only REPL** — feed integer latent action IDs directly (no action mapping):
+
+```bash
+uv run python -m scripts.dynamics_model.inference \
+  --tokenizer-checkpoint-path post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt \
+  --dynamics-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_.../checkpoint_latest.pt \
+  --action-model-checkpoint-path dynamics_model_pong_w_tokenizer_v2_.../action_model/checkpoint_latest.pt \
+  --dataset-type atari_pong --atari-pong-data-dir data/atari_pong \
+  --mode interactive
 ```
 
-Action Mapping Model
+`scripts/dynamics_model/inference.py` also offers non-interactive `--mode`s for analysis: `actual_actions_rollout`, `spam_actions_grid`, `compare_denoising_steps`, `compare_rollout_strategies`, and `visualize_denoising_trace`. These export comparison videos/grids (see `public/` and the rollout strategy library in `scripts/dynamics_model/rollout_strategies.py`).
+
+**Tokenizer evaluation:** `scripts/video_tokenizer/eval.py` (reconstruction quality, FVD) and `scripts/video_tokenizer/oracle_decode_eval.py` (oracle vs. autoregressive decode ablation).
+
+---
+
+## Configuration, logging & storage
+
+- **CLI:** all training scripts use [`tyro`](https://brentyi.github.io/tyro/). Run any script with `--help` to see every flag derived from its dataclass config.
+- **Logging:** `--logging-backend` selects `wandb`, `tensorboard`, or `none`. Default W&B projects: `pokemon-vqvae`, `pokemon-action-vqvae`, `pokemon-dynamics-model`, `pokemon-post-train-tokenizer`, `pokemon-action-mapping`. For TensorBoard, logs go under `--tensorboard_dir`. (`src/monitoring/`)
+- **S3** (`--use-s3`): used for Pokémon/open-world frame storage and artifact sync. Configured via `S3_BUCKET_NAME` + AWS credentials in `.env`. **Not** used for the Atari Pong path.
+- **Conventions** (see `CLAUDE.md`): no `getattr` with defaults — add fields to the relevant dataclass instead; all imports at the top of the file (no lazy imports).
+
+---
+
+## Gold checkpoints
+
+The current best Pong stack:
+
+| Role | Path |
+|---|---|
+| Dynamics model | `dynamics_model_pong_w_tokenizer_v2_256_scheduled_opt_longer_eval_128_d_action_16_frames_1_denoising_step_512_dynamics_anchor_action_fixed/checkpoint_latest.pt` |
+| Action (LAM) model | `.../action_model/checkpoint_latest.pt` (same directory) |
+| Tokenizer | `post_train_tokenizer_500k/checkpoint_epoch0_batch16003.pt` |
+| Action mapping | `action_mapping_2_layer_no_foresight/checkpoint_epoch4_step4535.pt` |
+
+These are not committed to git (checkpoints are gitignored). Obtain them from the project owner or your shared storage.
+
+---
+
+## Results
+
+**Pong tokenizer (50M)** — reconstruction comparison grid:
+
+![Pong tokenizer 50M comparison grid](public/pong_tokenizer_50m_comparison_grid.png)
+
+**FSQ quantization ablation** — straw (`2 2 2 2`, vocab 16) vs. light quantization (`16 12 12 12`, vocab ~36.8k):
+
+![FSQ ablation](public/fsq_ablation.png)
+
+**Tokenizer scaling** — image resolution matters more than vocabulary size; dropping from 260×260/patch-8 to 128×128/patch-4 gave ~20% better Fréchet distance:
+
+![Tokenizer image-size impact (Fréchet)](public/tokenizer_scaling_image_size_impact_frechet.png)
+
+**Latent action model "motion blur"** — early in training the IDM minimizes loss by blending the previous and next frame before it learns crisp transitions:
+
+![LAM frame blurring at epoch 50](public/lam_frame_blurring_epoch_50.png)
+
+More figures (gradient sparsity in the 100M tokenizer, 50M quality samples, loss-mask visualization) live in `public/`. W&B runs for the tokenizers:
+- [12M](https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/lhek7ncp) · [50M](https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/mu0wmzo3) · [100M](https://wandb.ai/adb262-cornell-university/pokemon-vqvae/runs/t0e7zv8b)
+
+---
+
+## Glossary
+
+- **Tokenizer** — VQ-VAE that maps frames to discrete codes and back; here it uses FSQ.
+- **FSQ (Finite Scalar Quantization)** — quantization with no learned codebook; each latent dimension is bounded and rounded to a fixed number of `bins`. Vocabulary = product of bins.
+- **Latent action / IDM** — a self-supervised inverse-dynamics model that infers a discrete "action" explaining the change between two frames.
+- **Dynamics model** — predicts the next frame's tokens from past tokens + a latent action. Trained MaskGIT-style (random masking), generates via iterative unmasking.
+- **Action mapping** — supervised model linking *real* controls to the *learned* latent action space (Pong only).
+- **Rollout** — autoregressively generating a sequence of frames by repeatedly predicting the next one.
+
+---
+
+## Roadmap
+
+Active and planned work (condensed from in-progress notes):
+
+- Larger action groups (predict action *chunks* + the frames that follow, instead of single transitions).
+- Latent / JEPA-style prediction for the action model instead of pixel-space residuals.
+- Decoder-only tokenizer scaling (Genie-style), since the decoder bottlenecks reconstruction fidelity.
+- Address latent-action codebook collapse and the "no-action" frames that dominate Pong/Pokémon.
+- Fix train/test leakage where test segments can be interspersed with training segments.
+- Return to Pokémon at scale (VLM- or small-model-based filtering of navigable vs. cut-scene frames).
+- Switch frame storage to Zarr; rerun tokenizer ablations with the new upsamplers.
+
+---
+
+## Pokémon data scraping (advanced)
+
+The original Pokémon pipeline scrapes YouTube playthroughs, cleans them, and extracts paired frames:
+
+```bash
+# Scrape + clean + extract from a playlist
+python -m src.data.scraping.pokemon_dataset_pipeline \
+  --scrape --clean --extract --summary \
+  --video_url "https://www.youtube.com/playlist?list=..." \
+  --game_name "Pokemon Emerald" \
+  --jump_seconds 5.0 --num_video_workers 8 --num_upload_threads 16
 ```
-action_mapping_2_layer_no_foresight/checkpoint_epoch4_step4535.pt
+
+Sync extracted frames to S3:
+
+```bash
+python -m scripts.data.sync_dataset_to_s3 \
+  --source pokemon_frames/pokemon_emerald_train_0_9_5_frames.json \
+  --bucket <bucket_name> --verbose
 ```
+
+---
+
+## Citation
+
+If you use this code or build on this work, please cite it:
+
+```bibtex
+@software{bishop_pokemon_pong_world_model,
+  author  = {Bishop, Allan},
+  title   = {{Gaia: A re-architected Genie implementation in PyTorch.}},
+  year    = {2026},
+  url      = {https://github.com/adb262/Gaia},
+  note     = {Version 0.1.0}
+}
+```
+
+Please also cite the underlying methods this work builds on (see [References](#references)), in particular Genie, MaskGIT, and FSQ.
+
+---
+
+## References
+
+- Mentzer et al., *Finite Scalar Quantization: VQ-VAE Made Simple* (2023) — `src/quantization/fsq.py`
+- Bruce et al., *Genie: Generative Interactive Environments* (2024) — overall world-model framing
+- Chang et al., *MaskGIT: Masked Generative Image Transformer* (2022) — dynamics model training/sampling
+- NSVQ: *Noise Substitution in Vector Quantization* (IEEE Access, 2022) — `src/quantization/nsvq.py`

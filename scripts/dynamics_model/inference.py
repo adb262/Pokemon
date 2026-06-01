@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 import subprocess
 import csv
@@ -8,7 +9,7 @@ import traceback
 from typing import Literal, Optional
 
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import torch
 import torchvision.utils as vutils
 import tyro
@@ -112,6 +113,8 @@ class InteractiveInferenceArgs:
     rollout_strategy_best_of_n: int = 4
     rollout_strategy_keyframe_interval: int = 4
     rollout_strategy_outlier_delta_multiplier: float = 2.5
+    compare_grid_cols: int = 3
+    compare_strategy_names: Optional[list[str]] = None
     triptych_error_gain: float = 5.0
 
 
@@ -1050,6 +1053,146 @@ def _build_labeled_rows_video(rows: list[tuple[str, torch.Tensor]]) -> torch.Ten
     return torch.stack(comparison_frames, dim=0)
 
 
+def _wrap_label_lines(
+    label: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """Greedily wrap ``label`` into lines that fit within ``max_width`` pixels."""
+    words = label.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if not current or draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _add_label_caption(
+    frame: torch.Tensor,
+    lines: list[str],
+    font: ImageFont.ImageFont,
+    caption_height: int,
+    line_height: int,
+    caption_pad: int,
+) -> torch.Tensor:
+    """Place a white caption strip with wrapped ``lines`` above ``frame``."""
+    frame = _normalize_frame(frame)
+    if frame.dim() != 3:
+        raise ValueError(f"Expected frame shape (C, H, W), got {tuple(frame.shape)}")
+    if frame.shape[0] == 1:
+        frame = frame.repeat(3, 1, 1)
+    if frame.shape[0] != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {frame.shape[0]}")
+
+    frame_uint8 = frame.clamp(0, 1).mul(255).byte().permute(1, 2, 0).cpu().numpy()
+    image = Image.fromarray(frame_uint8, mode="RGB")
+    canvas = Image.new("RGB", (image.width, image.height + caption_height), "white")
+    canvas.paste(image, (0, caption_height))
+    draw = ImageDraw.Draw(canvas)
+    for line_idx, line in enumerate(lines):
+        draw.text(
+            (caption_pad, caption_pad + line_idx * line_height),
+            line,
+            fill="black",
+            font=font,
+        )
+
+    captioned = torch.tensor(
+        list(canvas.getdata()),
+        dtype=torch.uint8,
+    ).view(canvas.height, canvas.width, 3)
+    return captioned.permute(2, 0, 1).float().div(255)
+
+
+def _build_labeled_grid_video(
+    cells: list[tuple[str, torch.Tensor]],
+    ncols: int,
+    padding: int = 2,
+    line_height: int = 11,
+    caption_pad: int = 3,
+) -> torch.Tensor:
+    """Tile labeled video panels into a row-major grid with ``ncols`` columns.
+
+    Each cell carries a top caption with its (word-wrapped) label, which reads
+    more cleanly than left-side labels when panels are arranged in a grid.
+    Empty trailing slots are padded with blank white cells.
+    """
+    if not cells:
+        raise ValueError("Expected at least one labeled cell")
+    if ncols < 1:
+        raise ValueError(f"ncols must be at least 1, got {ncols}")
+
+    n_frames = cells[0][1].shape[0]
+    cell_height = cells[0][1].shape[-2]
+    cell_width = cells[0][1].shape[-1]
+    for label, video in cells:
+        if video.dim() != 4:
+            raise ValueError(
+                f"Expected video cell '{label}' to have shape (T,C,H,W), "
+                f"got {tuple(video.shape)}"
+            )
+        if video.shape[0] != n_frames:
+            raise ValueError(
+                f"Video cell '{label}' has {video.shape[0]} frames; expected {n_frames}"
+            )
+        if video.shape[-2] != cell_height or video.shape[-1] != cell_width:
+            raise ValueError(
+                f"Video cell '{label}' has spatial size "
+                f"{tuple(video.shape[-2:])}; expected {(cell_height, cell_width)}"
+            )
+
+    font = ImageFont.load_default()
+    measure_image = Image.new("RGB", (cell_width, 1))
+    measure_draw = ImageDraw.Draw(measure_image)
+    wrapped_labels = [
+        _wrap_label_lines(label, measure_draw, font, cell_width - 2 * caption_pad)
+        for label, _ in cells
+    ]
+    max_lines = max(len(lines) for lines in wrapped_labels)
+    caption_height = max_lines * line_height + 2 * caption_pad
+
+    n_rows = math.ceil(len(cells) / ncols)
+    total_slots = n_rows * ncols
+    blank_cell = torch.ones((3, caption_height + cell_height, cell_width))
+
+    grid_frames = []
+    for t in range(n_frames):
+        captioned_cells = [
+            _add_label_caption(
+                video[t],
+                lines,
+                font,
+                caption_height,
+                line_height,
+                caption_pad,
+            )
+            for (_, video), lines in zip(cells, wrapped_labels)
+        ]
+        while len(captioned_cells) < total_slots:
+            captioned_cells.append(blank_cell.clone())
+        cell_stack = torch.stack(captioned_cells, dim=0)
+        grid_frames.append(
+            vutils.make_grid(
+                cell_stack,
+                nrow=ncols,
+                padding=padding,
+                pad_value=1.0,
+            )
+        )
+    return torch.stack(grid_frames, dim=0)
+
+
 def _build_raw_error_rows_video(
     real_video: torch.Tensor,
     generated_by_step: dict[int, torch.Tensor],
@@ -1767,6 +1910,24 @@ def _compare_rollout_strategies(
         raise ValueError("rollout_strategy_keyframe_interval must be at least 1")
     if args.rollout_strategy_outlier_delta_multiplier <= 0:
         raise ValueError("rollout_strategy_outlier_delta_multiplier must be positive")
+    if args.compare_grid_cols < 1:
+        raise ValueError("compare_grid_cols must be at least 1")
+
+    if args.compare_strategy_names is None:
+        selected_strategies = list(ROLLOUT_STRATEGIES)
+    else:
+        name_to_strategy = {strategy.name: strategy for strategy in ROLLOUT_STRATEGIES}
+        unknown = [
+            name for name in args.compare_strategy_names if name not in name_to_strategy
+        ]
+        if unknown:
+            raise ValueError(
+                f"Unknown rollout strategy names: {unknown}. "
+                f"Available: {sorted(name_to_strategy)}"
+            )
+        selected_strategies = [
+            name_to_strategy[name] for name in args.compare_strategy_names
+        ]
 
     batch = next(iter(test_dataloader))
     if batch.dim() != 5:
@@ -1805,7 +1966,7 @@ def _compare_rollout_strategies(
     rows: list[tuple[str, torch.Tensor]] = [("GT", real_video[0].detach().cpu())]
     base_seed = args.rollout_strategy_seed
 
-    for strategy_idx, strategy in enumerate(ROLLOUT_STRATEGIES):
+    for strategy_idx, strategy in enumerate(selected_strategies):
         if base_seed is None:
             strategy_rng = random.Random()
         else:
@@ -1836,15 +1997,22 @@ def _compare_rollout_strategies(
     comparison_path = output_dir / "rollout_strategies_comparison.mp4"
     _save_frames_as_video(comparison_video, comparison_path, display_scale=2)
 
+    grid_video = _build_labeled_grid_video(rows, args.compare_grid_cols)
+    grid_path = output_dir / "rollout_strategies_grid.mp4"
+    _save_frames_as_video(grid_video, grid_path, display_scale=4)
+
+    grid_rows = math.ceil(len(rows) / args.compare_grid_cols)
     print(
         "Rollout-strategy comparison complete: "
         f"sample_idx={sample_idx} seed_frames={rollout_seed_frames} "
         f"total_frames={rollout_total_frames} max_steps={args.max_steps} "
         f"actions={rollout_actions[0].detach().cpu().tolist()} "
-        f"video={comparison_path}"
+        f"stacked_video={comparison_path} "
+        f"grid_video={grid_path} grid={grid_rows}x{args.compare_grid_cols}"
     )
-    for strategy in ROLLOUT_STRATEGIES:
-        print(f"  row={strategy.label} strategy={strategy.name}")
+    for grid_idx, (label, _) in enumerate(rows):
+        row, col = divmod(grid_idx, args.compare_grid_cols)
+        print(f"  cell=({row},{col}) label={label}")
 
 
 def _interactive_loop(
